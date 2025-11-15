@@ -12,6 +12,7 @@
 #include "issue.h"
 // E-Commerce
 #include "ecom.h"
+#include "qrcode.h"
 
 using json = nlohmann::json;
 
@@ -35,6 +36,10 @@ json routeRequest(const std::string &channelId, const json &data) {
     else if (channelId == "ECOM") {
         std::cout << "[ECOM] Processing E-Commerce transaction\n";
         return processECOMTransaction(data);
+    }
+    else if (channelId == "QRCODE") {
+        std::cout << "[QRCODE] routing to QR processor\n";
+        return processQRCodePayment(data);
     }
     else {
         json err;
