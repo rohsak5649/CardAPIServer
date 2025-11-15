@@ -31,6 +31,8 @@ add_executable(BankingAPIServer
         include/issue.h
         include/ecom.h
         ecom.cpp
+        include/qrcode.h
+        qrcode.cpp
 )
 
 # ✅ Link the correct MySQL library (X DevAPI)
