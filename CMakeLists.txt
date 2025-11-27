@@ -33,6 +33,8 @@ add_executable(BankingAPIServer
         ecom.cpp
         include/qrcode.h
         qrcode.cpp
+        ringpay.cpp
+        include/ringpay.h
 )
 
 # ✅ Link the correct MySQL library (X DevAPI)
