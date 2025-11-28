@@ -13,6 +13,8 @@
 // E-Commerce
 #include "ecom.h"
 #include "qrcode.h"
+#include "ringpay.h"
+
 
 using json = nlohmann::json;
 
@@ -41,6 +43,11 @@ json routeRequest(const std::string &channelId, const json &data) {
         std::cout << "[QRCODE] routing to QR processor\n";
         return processQRCodePayment(data);
     }
+    else if (channelId == "RINGPAY") {
+        std::cout << "[RINGPAY] Processing RingPay transaction\n";
+        return processRingPayTransaction(data);
+    }
+
     else {
         json err;
         err["errorCode"] = "ERR_UNKNOWN_CHANNEL";
