@@ -1,3 +1,28 @@
+/*
+* Copyright (c) Rohan Sakhare
+ * All rights reserved.
+ *
+ * Payment Switching Engine – Routing Flow:
+ * 1. Server exposes REST APIs for transaction processing.
+ * 2. Client sends request with Channel ID and transaction data.
+ * 3. Router validates request structure and input fields.
+ * 4. Request is forwarded to respective channel processor:
+ *    - ATM       → Cash withdrawal & balance services
+ *    - MOBILE    → Mobile banking transactions
+ *    - POS       → Point-of-sale payments
+ *    - ECOM      → E-commerce purchases & refunds
+ *    - QRCODE    → QR-based payments
+ *    - RINGPAY   → Contactless wearable payments
+ *    - ISSUER    → Card issuance services
+ * 5. Channel processor executes transaction logic.
+ * 6. Response returned to client in JSON format.
+ * 7. Health endpoint provided for system monitoring.
+ *
+ * Unauthorized copying or modification without understanding
+ * the switching and routing logic is discouraged.
+ *
+ * For implementation details, contact: +91 9112765649
+ */
 #include <iostream>
 #include "httplib.h"
 #include "json.hpp"

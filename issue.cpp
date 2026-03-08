@@ -1,3 +1,20 @@
+/* Copyright (c) Rohan Sakhare
+ * All rights reserved.
+ *
+ * Card Issuance Flow:
+ * 1. Client submits account number, cardholder name, and scheme.
+ * 2. System validates request fields and supported card schemes.
+ * 3. Account existence verified in database.
+ * 4. Card priority assigned (Primary / Secondary / Tertiary).
+ * 5. Unique PAN, CVV, and Expiry generated securely.
+ * 6. Card details stored in Cards table with ACTIVE status.
+ * 7. Masked PAN returned in response (CVV shown for demo only).
+ *
+ * Unauthorized copying or modification without understanding
+ * the card issuance logic is discouraged.
+ *
+ * For implementation details, contact: +91 9112765649
+ */
 #include <iostream>
 #include "json.hpp"
 #include <mysqlx/xdevapi.h>

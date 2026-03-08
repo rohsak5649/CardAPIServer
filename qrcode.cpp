@@ -1,8 +1,24 @@
-// qrcode.cpp — Basic QR payments (Option A)
-// - Purchase: debits account (accountNumber required).
-// - Refund: strict single-refund per purchase (uses origClientTxnId).
-// - Basic QR parser: looks for "mid=", "merchantName=", "amount=", "currency=" in qrData.
-// - Uses mysqlx::xdevapi (same style as your other modules).
+/*
+* QR Code Payment Processing Flow:
+ *
+ * PURCHASE:
+ * 1. User scans QR or provides QR data manually.
+ * 2. System extracts merchant, terminal, currency, and amount details.
+ * 3. Customer selects debit account for payment.
+ * 4. Balance check performed (amount + fee).
+ * 5. Amount debited from account and QR transaction recorded.
+ * 6. Transaction linked to master records and success response returned.
+ *
+ * REFUND:
+ * 1. Refund request must reference original QR purchase.
+ * 2. System verifies original transaction and account consistency.
+ * 3. Strict single-refund policy enforced.
+ * 4. Refund amount validated against original purchase amount.
+ * 5. Amount credited back to customer account.
+ * 6. Refund record stored with linkage to original transaction.
+ *
+ * Supports static and dynamic QR data parsing.
+ */
 
 #include <iostream>
 #include <sstream>
