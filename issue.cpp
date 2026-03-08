@@ -7,13 +7,19 @@
 
 using namespace mysqlx;
 using json = nlohmann::json;
-
 // ---------------------- BIN DEFINITIONS ------------------------
 std::string getBIN(const std::string& scheme) {
-    if (scheme == "VISA") return "411111";
-    if (scheme == "MASTERCARD") return "550000";
-    if (scheme == "RUPAY") return "608014";
-    return "000000";
+
+    if (scheme == "VISA")
+        return "411111";
+
+    if (scheme == "MASTERCARD")
+        return "550000";
+
+    if (scheme == "RUPAY")
+        return "608014";
+
+    throw std::invalid_argument("Invalid card scheme");
 }
 
 // ---------------------- GENERATE PAN ---------------------------
@@ -25,6 +31,7 @@ std::string generatePAN(const std::string& bin) {
     std::string pan = bin;
     for (int i = 0; i < 10; i++)
         pan += std::to_string(dist(gen));
+
     return pan;
 }
 
@@ -38,39 +45,62 @@ std::string generateCVV() {
 
 // ---------------------- GENERATE EXPIRY ------------------------
 std::string generateExpiry() {
-    return "12/26";  // static for demo
+    return "12/26";  // demo static
 }
 
 // ---------------------- MASK PAN ------------------------
 std::string maskPAN(const std::string& pan) {
-    if (pan.length() < 6) return "XXXXXX********";
+    if (pan.length() < 6)
+        return "XXXXXX********";
+
     return pan.substr(0, 6) + "XXXXXXXXXX";
 }
 
 // ---------------------- MAIN API: ISSUE CARD ------------------
 json processIssueCard(const json& data) {
+
     json response;
 
     try {
+
+        if (!data.contains("accountNumber") ||
+            !data.contains("cardholderName") ||
+            !data.contains("scheme")) {
+
+            response["errorCode"] = "ERR_INVALID_REQUEST";
+            response["message"] = "Missing required fields.";
+            return response;
+        }
+
         std::string account = data["accountNumber"];
         std::string name = data["cardholderName"];
         std::string scheme = data["scheme"];
-        std::string cardType = "";  // will be auto-decided
 
-        // Auto cardType logic
-        if (scheme == "RUPAY")
-            cardType = "DOMESTIC";
-        else
-            cardType = "INTERNATIONAL";
+        // ----------- Make Scheme Case-Insensitive -------------
+        std::transform(scheme.begin(), scheme.end(), scheme.begin(), ::toupper);
 
-        // DB session
+        // ----------- STRICT SCHEME VALIDATION ------------------
+        if (scheme != "VISA" &&
+            scheme != "MASTERCARD" &&
+            scheme != "RUPAY") {
+
+            response["errorCode"] = "ERR_INVALID_SCHEME";
+            response["message"] =
+                "Unsupported card scheme. Allowed values: VISA, MASTERCARD, RUPAY.";
+            return response;
+        }
+
+        std::string cardType =
+            (scheme == "RUPAY") ? "DOMESTIC" : "INTERNATIONAL";
+
+        // ---------------- DB CONNECTION ------------------------
         Session sess("localhost", 33060, "root", "Rohan@5649");
         Schema db = sess.getSchema("bankingdb");
 
         Table accounts = db.getTable("accounts");
         Table cards = db.getTable("cards");
 
-        // Validate account
+        // ----------- Validate Account --------------------------
         RowResult accRes = accounts.select("account_id")
             .where("account_number = :acc")
             .bind("acc", account)
@@ -79,10 +109,11 @@ json processIssueCard(const json& data) {
         if (accRes.count() == 0) {
             response["errorCode"] = "ERR_ACCOUNT_NOT_FOUND";
             response["message"] = "Account does not exist.";
+            sess.close();
             return response;
         }
 
-        // Count existing cards
+        // ----------- Check Existing Cards ----------------------
         RowResult cardCountRes = cards.select("COUNT(*)")
             .where("account_number = :acc")
             .bind("acc", account)
@@ -100,17 +131,19 @@ json processIssueCard(const json& data) {
             priority = "TERTIARY";
         else {
             response["errorCode"] = "ERR_MAX_CARD_LIMIT";
-            response["message"] = "Maximum number of cards reached (3).";
+            response["message"] =
+                "Maximum number of cards reached (3).";
+            sess.close();
             return response;
         }
 
-        // Generate card data
+        // ----------- Generate Card Data ------------------------
         std::string bin = getBIN(scheme);
         std::string pan = generatePAN(bin);
         std::string expiry = generateExpiry();
         std::string cvv = generateCVV();
 
-        // Insert into DB
+        // ----------- Insert into DB ----------------------------
         cards.insert(
             "pan", "scheme", "card_type", "expiry",
             "cvv", "cardholder_name", "account_number",
@@ -125,10 +158,10 @@ json processIssueCard(const json& data) {
 
         sess.close();
 
-        // MASK THE PAN FOR RESPONSE
+        // ----------- Mask PAN for Response ---------------------
         std::string maskedPAN = maskPAN(pan);
 
-        // Final Response
+        // ----------- Success Response --------------------------
         response["status"] = "SUCCESS";
         response["message"] = "Card issued successfully";
         response["priorityAssigned"] = priority;
@@ -138,7 +171,7 @@ json processIssueCard(const json& data) {
             {"scheme", scheme},
             {"cardType", cardType},
             {"expiry", expiry},
-            {"cvv", cvv},
+            {"cvv", cvv},   // ⚠ In real banking NEVER return CVV
             {"cardholderName", name},
             {"accountNumber", account}
         };

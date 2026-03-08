@@ -1,8 +1,26 @@
-// pos.cpp — STRICT SINGLE-REFUND IMPLEMENTATION
-// - Refund allowed only once per original purchase (origClientTxnId).
-// - Refund rows store original_purchase_id to make checks accurate.
-// - Uses MySQL Connector/C++ X DevAPI (mysqlx).
-// - ARM/mac-safe (int64_t), no broken sess.sql binds.
+// pos.cpp — PURCHASE + REAL-WORLD STYLE REFUND LOGIC
+// Schema assumptions (from your current DB):
+//   cards(account_number, scheme, cvv, status, expiry, pan, ...)
+//   accounts(account_number, currency, balance, ...)
+//   transaction_pos(
+//       id, transaction_id, client_txn_id, original_purchase_id,
+//       merchant_id, terminal_id, location, account_number,
+//       amount, fee, card_pan, card_scheme,
+//       status, message, created_at
+//   )
+//   transactions(table_name, reference_id, status, ...)
+//
+// Transaction types supported:
+//   PURCHASE
+//   REFUND
+//
+// REFUND behaviour:
+//   - Prefer `origTransactionId` (maps to transaction_pos.transaction_id).
+//   - If not present, use latest successful purchase for `origClientTxnId`.
+//   - Multiple partial refunds allowed until original amount is fully refunded.
+//   - Refund always credits the original purchase account and uses the
+//     original card PAN for the refund record.
+//
 
 #include <iostream>
 #include <sstream>
@@ -25,8 +43,11 @@ static std::string genPosTxnId() {
 
 json processPOSTransaction(const json &data) {
     json res;
+
+    // We’ll keep one session for the whole function
+    // and use transactions only when we modify balances.
     try {
-        // Basic extraction
+        // --------------- Common fields ----------------
         std::string clientTxnId = data.value("clientTxnId", genPosTxnId());
         std::string txnType     = data.value("transactionType", std::string("PURCHASE"));
         std::string merchantId  = data.value("merchantId", std::string());
@@ -36,94 +57,112 @@ json processPOSTransaction(const json &data) {
         double fee              = data.value("fee", 0.0);
         std::string currency    = data.value("currency", std::string("USD"));
 
-        if (!data.contains("card")) {
-            res["errorCode"] = "ERR_MISSING_CARD";
-            res["message"] = "card object required";
+        if (amount < 0.0) {
+            res["errorCode"] = "ERR_INVALID_AMOUNT";
+            res["message"]   = "Amount cannot be negative.";
             return res;
         }
 
-        json card = data["card"];
-        std::string pan    = card.value("pan", std::string());
-        std::string expiry = card.value("expiry", std::string());
-        std::string cvv    = card.value("cvv", std::string());
-
-        if (pan.empty() || expiry.empty()) {
-            res["errorCode"] = "ERR_CARD_INCOMPLETE";
-            res["message"] = "PAN and expiry required";
-            return res;
-        }
-
-        // DB connection (adjust if your host/port/credentials differ)
+        // DB connection (adjust if needed)
         Session sess("localhost", 33060, "root", "Rohan@5649");
         Schema db = sess.getSchema("bankingdb");
-
         Table cards    = db.getTable("cards");
         Table accounts = db.getTable("accounts");
         Table posTbl   = db.getTable("transaction_pos");
         Table master   = db.getTable("transactions");
 
-        // Validate card
-        RowResult cardRes = cards.select("account_number","scheme","cvv","status")
-            .where("pan = :p AND expiry = :e")
-            .bind("p", pan)
-            .bind("e", expiry)
-            .execute();
-
-        if (cardRes.count() == 0) {
-            res["errorCode"] = "ERR_CARD_NOT_FOUND";
-            res["message"] = "Card not found for given PAN/expiry.";
-            return res;
-        }
-
-        Row cardRow = cardRes.fetchOne();
-        std::string accNo      = cardRow[0].get<std::string>();
-        std::string cardScheme = cardRow[1].isNull() ? std::string() : cardRow[1].get<std::string>();
-        std::string dbCvv      = cardRow[2].isNull() ? std::string() : cardRow[2].get<std::string>();
-        std::string cardStatus = cardRow[3].isNull() ? std::string() : cardRow[3].get<std::string>();
-
-        if (cardStatus != "ACTIVE") {
-            res["errorCode"] = "ERR_CARD_NOT_ACTIVE";
-            res["message"] = "Card is not active.";
-            return res;
-        }
-
-        // Optional CVV check (if provided)
-        if (!cvv.empty()) {
-            if (!dbCvv.empty() && cvv != dbCvv) {
-                res["errorCode"] = "ERR_CVV_MISMATCH";
-                res["message"] = "Provided CVV does not match stored CVV.";
-                return res;
-            }
-        }
-
-        // Fetch account details
-        RowResult accRes = accounts.select("currency","balance")
-            .where("account_number = :a")
-            .bind("a", accNo)
-            .execute();
-
-        if (accRes.count() == 0) {
-            res["errorCode"] = "ERR_ACCOUNT_NOT_FOUND";
-            res["message"] = "Linked account not found.";
-            return res;
-        }
-
-        Row accRow = accRes.fetchOne();
-        std::string accCurrency = accRow[0].get<std::string>();
-        double balance = accRow[1].get<double>();
-
+        bool txStarted = false;
         std::string txnId = genPosTxnId();
-        std::string scope = (accCurrency == currency) ? "DOMESTIC" : "INTERNATIONAL";
 
-        // ----------------- PURCHASE -----------------
+        // ==========================================================
+        //                        PURCHASE
+        // ==========================================================
         if (txnType == "PURCHASE") {
-            if (balance < (amount + fee)) {
-                res["errorCode"] = "ERR_INSUFFICIENT_FUNDS";
-                res["message"] = "Not enough balance.";
+            if (!data.contains("card")) {
+                res["errorCode"] = "ERR_MISSING_CARD";
+                res["message"]   = "card object required for purchase.";
                 return res;
             }
 
-            double newBal = balance - (amount + fee);
+            json card = data["card"];
+            std::string pan    = card.value("pan", std::string());
+            std::string expiry = card.value("expiry", std::string());
+            std::string cvv    = card.value("cvv", std::string());
+
+            if (pan.empty() || expiry.empty()) {
+                res["errorCode"] = "ERR_CARD_INCOMPLETE";
+                res["message"]   = "PAN and expiry required.";
+                return res;
+            }
+
+            // Validate card from cards table
+            RowResult cardRes = cards.select("account_number","scheme","cvv","status")
+                .where("pan = :p AND expiry = :e")
+                .bind("p", pan)
+                .bind("e", expiry)
+                .execute();
+
+            if (cardRes.count() == 0) {
+                res["errorCode"] = "ERR_CARD_NOT_FOUND";
+                res["message"]   = "Card not found for given PAN/expiry.";
+                return res;
+            }
+
+            Row cardRow = cardRes.fetchOne();
+            std::string accNo      = cardRow[0].get<std::string>();
+            std::string cardScheme = cardRow[1].isNull()? std::string() : cardRow[1].get<std::string>();
+            std::string dbCvv      = cardRow[2].isNull()? std::string() : cardRow[2].get<std::string>();
+            std::string cardStatus = cardRow[3].isNull()? std::string() : cardRow[3].get<std::string>();
+
+            if (cardStatus != "ACTIVE") {
+                res["errorCode"] = "ERR_CARD_NOT_ACTIVE";
+                res["message"]   = "Card is not active.";
+                return res;
+            }
+
+            // Optional CVV check
+            if (!cvv.empty() && !dbCvv.empty() && cvv != dbCvv) {
+                res["errorCode"] = "ERR_CVV_MISMATCH";
+                res["message"]   = "Provided CVV does not match stored CVV.";
+                return res;
+            }
+
+            // Load account
+            RowResult accRes = accounts.select("currency","balance")
+                .where("account_number = :a")
+                .bind("a", accNo)
+                .execute();
+
+            if (accRes.count() == 0) {
+                res["errorCode"] = "ERR_ACCOUNT_NOT_FOUND";
+                res["message"]   = "Linked account not found.";
+                return res;
+            }
+
+            Row accRow = accRes.fetchOne();
+            std::string accCurrency = accRow[0].get<std::string>();
+            double balance          = accRow[1].get<double>();
+
+            std::string scope = (accCurrency == currency) ? "DOMESTIC" : "INTERNATIONAL";
+
+            double totalDebit = amount + fee;
+            if (totalDebit <= 0.0) {
+                res["errorCode"] = "ERR_INVALID_AMOUNT";
+                res["message"]   = "Total debit must be positive.";
+                return res;
+            }
+
+            if (balance < totalDebit) {
+                res["errorCode"] = "ERR_INSUFFICIENT_FUNDS";
+                res["message"]   = "Not enough balance.";
+                return res;
+            }
+
+            // ---- Start atomic DB transaction for debit + inserts ----
+            txStarted = true;
+            sess.startTransaction();
+
+            double newBal = balance - totalDebit;
 
             // Update balance
             accounts.update()
@@ -132,7 +171,7 @@ json processPOSTransaction(const json &data) {
                 .bind("a", accNo)
                 .execute();
 
-            // Insert purchase row; original_purchase_id is NULL for purchases
+            // Insert purchase row (original_purchase_id is NULL)
             auto ins = posTbl.insert(
                 "transaction_id","client_txn_id","merchant_id","terminal_id",
                 "location","account_number","amount","fee","card_pan","card_scheme",
@@ -145,114 +184,229 @@ json processPOSTransaction(const json &data) {
 
             int64_t childId = ins.getAutoIncrementValue();
 
-            // Insert master row
+            // Insert into master table
             master.insert("table_name","reference_id","status")
                 .values("transaction_pos", childId, "SUCCESS")
                 .execute();
 
-            res["transactionId"] = txnId;
-            res["status"] = "SUCCESS";
-            res["balanceAfter"] = newBal;
+            sess.commit();
+            txStarted = false;
+
+            res["transactionId"]    = txnId;
+            res["status"]           = "SUCCESS";
+            res["balanceAfter"]     = newBal;
             res["transactionScope"] = scope;
             return res;
         }
 
-        // ----------------- REFUND (STRICT SINGLE REFUND) -----------------
+        // ==========================================================
+        //                          REFUND
+        // ==========================================================
         if (txnType == "REFUND") {
-            if (!data.contains("origClientTxnId")) {
+            // Prefer origTransactionId (transaction_pos.transaction_id)
+            std::string origTransId  = data.value("origTransactionId", std::string());
+            std::string origClientId = data.value("origClientTxnId", std::string());
+
+            if (origTransId.empty() && origClientId.empty()) {
                 res["errorCode"] = "ERR_MISSING_ORIGINAL";
-                res["message"] = "origClientTxnId required for refund.";
+                res["message"]   = "origTransactionId or origClientTxnId required for refund.";
                 return res;
             }
 
-            std::string origClient = data["origClientTxnId"].get<std::string>();
+            if (amount <= 0.0) {
+                res["errorCode"] = "ERR_INVALID_REFUND_AMOUNT";
+                res["message"]   = "Refund amount must be positive.";
+                return res;
+            }
 
-            // Locate original purchase row (must be a successful POS purchase)
-            RowResult purchRes = posTbl.select("id","amount","card_pan")
-                .where("client_txn_id = :cid AND message = 'POS purchase successful'")
-                .bind("cid", origClient)
-                .execute();
+            // ---- 1) Locate the original purchase row ----
+            RowResult purchRes;
+
+            if (!origTransId.empty()) {
+                // Exact mapping: best / real-world style
+                purchRes = posTbl.select(
+                        "id","transaction_id","client_txn_id",
+                        "amount","account_number","card_pan","card_scheme",
+                        "merchant_id","terminal_id"
+                    )
+                    .where("transaction_id = :tid AND message = 'POS purchase successful'")
+                    .bind("tid", origTransId)
+                    .execute();
+            } else {
+                // Fallback: latest successful purchase for this clientTxnId
+                purchRes = posTbl.select(
+                        "id","transaction_id","client_txn_id",
+                        "amount","account_number","card_pan","card_scheme",
+                        "merchant_id","terminal_id"
+                    )
+                    .where("client_txn_id = :cid AND message = 'POS purchase successful'")
+                    .orderBy("id DESC")
+                    .limit(1)
+                    .bind("cid", origClientId)
+                    .execute();
+            }
 
             if (purchRes.count() == 0) {
                 res["errorCode"] = "ERR_PURCHASE_NOT_FOUND";
-                res["message"] = "Original POS purchase not found for given origClientTxnId.";
+                res["message"]   = "Original POS purchase not found.";
                 return res;
             }
 
             Row purchRow = purchRes.fetchOne();
-            int64_t purchaseDbId = purchRow[0].get<int64_t>();
-            double purchaseAmount = purchRow[1].get<double>();
-            std::string purchasePan = purchRow[2].get<std::string>();
 
-            // PAN must match original purchase
-            if (purchasePan != pan) {
-                res["errorCode"] = "ERR_PAN_MISMATCH";
-                res["message"] = "Refund PAN does not match original purchase PAN.";
+            int64_t purchaseDbId     = purchRow[0].get<int64_t>();
+            std::string purchaseTxnId= purchRow[1].get<std::string>();
+            std::string purchaseCliId= purchRow[2].get<std::string>();
+            double purchaseAmount    = purchRow[3].get<double>();
+            std::string accNo        = purchRow[4].get<std::string>();
+            std::string purchasePan  = purchRow[5].get<std::string>();
+            std::string purchaseScheme = purchRow[6].isNull()? std::string() : purchRow[6].get<std::string>();
+            std::string purchMid     = purchRow[7].get<std::string>();
+            std::string purchTid     = purchRow[8].get<std::string>();
+
+            // If both ids provided, ensure they refer to same purchase
+            if (!origClientId.empty() && origClientId != purchaseCliId) {
+                res["errorCode"] = "ERR_ORIGINAL_ID_MISMATCH";
+                res["message"]   = "origClientTxnId does not match the original transaction.";
                 return res;
             }
 
-            // Check if ANY refund already exists for this purchase (strict single refund)
-            RowResult alreadyRefundedRes = posTbl.select("id")
+            // 2) Merchant / terminal consistency
+            if (!merchantId.empty() && merchantId != purchMid) {
+                res["errorCode"] = "ERR_MERCHANT_MISMATCH";
+                res["message"]   = "Refund merchantId does not match original purchase.";
+                return res;
+            }
+            if (!terminalId.empty() && terminalId != purchTid) {
+                res["errorCode"] = "ERR_TERMINAL_MISMATCH";
+                res["message"]   = "Refund terminalId does not match original purchase.";
+                return res;
+            }
+
+            // 3) Optional card verification (real world: must use same card)
+            if (data.contains("card")) {
+                json card = data["card"];
+                std::string pan    = card.value("pan", std::string());
+                std::string expiry = card.value("expiry", std::string());
+                std::string cvv    = card.value("cvv", std::string());
+
+                if (!pan.empty() && pan != purchasePan) {
+                    res["errorCode"] = "ERR_PAN_MISMATCH";
+                    res["message"]   = "Refund PAN does not match original purchase PAN.";
+                    return res;
+                }
+
+                // If expiry/cvv given you could optionally re-check against cards table;
+                // for now we trust the original card + PAN.
+            }
+
+            // 4) How much already refunded for this purchase?
+            RowResult sumRes = posTbl.select("IFNULL(SUM(amount),0)")
                 .where("original_purchase_id = :pid AND message = 'Refund successful'")
                 .bind("pid", purchaseDbId)
                 .execute();
 
-            if (alreadyRefundedRes.count() > 0) {
-                res["errorCode"] = "ERR_ALREADY_REFUNDED";
-                res["message"] = "This purchase has already been refunded (strict single-refund policy).";
+            double alreadyRefunded = 0.0;
+            if (sumRes.count() > 0) {
+                Row r = sumRes.fetchOne();
+                alreadyRefunded = r[0].get<double>();
+            }
+
+            double remaining = purchaseAmount - alreadyRefunded;
+
+            if (remaining <= 0.0) {
+                res["errorCode"]         = "ERR_ALREADY_REFUNDED";
+                res["message"]           = "Purchase already fully refunded.";
+                res["purchaseAmount"]    = purchaseAmount;
+                res["alreadyRefunded"]   = alreadyRefunded;
+                res["remainingRefundable"] = 0.0;
                 return res;
             }
 
-            // Optionally enforce refund amount <= purchase amount (we'll enforce)
-            if (amount > purchaseAmount) {
-                res["errorCode"] = "ERR_REFUND_EXCEEDS_PURCHASE";
-                res["message"] = "Refund amount exceeds original purchase amount.";
-                res["purchaseAmount"] = purchaseAmount;
+            if (amount > remaining) {
+                res["errorCode"]         = "ERR_REFUND_EXCEEDS_REMAINING";
+                res["message"]           = "Refund amount exceeds remaining refundable amount.";
+                res["purchaseAmount"]    = purchaseAmount;
+                res["alreadyRefunded"]   = alreadyRefunded;
+                res["remainingRefundable"] = remaining;
                 return res;
             }
 
-            // Credit the account
-            double newBal = balance + amount;
+            // 5) Credit the original account, atomically
+            RowResult accRes = accounts.select("balance")
+                .where("account_number = :a")
+                .bind("a", accNo)
+                .execute();
+
+            if (accRes.count() == 0) {
+                res["errorCode"] = "ERR_ACCOUNT_NOT_FOUND";
+                res["message"]   = "Original account for purchase not found.";
+                return res;
+            }
+
+            double balance = accRes.fetchOne()[0].get<double>();
+            double newBal  = balance + amount;
+
+            txStarted = true;
+            sess.startTransaction();
+
+            // Update balance
             accounts.update()
                 .set("balance", newBal)
                 .where("account_number = :a")
                 .bind("a", accNo)
                 .execute();
 
-            // Insert refund row and set original_purchase_id = purchaseDbId
+            // Insert refund row
             auto insRefund = posTbl.insert(
                 "transaction_id","client_txn_id","merchant_id","terminal_id",
                 "location","account_number","amount","fee","card_pan","card_scheme",
                 "status","message","original_purchase_id"
             ).values(
-                txnId, clientTxnId, merchantId, terminalId, location,
-                accNo, amount, 0.0, pan, cardScheme,
-                "SUCCESS", "Refund successful", purchaseDbId
+                txnId,
+                clientTxnId,          // new client txn id for refund
+                purchMid,             // force same merchant/terminal as purchase
+                purchTid,
+                location,             // current POS location (or could reuse purchase location)
+                accNo,
+                amount,
+                0.0,                  // usually no fee on refund
+                purchasePan,
+                purchaseScheme,
+                "SUCCESS",
+                "Refund successful",
+                purchaseDbId
             ).execute();
 
             int64_t refundChildId = insRefund.getAutoIncrementValue();
 
-            // Insert master row
             master.insert("table_name","reference_id","status")
                 .values("transaction_pos", refundChildId, "SUCCESS")
                 .execute();
 
-            res["transactionId"] = txnId;
-            res["status"] = "SUCCESS";
-            res["balanceAfter"] = newBal;
-            res["purchaseAmount"] = purchaseAmount;
-            res["refundedAmount"] = amount;
+            sess.commit();
+            txStarted = false;
+
+            res["transactionId"]      = txnId;
+            res["status"]             = "SUCCESS";
+            res["balanceAfter"]       = newBal;
+            res["purchaseAmount"]     = purchaseAmount;
+            res["alreadyRefunded"]    = alreadyRefunded + amount;
+            res["remainingRefundable"]= purchaseAmount - (alreadyRefunded + amount);
+            res["originalTransactionId"] = purchaseTxnId;
             return res;
         }
 
-        // Unsupported type
+        // ==========================================================
+        //                   Unsupported transaction type
+        // ==========================================================
         res["errorCode"] = "ERR_INVALID_TYPE";
-        res["message"] = "Unsupported POS transactionType. Only PURCHASE and REFUND allowed.";
+        res["message"]   = "Unsupported POS transactionType. Only PURCHASE and REFUND allowed.";
         return res;
     }
     catch (const std::exception &e) {
         res["errorCode"] = "ERR_EXCEPTION";
-        res["message"] = e.what();
+        res["message"]   = e.what();
         return res;
     }
 }
