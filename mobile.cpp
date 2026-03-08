@@ -52,7 +52,7 @@ json processMobileTransaction(const json &data) {
         std::string deviceId    = data["deviceId"];
         std::string mobileNo    = data["mobileNumber"];
 
-        Session sess("localhost", 33060, "root", "Rohan@5649");
+        Session sess("localhost", 33060, "root", "YourPassword");
         sess.sql("USE bankingdb").execute();   // ✅ FIX ADDED
         Schema db = sess.getSchema("bankingdb");
 

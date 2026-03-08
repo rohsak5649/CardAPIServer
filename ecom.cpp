@@ -65,7 +65,7 @@ json processECOMTransaction(const json &data) {
         }
 
         // DB Session
-        Session sess("localhost", 33060, "root", "Rohan@5649");
+        Session sess("localhost", 33060, "root", "YourPassword");
         Schema db = sess.getSchema("bankingdb");
 
         Table cards = db.getTable("cards");

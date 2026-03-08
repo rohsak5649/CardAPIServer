@@ -121,7 +121,7 @@ json processQRCodePayment(const json &data) {
         }
 
         // DB connection (adjust credentials if needed)
-        Session sess("localhost", 33060, "root", "Rohan@5649");
+        Session sess("localhost", 33060, "root", "YourPassword");
         Schema db = sess.getSchema("bankingdb");
 
         Table accounts = db.getTable("accounts");

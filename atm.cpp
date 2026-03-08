@@ -36,7 +36,7 @@ json processATMTransaction(const json& data) {
         double amount             = data["amount"];
         double fee                = data["fee"];
 
-        Session sess("localhost", 33060, "root", "Rohan@5649");
+        Session sess("localhost", 33060, "root", "YourPassword");
         Schema db = sess.getSchema("bankingdb");
 
         Table cards = db.getTable("cards");
