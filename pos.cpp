@@ -1,26 +1,24 @@
-// pos.cpp — PURCHASE + REAL-WORLD STYLE REFUND LOGIC
-// Schema assumptions (from your current DB):
-//   cards(account_number, scheme, cvv, status, expiry, pan, ...)
-//   accounts(account_number, currency, balance, ...)
-//   transaction_pos(
-//       id, transaction_id, client_txn_id, original_purchase_id,
-//       merchant_id, terminal_id, location, account_number,
-//       amount, fee, card_pan, card_scheme,
-//       status, message, created_at
-//   )
-//   transactions(table_name, reference_id, status, ...)
-//
-// Transaction types supported:
-//   PURCHASE
-//   REFUND
-//
-// REFUND behaviour:
-//   - Prefer `origTransactionId` (maps to transaction_pos.transaction_id).
-//   - If not present, use latest successful purchase for `origClientTxnId`.
-//   - Multiple partial refunds allowed until original amount is fully refunded.
-//   - Refund always credits the original purchase account and uses the
-//     original card PAN for the refund record.
-//
+/*
+* POS Transaction Processing Flow:
+ *
+ * PURCHASE:
+ * 1. POS sends card and payment details.
+ * 2. System validates card status, CVV, and linked account.
+ * 3. Balance check performed (amount + fee).
+ * 4. Amount debited atomically from customer account.
+ * 5. POS transaction stored and linked in master records.
+ * 6. Success response returned with updated balance.
+ *
+ * REFUND:
+ * 1. POS sends original transaction reference.
+ * 2. System validates original purchase and merchant/terminal.
+ * 3. Ensures refund does not exceed original purchase amount.
+ * 4. Amount credited atomically back to customer account.
+ * 5. Refund record stored with linkage to original purchase.
+ * 6. Response returned with refund status and balance update.
+ *
+ * Ensures transactional integrity using database transactions.
+ */
 
 #include <iostream>
 #include <sstream>
@@ -64,7 +62,7 @@ json processPOSTransaction(const json &data) {
         }
 
         // DB connection (adjust if needed)
-        Session sess("localhost", 33060, "root", "Rohan@5649");
+        Session sess("localhost", 33060, "root", "YourPassword");
         Schema db = sess.getSchema("bankingdb");
         Table cards    = db.getTable("cards");
         Table accounts = db.getTable("accounts");

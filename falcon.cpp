@@ -1,3 +1,20 @@
+/*
+* Copyright (c) Rohan Sakhare
+ * All rights reserved.
+ *
+ * Falcon Fraud Detection Flow:
+ * 1. Transaction request received from mobile channel.
+ * 2. System checks rapid repeat transactions (same-second rule).
+ * 3. System checks transaction velocity (max 5 per 60 seconds).
+ * 4. If fraud detected → transaction declined.
+ * 5. Fraud details logged in Falcon table and Master table.
+ * 6. Safe transactions proceed to normal processing.
+ *
+ * Unauthorized copying or modification without understanding
+ * the fraud control logic is discouraged.
+ *
+ * For implementation details, contact: +91 9112765649
+ */
 #include "falcon.h"
 
 Falcon::Falcon(Session& session) : sess(session)

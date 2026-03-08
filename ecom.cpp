@@ -1,3 +1,20 @@
+/*
+* Copyright (c) Rohan Sakhare
+ * All rights reserved.
+ *
+ * E-Commerce Transaction Flow (ECOM):
+ * 1. Client sends purchase/refund request with card & order details.
+ * 2. System validates card, CVV, and account status.
+ * 3. Balance check performed for purchase transactions.
+ * 4. Amount debited (purchase) or credited (refund).
+ * 5. Transaction recorded in ECOM and Master tables.
+ * 6. Response returned with transaction status and updated balance.
+ *
+ * Unauthorized copying or modification without understanding
+ * the transaction flow is discouraged.
+ *
+ * For implementation details, contact: +91 9112765649
+ */
 #include <iostream>
 #include <sstream>
 #include <random>
@@ -48,7 +65,7 @@ json processECOMTransaction(const json &data) {
         }
 
         // DB Session
-        Session sess("localhost", 33060, "root", "Rohan@5649");
+        Session sess("localhost", 33060, "root", "YourPassword");
         Schema db = sess.getSchema("bankingdb");
 
         Table cards = db.getTable("cards");

@@ -1,3 +1,22 @@
+/*
+* RingPay (Wearable Contactless Payment) Processing Flow:
+ *
+ * 1. Customer taps wearable device linked to PRIMARY active card.
+ * 2. System validates card status, priority, and linked account state.
+ * 3. Secure payment token fetched or generated for the device.
+ * 4. Multiple safety checks enforced:
+ *    • Per-transaction spending limit
+ *    • Daily spending limit
+ *    • Merchant-specific spending limit
+ *    • Real-time risk scoring based on usage patterns
+ * 5. Account balance verified before debit.
+ * 6. Amount debited and transaction recorded in processing state.
+ * 7. Random failure simulation may trigger automatic reversal.
+ * 8. Successful transactions finalized and linked to master records.
+ * 9. Response returned with token, risk score, and updated balance.
+ *
+ * Designed for secure low-latency NFC wearable payments.
+ */
 #include <iostream>
 #include "json.hpp"
 #include <mysqlx/xdevapi.h>
@@ -47,7 +66,7 @@ json processRingPayTransaction(const json& data) {
         std::string merchant  = data["merchantId"];
 
         // -------- DB SESSION --------
-        Session sess("localhost", 33060, "root", "Rohan@5649");
+        Session sess("localhost", 33060, "root", "YourPassword");
         Schema db = sess.getSchema("bankingdb");
 
         Table cards        = db.getTable("cards");
