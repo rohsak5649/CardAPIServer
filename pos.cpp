@@ -26,7 +26,7 @@
 #include <chrono>
 #include <mysqlx/xdevapi.h>
 #include "json.hpp"
-
+#include "Database.h"
 using namespace mysqlx;
 using json = nlohmann::json;
 
@@ -62,8 +62,8 @@ json processPOSTransaction(const json &data) {
         }
 
         // DB connection (adjust if needed)
-        Session sess("localhost", 33060, "root", "YourPassword");
-        Schema db = sess.getSchema("bankingdb");
+        Session& sess = Database::getSession();
+        Schema db = Database::getSchema();
         Table cards    = db.getTable("cards");
         Table accounts = db.getTable("accounts");
         Table posTbl   = db.getTable("transaction_pos");

@@ -16,7 +16,7 @@
  * For implementation details, contact: +91 9112765649
  */
 #include "falcon.h"
-
+#include "Database.h"
 Falcon::Falcon(Session& session) : sess(session)
 {
     sess.sql("USE bankingdb").execute();

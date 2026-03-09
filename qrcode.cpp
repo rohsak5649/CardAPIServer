@@ -28,6 +28,7 @@
 #include <algorithm>
 #include <mysqlx/xdevapi.h>
 #include "json.hpp"
+#include "Database.h"
 
 using namespace mysqlx;
 using json = nlohmann::json;
@@ -121,8 +122,8 @@ json processQRCodePayment(const json &data) {
         }
 
         // DB connection (adjust credentials if needed)
-        Session sess("localhost", 33060, "root", "YourPassword");
-        Schema db = sess.getSchema("bankingdb");
+        Session& sess = Database::getSession();
+        Schema db = Database::getSchema();
 
         Table accounts = db.getTable("accounts");
         Table qrTable  = db.getTable("transaction_qrcode");
