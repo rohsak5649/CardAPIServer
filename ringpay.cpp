@@ -23,6 +23,7 @@
 #include <chrono>
 #include <random>
 #include <sstream>
+#include "Database.h"
 
 using namespace mysqlx;
 using json = nlohmann::json;
@@ -66,8 +67,8 @@ json processRingPayTransaction(const json& data) {
         std::string merchant  = data["merchantId"];
 
         // -------- DB SESSION --------
-        Session sess("localhost", 33060, "root", "YourPassword");
-        Schema db = sess.getSchema("bankingdb");
+        Session& sess = Database::getSession();
+        Schema db = Database::getSchema();
 
         Table cards        = db.getTable("cards");
         Table accounts     = db.getTable("accounts");

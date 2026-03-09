@@ -39,7 +39,7 @@
 #include "ecom.h"
 #include "qrcode.h"
 #include "ringpay.h"
-
+#include "Database.h"
 
 using json = nlohmann::json;
 

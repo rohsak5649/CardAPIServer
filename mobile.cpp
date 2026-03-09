@@ -24,6 +24,7 @@
 #include <sstream>
 #include <random>
 #include "falcon.h"
+#include "Database.h"
 
 using namespace mysqlx;
 using json = nlohmann::json;
@@ -52,9 +53,8 @@ json processMobileTransaction(const json &data) {
         std::string deviceId    = data["deviceId"];
         std::string mobileNo    = data["mobileNumber"];
 
-        Session sess("localhost", 33060, "root", "YourPassword");
-        sess.sql("USE bankingdb").execute();   // ✅ FIX ADDED
-        Schema db = sess.getSchema("bankingdb");
+        Session& sess = Database::getSession();
+        Schema db = Database::getSchema();
 
         Table accounts     = db.getTable("accounts");
         Table cards        = db.getTable("cards");
@@ -88,7 +88,7 @@ json processMobileTransaction(const json &data) {
             response["status"] = "DECLINED";
             response["message"] = fraudReason;
 
-            sess.close();
+            //sess.close();
             return response;
         }
 
@@ -266,7 +266,7 @@ json processMobileTransaction(const json &data) {
         response["status"] = "SUCCESS";
         response["balanceAfterDebit"] = debitNew;
 
-        sess.close();
+        //sess.close();
         return response;
     }
     catch (const std::exception &e) {
