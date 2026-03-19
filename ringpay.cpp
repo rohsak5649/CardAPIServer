@@ -226,7 +226,7 @@ json processRingPayTransaction(const json& data) {
         response["balanceAfter"] = newBal;
         response["riskScore"] = risk;
 
-        sess.close();
+        //sess.close();
         return response;
     }
     catch (const std::exception &e) {
