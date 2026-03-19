@@ -127,7 +127,7 @@ json processIssueCard(const json& data) {
         if (accRes.count() == 0) {
             response["errorCode"] = "ERR_ACCOUNT_NOT_FOUND";
             response["message"] = "Account does not exist.";
-            sess.close();
+            //sess.close();
             return response;
         }
 
@@ -151,7 +151,7 @@ json processIssueCard(const json& data) {
             response["errorCode"] = "ERR_MAX_CARD_LIMIT";
             response["message"] =
                 "Maximum number of cards reached (3).";
-            sess.close();
+            //sess.close();
             return response;
         }
 
@@ -174,7 +174,7 @@ json processIssueCard(const json& data) {
         )
         .execute();
 
-        sess.close();
+
 
         // ----------- Mask PAN for Response ---------------------
         std::string maskedPAN = maskPAN(pan);

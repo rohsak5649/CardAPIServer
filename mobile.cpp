@@ -1,21 +1,7 @@
 /*
 * Copyright (c) Rohan Sakhare
- * All rights reserved.
- *
- * Card Issuance Flow:
- * 1. Client submits account number, cardholder name, and scheme.
- * 2. System validates request fields and supported card schemes.
- * 3. Account existence verified in database.
- * 4. Card priority assigned (Primary / Secondary / Tertiary).
- * 5. Unique PAN, CVV, and Expiry generated securely.
- * 6. Card details stored in Cards table with ACTIVE status.
- * 7. Masked PAN returned in response (CVV shown for demo only).
- *
- * Unauthorized copying or modification without understanding
- * the card issuance logic is discouraged.
- *
- * For implementation details, contact: +91 9112765649
- */
+* All rights reserved.
+*/
 
 #include <iostream>
 #include "json.hpp"
@@ -23,8 +9,10 @@
 #include <chrono>
 #include <sstream>
 #include <random>
+#include <future>   // ✅ NEW
 #include "falcon.h"
 #include "Database.h"
+#include "pin.h"
 
 using namespace mysqlx;
 using json = nlohmann::json;
@@ -40,13 +28,20 @@ std::string generateMobileTxnId() {
     oss << "mobile-txn-" << ms << "-" << r;
     return oss.str();
 }
-json processMobileTransaction(const json &data) {
+
+// ================= CORE FUNCTION (ORIGINAL + SAFE ADDITIONS) =================
+json processMobileTransactionCore(const json &data) {
     json response;
 
     try {
         std::string clientTxnId = data["clientTxnId"];
         std::string txnType     = data["transactionType"];
-        std::string debitAcc    = data["debitAccount"]["accountNumber"];
+
+        // ✅ KEEP EXISTING (fallback)
+        std::string debitAcc = "";
+        if (data.contains("debitAccount"))
+            debitAcc = data["debitAccount"]["accountNumber"];
+
         std::string creditAcc   = data["creditAccount"]["accountNumber"];
         double amount           = data["amount"];
         double fee              = data["fee"];
@@ -62,14 +57,62 @@ json processMobileTransaction(const json &data) {
         Table masterTable  = db.getTable("transactions");
 
         sess.startTransaction();
-        // ------------------ FALCON FRAUD CHECK ------------------
+
+        // ================== ✅ NEW: PAN FLOW (NON-BREAKING) ==================
+        if (data.contains("pan") && data.contains("pin")) {
+
+            std::string inputPan = data["pan"];
+            std::string inputPin = data["pin"];
+
+            if (inputPan.length() != 16) {
+                response["errorCode"] = "ERR_INVALID_PAN";
+                response["message"] = "Invalid PAN format.";
+                sess.rollback();
+                return response;
+            }
+
+            // Fetch account from PAN
+            RowResult accFetch = cards.select("account_number")
+                .where("pan = :pan AND card_priority = 'PRIMARY'")
+                .bind("pan", inputPan)
+                .execute();
+
+            if (accFetch.count() == 0) {
+                response["errorCode"] = "ERR_CARD_NOT_FOUND";
+                response["message"] = "Invalid PAN.";
+                sess.rollback();
+                return response;
+            }
+
+            // ✅ override debit account
+            debitAcc = accFetch.fetchOne()[0].get<std::string>();
+
+            // PIN verification
+            try {
+                auto& pinService = PINService::getInstance();
+
+                if (!pinService.verifyPIN(inputPan, inputPin)) {
+                    response["errorCode"] = "ERR_INVALID_PIN";
+                    response["message"] = "PIN verification failed.";
+                    sess.rollback();
+                    return response;
+                }
+            }
+            catch (const std::exception& e) {
+                response["errorCode"] = "ERR_PIN_SYSTEM";
+                response["message"] = e.what();
+                sess.rollback();
+                return response;
+            }
+        }
+
+        // ================== EXISTING FALCON LOGIC ==================
         Falcon falcon(sess);
 
         std::string fraudReason;
         bool isFraud = falcon.checkFraud(debitAcc, amount, fraudReason);
 
         if (isFraud) {
-
             std::string txnId = generateMobileTxnId();
 
             falcon.logFraud(
@@ -82,16 +125,13 @@ json processMobileTransaction(const json &data) {
                 fraudReason
             );
 
-            sess.commit();   // commit fraud log
+            sess.commit();
 
             response["transactionId"] = txnId;
             response["status"] = "DECLINED";
             response["message"] = fraudReason;
-
-            //sess.close();
             return response;
         }
-
 
         // ------------------ Validate type ------------------
         if (txnType != "FUND_TRANSFER") {
@@ -101,15 +141,15 @@ json processMobileTransaction(const json &data) {
             return response;
         }
 
-        // ------------------ One-time limit (₹2000) ------------------
+        // ------------------ One-time limit ------------------
         if (amount > 2000.0) {
             response["errorCode"] = "ERR_ONE_TIME_LIMIT";
             response["message"] = "Single transaction cannot exceed ₹2,000.";
             sess.rollback();
             return response;
         }
-        // ------------------ Rolling 1-hour limit (₹2000) ------------------
 
+        // ------------------ Rolling 1-hour limit ------------------
         RowResult hourlyRes = sess.sql(
             "SELECT SUM(amount) FROM bankingdb.transaction_mobile "
             "WHERE account_number = ? "
@@ -131,13 +171,11 @@ json processMobileTransaction(const json &data) {
         double remainingLimit = hourlyLimit - hourlyTotal;
 
         if ((hourlyTotal + amount) > hourlyLimit) {
-
             response["errorCode"] = "ERR_HOURLY_LIMIT";
 
             std::ostringstream msg;
             msg << "Hourly limit exceeded. You can transact only ₹"
-                << remainingLimit
-                << " more in this hour.";
+                << remainingLimit << " more in this hour.";
 
             response["message"] = msg.str();
             response["remainingLimit"] = remainingLimit;
@@ -146,8 +184,7 @@ json processMobileTransaction(const json &data) {
             return response;
         }
 
-
-        // ------------------ Daily limit (₹10,000) ------------------
+        // ------------------ Daily limit ------------------
         RowResult dailyRes = mobileTable.select("SUM(amount)")
             .where("account_number = :acc AND status = 'SUCCESS' AND DATE(created_at) = CURDATE()")
             .bind("acc", debitAcc)
@@ -207,23 +244,6 @@ json processMobileTransaction(const json &data) {
             return response;
         }
 
-        // ------------------ Fetch PRIMARY card ------------------
-        RowResult cardRes = cards.select("pan", "scheme")
-            .where("account_number = :acc AND card_priority = 'PRIMARY'")
-            .bind("acc", debitAcc)
-            .execute();
-
-        if (cardRes.count() == 0) {
-            response["errorCode"] = "ERR_NO_PRIMARY_CARD";
-            response["message"] = "No PRIMARY card found.";
-            sess.rollback();
-            return response;
-        }
-
-        Row cardRow = cardRes.fetchOne();
-        std::string primaryPan    = cardRow[0].get<std::string>();
-        std::string primaryScheme = cardRow[1].get<std::string>();
-
         // ------------------ Update balances ------------------
         double debitNew  = debitPrev - (amount + fee);
         double creditNew = creditPrev + amount;
@@ -266,7 +286,6 @@ json processMobileTransaction(const json &data) {
         response["status"] = "SUCCESS";
         response["balanceAfterDebit"] = debitNew;
 
-        //sess.close();
         return response;
     }
     catch (const std::exception &e) {
@@ -274,4 +293,20 @@ json processMobileTransaction(const json &data) {
         response["message"] = e.what();
         return response;
     }
+}
+
+// ================== TIMEOUT WRAPPER ==================
+json processMobileTransaction(const json &data) {
+
+    auto future = std::async(std::launch::async, processMobileTransactionCore, data);
+
+    if (future.wait_for(std::chrono::seconds(6)) == std::future_status::timeout) {
+        json response;
+        response["status"] = "DECLINED";
+        response["errorCode"] = "ERR_TIMEOUT";
+        response["message"] = "Transaction timeout (more than 6 seconds)";
+        return response;
+    }
+
+    return future.get();
 }

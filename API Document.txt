@@ -1,0 +1,170 @@
+Issue New Card :
+
+{
+  "channelId": "ISSUER",
+  "data": {
+    "accountNumber": "AU1234567890",
+    "cardholderName": "Dada Sakhare",
+    "scheme": "MASTERCARD"
+  }
+}
+
+
+POS  PURCHASE
+
+{
+  "channelId": "POS",
+  "data": {
+    "clientTxnId": "pos-1001",
+    "transactionType": "PURCHASE",
+    "merchantId": "MCH-POS-001",
+    "terminalId": "TERM-7788",
+    "location": "Sydney Mall”,
+“mecrceht”: “Vijay Sales”
+    "amount": 150.00,
+    "fee": 1.50,
+    "currency": "AUD",
+    "card": {
+      "pan": "5500004171373416",
+      "expiry": "12/26",
+      "cvv": "815"
+    }
+  }
+}
+
+
+POS  REFUND
+
+{
+  "channelId": "POS",
+  "data": {
+    "clientTxnId": "pos-refund-1001",
+    "transactionType": "REFUND",
+    "origClientTxnId": "pos-1001",
+    "merchantId": "MCH-POS-001",
+    "terminalId": "TERM-7788",
+    "location": "Sydney Mall",
+    "amount": 150.00,
+    "currency": "AUD",
+    "card": {
+      "pan": "5500004171373416",
+      "expiry": "12/26",
+      "cvv": "815"
+    }
+  }
+}
+
+
+
+
+
+ECOM  PURCHASE
+
+{
+  "channelId": "ECOM",
+  "data": {
+    "clientTxnId": "ecom-pur-1001",
+    "transactionType": "PURCHASE",
+    "merchantId": "MCH-ECOM-55",
+    "orderId": "ORD-20251116-1001",
+    "amount": 49.99,
+    "fee": 0.50,
+    "currency": "AUD",
+    "card": {
+      "pan": "5500004249929296",
+      "expiry": "12/26",
+      "cvv": "178"
+    }
+  }
+}
+
+ECOM  REFUND
+
+
+{
+  "channelId": "ECOM",
+  "data": {
+    "clientTxnId": "ecom-refund-1001",
+    "transactionType": "REFUND",
+    "merchantId": "MCH-ECOM-55",
+    "orderId": "ORD-20251116-1001",
+    "amount": 49.99,
+    "currency": "AUD",
+    "card": {
+      "pan": "5500009004544990",
+      "expiry": "12/26",
+      "cvv": "420"
+    }
+  }
+}
+
+MOBILE  Banking
+{
+  "channelId": "MOBILE",
+  "data": {
+    "clientTxnId": "mob-2001",
+    "transactionType": "FUND_TRANSFER",
+
+    "pan": "4111116688995771",   // ✅ NEW
+    "pin": "Zq1@)tYN=s{^l@y2jboIbS3kj|S:/md1:PrJbR1Mf>H}0D>PwmrU-.$ZkHGG6e]Q7*BNURD;jt<2&lG(pQ_(iv[*6T*Q2hJU>$XJ+u(Kk((oEu4a0{!K<s@0TpMi2awBq,!^fk)<{x4ETuO>e{4Hz2",               // ✅ NEW
+
+    "debitAccount": {
+      "accountNumber": "AU9988776655"
+    },
+    "creditAccount": {
+      "accountNumber": "INR9876543210"
+    },
+
+    "amount": 200.00,
+    "fee": 0.00,
+    "deviceId": "DEVICE-8899",
+    "mobileNumber": "9876543210"
+  }
+}
+
+ATM Withdrawal
+
+{
+  "channelId": "ATM",
+  "data": {
+    "clientTxnId": "atm-1001",
+    "transactionType": "WITHDRAWAL",
+    "atmId": "ATM-4455",
+    "terminalId": "TERM-8899",
+    "location": "Mumbai-Andheri",
+    "card": {
+      "pan": "5500009814807088",
+      "expiry": "12/26"
+    },
+    "pin": "Bw1*L?xAwu)FxkW+lN;]We3jMT1j]P.Wdg#Mwlf@SOfiMiix1T$6X_0WPAVkL:L{K[bV17+.:vpQExebiA7|ZLL)gUBdLw%J<.o=q)TK3bo{V,q[.:%cJnCRkz,S-ly9cm}h/c-?O/AwiYA)8DtwS#",
+    "debitAccount": {
+      "accountNumber": "IN53433445555"
+    },
+    "amount": 500.00,
+    "fee": 10.00
+  }
+}
+
+ATM Deposit
+
+
+{
+  "channelId": "ATM",
+  "data": {
+    "clientTxnId": "atm-1002",
+    "transactionType": "DEPOSIT",
+    "atmId": "ATM-4455",
+    "terminalId": "TERM-8899",
+    "location": "Mumbai-Andheri",
+    "card": {
+      "pan": "5500009814807088",
+      "expiry": "12/26"
+    },
+    "pin": "Bw1*L?xAwu)FxkW+lN;]We3jMT1j]P.Wdg#Mwlf@SOfiMiix1T$6X_0WPAVkL:L{K[bV17+.:vpQExebiA7|ZLL)gUBdLw%J<.o=q)TK3bo{V,q[.:%cJnCRkz,S-ly9cm}h/c-?O/AwiYA)8DtwS#",
+    "debitAccount": {
+      "accountNumber": "NZ8877665511"
+    },
+    "amount": 3000.00,
+    "fee": 0.00
+  }
+}

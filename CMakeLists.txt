@@ -17,7 +17,8 @@ link_directories(
         /opt/homebrew/lib
         /opt/homebrew/Cellar/mysql-connector-c++/9.5.0/lib
 )
-
+set(OPENSSL_ROOT_DIR /opt/homebrew/opt/openssl@3)
+find_package(OpenSSL REQUIRED)
 # ✅ Add your source files
 add_executable(BankingAPIServer
         parser&router.cpp
@@ -39,11 +40,14 @@ add_executable(BankingAPIServer
         falcon.cpp
         include/Database.h
         Database.cpp
+        include/pin.h
+        pin.cpp
 )
 
 # ✅ Link the correct MySQL library (X DevAPI)
 target_link_libraries(BankingAPIServer
         mysqlcppconnx
+        OpenSSL::Crypto
 )
 
 set(CMAKE_BUILD_TYPE Debug)
