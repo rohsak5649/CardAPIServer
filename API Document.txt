@@ -104,19 +104,23 @@ MOBILE  Banking
   "data": {
     "clientTxnId": "mob-2001",
     "transactionType": "FUND_TRANSFER",
+
+    "pan": "4111116688995771",   // ✅ NEW
+    "pin": "Zq1@)tYN=s{^l@y2jboIbS3kj|S:/md1:PrJbR1Mf>H}0D>PwmrU-.$ZkHGG6e]Q7*BNURD;jt<2&lG(pQ_(iv[*6T*Q2hJU>$XJ+u(Kk((oEu4a0{!K<s@0TpMi2awBq,!^fk)<{x4ETuO>e{4Hz2",               // ✅ NEW
+
     "debitAccount": {
-      "accountNumber": "NZ8877665511"
+      "accountNumber": "AU9988776655"
     },
     "creditAccount": {
-      "accountNumber": "AU1234567890"
+      "accountNumber": "INR9876543210"
     },
+
     "amount": 200.00,
     "fee": 0.00,
     "deviceId": "DEVICE-8899",
     "mobileNumber": "9876543210"
   }
 }
-
 
 ATM Withdrawal
 
@@ -129,9 +133,10 @@ ATM Withdrawal
     "terminalId": "TERM-8899",
     "location": "Mumbai-Andheri",
     "card": {
-      "pan": "5500006290481054",
+      "pan": "5500009814807088",
       "expiry": "12/26"
     },
+    "pin": "Bw1*L?xAwu)FxkW+lN;]We3jMT1j]P.Wdg#Mwlf@SOfiMiix1T$6X_0WPAVkL:L{K[bV17+.:vpQExebiA7|ZLL)gUBdLw%J<.o=q)TK3bo{V,q[.:%cJnCRkz,S-ly9cm}h/c-?O/AwiYA)8DtwS#",
     "debitAccount": {
       "accountNumber": "IN53433445555"
     },
@@ -152,9 +157,10 @@ ATM Deposit
     "terminalId": "TERM-8899",
     "location": "Mumbai-Andheri",
     "card": {
-      "pan": "4111111111111111",
-      "expiry": "1227"
+      "pan": "5500009814807088",
+      "expiry": "12/26"
     },
+    "pin": "Bw1*L?xAwu)FxkW+lN;]We3jMT1j]P.Wdg#Mwlf@SOfiMiix1T$6X_0WPAVkL:L{K[bV17+.:vpQExebiA7|ZLL)gUBdLw%J<.o=q)TK3bo{V,q[.:%cJnCRkz,S-ly9cm}h/c-?O/AwiYA)8DtwS#",
     "debitAccount": {
       "accountNumber": "NZ8877665511"
     },

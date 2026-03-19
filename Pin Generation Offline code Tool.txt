@@ -1,0 +1,184 @@
+#include <iostream>
+#include <vector>
+#include <array>
+#include <string>
+#include <stdexcept>
+#include <algorithm>
+#include <openssl/hmac.h>
+
+using namespace std;
+
+/* ===================== LOW LEVEL UTILS ===================== */
+
+class BitMixer {
+public:
+    static uint64_t rotl(uint64_t x, int r) {
+        return (x << r) | (x >> (64 - r));
+    }
+
+    static uint64_t avalanche(uint64_t x) {
+        x ^= x >> 33;
+        x *= 0xff51afd7ed558ccdULL;
+        x ^= x >> 33;
+        x *= 0xc4ceb9fe1a85ec53ULL;
+        x ^= x >> 33;
+        return x;
+    }
+};
+
+/* ===================== CRYPTO CORE ===================== */
+
+class HMACEngine {
+private:
+    string key; // 🔐 MUST be secret (move to env in real systems)
+
+public:
+    explicit HMACEngine(string k) : key(std::move(k)) {}
+
+    vector<unsigned char> digest(const string& data) const {
+        unsigned int len = 32;
+        vector<unsigned char> result(len);
+
+        HMAC(EVP_sha256(),
+             key.data(), key.size(),
+             reinterpret_cast<const unsigned char*>(data.data()),
+             data.size(),
+             result.data(), &len);
+
+        return result;
+    }
+};
+
+/* ===================== DERIVATION LAYER ===================== */
+
+class DerivationEngine {
+private:
+    HMACEngine hmac;
+
+    uint64_t compress(const vector<unsigned char>& v) const {
+        uint64_t acc = 0;
+        for (size_t i = 0; i < v.size(); i++) {
+            acc ^= (uint64_t)v[i] << ((i % 8) * 8);
+            acc = BitMixer::rotl(acc, 13);
+            acc = BitMixer::avalanche(acc);
+        }
+        return acc;
+    }
+
+public:
+    explicit DerivationEngine(const string& key) : hmac(key) {}
+
+    vector<uint64_t> derive(const string& pan) const {
+        vector<uint64_t> blocks;
+
+        string state = pan;
+
+        // multi-round derivation
+        for (int i = 0; i < 6; i++) {
+            auto d = hmac.digest(state);
+            uint64_t val = compress(d);
+
+            blocks.push_back(val);
+
+            state = to_string(val) + state;
+        }
+
+        return blocks;
+    }
+};
+
+/* ===================== CHARACTER MAPPER ===================== */
+
+class CharacterMapper {
+private:
+    const string pool =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+        "abcdefghijklmnopqrstuvwxyz"
+        "0123456789"
+        "!@#$%^&*()-_=+[]{}|;:,.<>?/";
+
+public:
+    char map(uint64_t x) const {
+        return pool[x % pool.size()];
+    }
+
+    size_t size() const { return pool.size(); }
+};
+
+/* ===================== FINAL GENERATOR ===================== */
+
+class AdvancedPINGenerator {
+private:
+    DerivationEngine engine;
+    CharacterMapper mapper;
+
+public:
+    explicit AdvancedPINGenerator(const string& secret)
+        : engine(secret) {}
+
+    string generate(const string& pan, size_t length = 150) const {
+        if (pan.size() != 16)
+            throw invalid_argument("PAN must be 16 digits");
+
+        auto blocks = engine.derive(pan);
+
+        string result;
+        result.reserve(length);
+
+        uint64_t state = 0;
+
+        // combine all blocks into initial state
+        for (auto b : blocks) {
+            state ^= BitMixer::avalanche(b);
+        }
+
+        // expansion loop
+        for (size_t i = 0; i < length; i++) {
+            state = BitMixer::rotl(state ^ (i * 0x9e3779b97f4a7c15ULL), 7);
+            state = BitMixer::avalanche(state);
+
+            result += mapper.map(state);
+        }
+
+        // enforce category presence
+        result[0] = 'A' + (state % 26);
+        result[1] = 'a' + ((state >> 3) % 26);
+        result[2] = '0' + ((state >> 5) % 10);
+        result[3] = "!@#$%^&*"[state % 8];
+
+        return result;
+    }
+};
+
+/* ===================== SERVICE LAYER ===================== */
+
+class SecureService {
+private:
+    AdvancedPINGenerator generator;
+
+public:
+    SecureService()
+        : generator("ULTRA_SECRET_KEY_2026_!@#") {} // 🔐 move outside in real system
+
+    string createPIN(const string& pan) {
+        return generator.generate(pan, 150);
+    }
+};
+
+/* ===================== MAIN ===================== */
+
+int main() {
+    try {
+        string pan;
+        cout << "Enter 16-digit PAN: ";
+        cin >> pan;
+
+        SecureService service;
+        string pin = service.createPIN(pan);
+
+        cout << "\nGenerated PIN:\n" << pin << endl;
+
+    } catch (const exception& e) {
+        cout << "Error: " << e.what() << endl;
+    }
+}

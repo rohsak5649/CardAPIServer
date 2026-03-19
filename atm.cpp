@@ -4,15 +4,14 @@
 #include <chrono>
 #include <random>
 #include <sstream>
+#include <future>      // ================== TIMEOUT SUPPORT ==================
 #include "Database.h"
+#include "pin.h"       // ================== PIN SERVICE ==================
 
 using namespace mysqlx;
 using json = nlohmann::json;
 
-////////////////////////////////////////////////////////////
-/// TRANSACTION ID GENERATOR
-////////////////////////////////////////////////////////////
-
+// ================== TRANSACTION ID GENERATOR ==================
 static std::string generateTxnId()
 {
     auto now = std::chrono::system_clock::now();
@@ -28,10 +27,7 @@ static std::string generateTxnId()
     return oss.str();
 }
 
-////////////////////////////////////////////////////////////
-/// ATM REPOSITORY (DATABASE OPERATIONS)
-////////////////////////////////////////////////////////////
-
+// ================== ATM REPOSITORY ==================
 class ATMRepository
 {
 private:
@@ -44,10 +40,6 @@ public:
     : session(s), db(Database::getSchema())
     {
     }
-
-    ////////////////////////////////////////////////////////////
-    /// FETCH CARD DETAILS
-    ////////////////////////////////////////////////////////////
 
     Row getCard(std::string pan,std::string expiry)
     {
@@ -65,10 +57,6 @@ public:
         return res.fetchOne();
     }
 
-    ////////////////////////////////////////////////////////////
-    /// LOCK ACCOUNT AND FETCH BALANCE
-    ////////////////////////////////////////////////////////////
-
     double getBalance(std::string acc)
     {
         RowResult res = session->sql(
@@ -81,10 +69,6 @@ public:
 
         return res.fetchOne()[0].get<double>();
     }
-
-    ////////////////////////////////////////////////////////////
-    /// CALCULATE TODAY'S TOTAL TRANSACTION AMOUNT
-    ////////////////////////////////////////////////////////////
 
     double getTodayTotal(std::string acc)
     {
@@ -100,10 +84,6 @@ public:
         return res.fetchOne()[0].get<double>();
     }
 
-    ////////////////////////////////////////////////////////////
-    /// UPDATE ACCOUNT BALANCE
-    ////////////////////////////////////////////////////////////
-
     void updateBalance(std::string acc,double balance)
     {
         Table accounts = db.getTable("accounts");
@@ -114,10 +94,6 @@ public:
         .bind("a",acc)
         .execute();
     }
-
-    ////////////////////////////////////////////////////////////
-    /// INSERT ATM TRANSACTION RECORD
-    ////////////////////////////////////////////////////////////
 
     long insertATMTransaction(
         std::string txnId,
@@ -166,10 +142,6 @@ public:
         return res.getAutoIncrementValue();
     }
 
-    ////////////////////////////////////////////////////////////
-    /// INSERT MASTER TRANSACTION ENTRY
-    ////////////////////////////////////////////////////////////
-
     void insertMasterTransaction(long refId)
     {
         Table master = db.getTable("transactions");
@@ -180,10 +152,7 @@ public:
     }
 };
 
-////////////////////////////////////////////////////////////
-/// ATM SERVICE (BUSINESS LOGIC)
-////////////////////////////////////////////////////////////
-
+// ================== ATM SERVICE ==================
 class ATMService
 {
 private:
@@ -196,20 +165,12 @@ public:
         repo = r;
     }
 
-    ////////////////////////////////////////////////////////////
-    /// PROCESS ATM TRANSACTION
-    ////////////////////////////////////////////////////////////
-
     json process(const json& data)
     {
         json response;
 
         try
         {
-            ////////////////////////////////////////////////////
-            /// EXTRACT INPUT DATA
-            ////////////////////////////////////////////////////
-
             std::string clientTxnId = data["clientTxnId"];
             std::string txnType = data["transactionType"];
             std::string atmId = data["atmId"];
@@ -221,10 +182,18 @@ public:
             double amount = data["amount"];
             double fee = data["fee"];
 
-            ////////////////////////////////////////////////////
-            /// VALIDATE CARD
-            ////////////////////////////////////////////////////
+            // ================== PIN VERIFICATION (NEW - FIXED SINGLETON) ==================
+            if (data.contains("pin"))
+            {
+                std::string inputPin = data["pin"];
 
+                if (!PINService::getInstance().verifyPIN(pan, inputPin))
+                {
+                    throw std::runtime_error("Invalid PIN");
+                }
+            }
+
+            // ================== ORIGINAL LOGIC ==================
             Row card = repo->getCard(pan,expiry);
 
             std::string account = card[0].get<std::string>();
@@ -234,16 +203,8 @@ public:
             if(status!="ACTIVE")
                 throw std::runtime_error("Card inactive");
 
-            ////////////////////////////////////////////////////
-            /// FETCH BALANCE AND LOCK ACCOUNT
-            ////////////////////////////////////////////////////
-
             double balance = repo->getBalance(account);
             double newBalance = balance;
-
-            ////////////////////////////////////////////////////
-            /// CHECK DAILY LIMIT
-            ////////////////////////////////////////////////////
 
             double todayTotal = repo->getTodayTotal(account);
 
@@ -257,7 +218,6 @@ public:
 
                 newBalance = balance - amount - fee;
             }
-
             else if(txnType=="DEPOSIT")
             {
                 if(todayTotal + amount > 10000)
@@ -265,27 +225,14 @@ public:
 
                 newBalance = balance + amount;
             }
-
             else
             {
                 throw std::runtime_error("Invalid transaction type");
             }
 
-            ////////////////////////////////////////////////////
-            /// UPDATE ACCOUNT BALANCE
-            ////////////////////////////////////////////////////
-
             repo->updateBalance(account,newBalance);
 
-            ////////////////////////////////////////////////////
-            /// GENERATE TRANSACTION ID
-            ////////////////////////////////////////////////////
-
             std::string txnId = generateTxnId();
-
-            ////////////////////////////////////////////////////
-            /// INSERT ATM TRANSACTION
-            ////////////////////////////////////////////////////
 
             long refId = repo->insertATMTransaction(
                     txnId,
@@ -301,15 +248,7 @@ public:
                     "SUCCESS",
                     "ATM transaction successful");
 
-            ////////////////////////////////////////////////////
-            /// INSERT MASTER TRANSACTION
-            ////////////////////////////////////////////////////
-
             repo->insertMasterTransaction(refId);
-
-            ////////////////////////////////////////////////////
-            /// SUCCESS RESPONSE
-            ////////////////////////////////////////////////////
 
             response["transactionId"]=txnId;
             response["status"]="SUCCESS";
@@ -327,11 +266,8 @@ public:
     }
 };
 
-////////////////////////////////////////////////////////////
-/// API ENTRY FUNCTION
-////////////////////////////////////////////////////////////
-
-json processATMTransaction(const json& data)
+// ================== CORE ==================
+json processATMTransactionCore(const json& data)
 {
     Session& session = Database::getSession();
 
@@ -339,4 +275,21 @@ json processATMTransaction(const json& data)
     ATMService service(&repo);
 
     return service.process(data);
+}
+
+// ================== TIMEOUT WRAPPER ==================
+json processATMTransaction(const json& data)
+{
+    auto future = std::async(std::launch::async, processATMTransactionCore, data);
+
+    if (future.wait_for(std::chrono::seconds(6)) == std::future_status::timeout)
+    {
+        json response;
+        response["status"] = "DECLINED";
+        response["errorCode"] = "ERR_TIMEOUT";
+        response["message"] = "Transaction timeout (more than 6 seconds)";
+        return response;
+    }
+
+    return future.get();
 }
