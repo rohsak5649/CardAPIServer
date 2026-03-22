@@ -118,9 +118,12 @@ CREATE TABLE `transaction_ecom` (
                                     `card_scheme` varchar(20) DEFAULT NULL,
                                     `status` enum('SUCCESS','FAILED') DEFAULT NULL,
                                     `message` varchar(255) DEFAULT NULL,
+                                    `reference_txn_id` varchar(50) DEFAULT NULL,
+                                    `refunded_amount` decimal(12,2) DEFAULT '0.00',
+                                    `flag` varchar(5) DEFAULT 'N',
                                     `created_at` timestamp NULL DEFAULT CURRENT_TIMESTAMP,
                                     PRIMARY KEY (`id`)
-) ENGINE=InnoDB AUTO_INCREMENT=3 DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci
+) ENGINE=InnoDB AUTO_INCREMENT=10 DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci
 
 CREATE TABLE `transaction_falcon` (
                                       `id` int NOT NULL AUTO_INCREMENT,

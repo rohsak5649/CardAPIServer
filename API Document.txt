@@ -63,41 +63,40 @@ ECOM  PURCHASE
 {
   "channelId": "ECOM",
   "data": {
-    "clientTxnId": "ecom-pur-1001",
+    "clientTxnId": "ecom-pur-3002",
     "transactionType": "PURCHASE",
     "merchantId": "MCH-ECOM-55",
-    "orderId": "ORD-20251116-1001",
-    "amount": 49.99,
+    "orderId": "ORD-SECURE-3001",
+    "amount": 100.99,
     "fee": 0.50,
     "currency": "AUD",
     "card": {
-      "pan": "5500004249929296",
+      "pan": "CBwBBJr4ysXiKsjSckij5bIE+K90EkGPl0XHIU0aexg1K+oPF/lRCRgKg5M=",
+      "pin": "Fx1$%w*NbHo#$IZ_VD*G(S|5^@IP(b+&a8dsuuLrlq>3$.2e9xC^df.-2}af;=1{V<HCQ*$/,_.Uk^1Lc)g#cOX7*]049/Cq+}/NFe|r;d|i2F6fQ&SL2&l%?h]Do*<4NFZNQ<x$^rzna@s5JNhj%=",
       "expiry": "12/26",
-      "cvv": "178"
+      "cvv": "905"
     }
   }
 }
 
 ECOM  REFUND
 
-
 {
   "channelId": "ECOM",
   "data": {
-    "clientTxnId": "ecom-refund-1001",
+    "clientTxnId": "ecom-ref-3002",
     "transactionType": "REFUND",
-    "merchantId": "MCH-ECOM-55",
-    "orderId": "ORD-20251116-1001",
-    "amount": 49.99,
+    "originalTxnId": "ecom-txn-1774184114934-1492",
+    "amount": 1000.99,
     "currency": "AUD",
     "card": {
-      "pan": "5500009004544990",
+      "pan": "CBwBBJr4ysXiKsjSckij5bIE+K90EkGPl0XHIU0aexg1K+oPF/lRCRgKg5M=",
+      "pin": "Fx1$%w*NbHo#$IZ_VD*G(S|5^@IP(b+&a8dsuuLrlq>3$.2e9xC^df.-2}af;=1{V<HCQ*$/,_.Uk^1Lc)g#cOX7*]049/Cq+}/NFe|r;d|i2F6fQ&SL2&l%?h]Do*<4NFZNQ<x$^rzna@s5JNhj%=",
       "expiry": "12/26",
-      "cvv": "420"
+      "cvv": "905"
     }
   }
 }
-
 MOBILE  Banking
 {
   "channelId": "MOBILE",
@@ -105,12 +104,9 @@ MOBILE  Banking
     "clientTxnId": "mob-2001",
     "transactionType": "FUND_TRANSFER",
 
-    "pan": "4111116688995771",   // ✅ NEW
+    "pan": "CmisQUS62z9Xr1ghYzvIDUHp4Gxhl9rxsVnvyx7XECr23Ll6NxBhctK1ivY=",   // ✅ NEW
     "pin": "Zq1@)tYN=s{^l@y2jboIbS3kj|S:/md1:PrJbR1Mf>H}0D>PwmrU-.$ZkHGG6e]Q7*BNURD;jt<2&lG(pQ_(iv[*6T*Q2hJU>$XJ+u(Kk((oEu4a0{!K<s@0TpMi2awBq,!^fk)<{x4ETuO>e{4Hz2",               // ✅ NEW
 
-    "debitAccount": {
-      "accountNumber": "AU9988776655"
-    },
     "creditAccount": {
       "accountNumber": "INR9876543210"
     },
@@ -132,19 +128,17 @@ ATM Withdrawal
     "atmId": "ATM-4455",
     "terminalId": "TERM-8899",
     "location": "Mumbai-Andheri",
+
     "card": {
-      "pan": "5500009814807088",
+      "pan": "v63+3AWeRrCS2zo+Q/9dgzuji0ppW5CQPcZjzea4DOMqaHoF7ICpZMACwSo=",   // 🔐 encrypted
       "expiry": "12/26"
     },
-    "pin": "Bw1*L?xAwu)FxkW+lN;]We3jMT1j]P.Wdg#Mwlf@SOfiMiix1T$6X_0WPAVkL:L{K[bV17+.:vpQExebiA7|ZLL)gUBdLw%J<.o=q)TK3bo{V,q[.:%cJnCRkz,S-ly9cm}h/c-?O/AwiYA)8DtwS#",
-    "debitAccount": {
-      "accountNumber": "IN53433445555"
-    },
+
+    "pin": "Ky9!V5^pQ(>+,)+0@,i6my9C!OF7X@A&zw|<N_TNrcI3-jC@[yfjH!TF>p/c;/Z]:9AU]|42#y3KRol=T$C_J8RSUDrm+uvj&qX[tH]IoSL6kPoF3f#:b_RDZ(IwU$C%P2>0|cBmPsot[*T[<su8ij",
     "amount": 500.00,
     "fee": 10.00
   }
 }
-
 ATM Deposit
 
 
@@ -156,14 +150,14 @@ ATM Deposit
     "atmId": "ATM-4455",
     "terminalId": "TERM-8899",
     "location": "Mumbai-Andheri",
+
     "card": {
-      "pan": "5500009814807088",
+      "pan": "40KZfECrScVf6dprxpvfN36Si0UbkyAJzQNMhgqkVt/u1l1BZgYUdyC1I2U=",   // 🔐 encrypted PAN
       "expiry": "12/26"
     },
-    "pin": "Bw1*L?xAwu)FxkW+lN;]We3jMT1j]P.Wdg#Mwlf@SOfiMiix1T$6X_0WPAVkL:L{K[bV17+.:vpQExebiA7|ZLL)gUBdLw%J<.o=q)TK3bo{V,q[.:%cJnCRkz,S-ly9cm}h/c-?O/AwiYA)8DtwS#",
-    "debitAccount": {
-      "accountNumber": "NZ8877665511"
-    },
+
+    "pin": "Fx1$%w*NbHo#$IZ_VD*G(S|5^@IP(b+&a8dsuuLrlq>3$.2e9xC^df.-2}af;=1{V<HCQ*$/,_.Uk^1Lc)g#cOX7*]049/Cq+}/NFe|r;d|i2F6fQ&SL2&l%?h]Do*<4NFZNQ<x$^rzna@s5JNhj%=",
+
     "amount": 3000.00,
     "fee": 0.00
   }

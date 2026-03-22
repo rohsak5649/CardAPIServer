@@ -1,28 +1,120 @@
 /*
 * Copyright (c) Rohan Sakhare
- * All rights reserved.
- *
- * Payment Switching Engine – Routing Flow:
- * 1. Server exposes REST APIs for transaction processing.
- * 2. Client sends request with Channel ID and transaction data.
- * 3. Router validates request structure and input fields.
- * 4. Request is forwarded to respective channel processor:
- *    - ATM       → Cash withdrawal & balance services
- *    - MOBILE    → Mobile banking transactions
- *    - POS       → Point-of-sale payments
- *    - ECOM      → E-commerce purchases & refunds
- *    - QRCODE    → QR-based payments
- *    - RINGPAY   → Contactless wearable payments
- *    - ISSUER    → Card issuance services
- * 5. Channel processor executes transaction logic.
- * 6. Response returned to client in JSON format.
- * 7. Health endpoint provided for system monitoring.
- *
- * Unauthorized copying or modification without understanding
- * the switching and routing logic is discouraged.
- *
- * For implementation details, contact: +91 9112765649
- */
+* All rights reserved.
+*
+* PAYMENT SWITCHING ENGINE – ROUTING & ORCHESTRATION FLOW
+*
+* 1. PURPOSE:
+*    - Acts as central routing layer for all transaction channels.
+*    - Receives client requests and dispatches them to appropriate processors.
+*    - Provides unified API interface for multi-channel transaction processing.
+*
+* 2. SUPPORTED CHANNELS:
+*    - ATM       → Cash withdrawal / deposit
+*    - MOBILE    → Mobile banking transactions
+*    - POS       → Point-of-sale payments
+*    - ECOM      → E-commerce purchase & refund
+*    - QRCODE    → QR-based payments
+*    - RINGPAY   → Contactless wearable payments
+*    - ISSUER    → Card issuance services
+*
+* 3. API ENDPOINTS:
+*
+*    POST /transaction/initiate
+*    - Main transaction entry point
+*    - Accepts JSON request:
+*        {
+*            "channelId": "ECOM",
+*            "data": { ... }
+*        }
+*
+*    GET /health
+*    - Health check endpoint
+*    - Used for monitoring and uptime verification
+*
+* 4. REQUEST FLOW:
+*
+*    Step 1: Client sends HTTP POST request
+*    Step 2: Request body parsed into JSON
+*    Step 3: Validate required fields:
+*        → channelId
+*        → data
+*
+*    Step 4: Routing logic executed:
+*        → routeRequest(channelId, data)
+*
+*    Step 5: Request forwarded to respective module:
+*        → ATM       → processATMTransaction()
+*        → MOBILE    → processMobileTransaction()
+*        → POS       → processPOSTransaction()
+*        → ECOM      → processECOMTransaction()
+*        → ISSUER    → processIssueCard()
+*        → QRCODE    → processQRCodePayment()
+*        → RINGPAY   → processRingPayTransaction()
+*
+*    Step 6: Channel-specific business logic executed
+*
+*    Step 7: JSON response returned to client
+*
+* 5. ERROR HANDLING:
+*
+*    - Empty request body → HTTP 400
+*    - Missing fields → HTTP 400
+*    - Unsupported channel → ERR_UNKNOWN_CHANNEL
+*    - Internal exception → HTTP 500 (ERR_SERVER)
+*    - Unknown error → ERR_UNKNOWN
+*
+* 6. LOGGING:
+*    - Each channel request logged to console:
+*        → [ATM], [ECOM], [MOBILE], etc.
+*    - Helps in debugging and tracing transaction flow
+*
+* 7. ARCHITECTURE DESIGN:
+*
+*    - Follows Dispatcher / Router Pattern
+*    - Separation of concerns:
+*        → Routing layer (this file)
+*        → Business logic (channel modules)
+*        → DB layer (Database module)
+*
+*    - Each channel is independently scalable
+*
+* 8. PERFORMANCE NOTES:
+*
+*    - Lightweight routing logic ensures minimal latency
+*    - Supports high-frequency transaction systems
+*    - Stateless request handling
+*
+* 9. SECURITY CONSIDERATIONS:
+*
+*    - Input validation enforced before routing
+*    - Sensitive operations handled in downstream modules
+*    - Recommended production enhancements:
+*        → Authentication (JWT / OAuth)
+*        → Rate limiting
+*        → Request signing
+*
+* 10. FUTURE ENHANCEMENTS:
+*
+*    - Add middleware for:
+*        → Logging (centralized)
+*        → Authentication & authorization
+*        → Rate limiting
+*
+*    - Add API gateway integration
+*    - Add distributed tracing (Jaeger / Zipkin)
+*    - Add metrics (Prometheus / Grafana)
+*
+*    - Convert routing to dynamic registry-based system
+*      instead of static if-else chain
+*
+* Unauthorized modification without understanding routing,
+* channel separation, and transaction orchestration is discouraged.
+*
+* For implementation details:
+* Email: rohanavinashsakhare@gmail.com
+* Mobile: +91 9112765649
+*/
 #include <iostream>
 #include "httplib.h"
 #include "json.hpp"

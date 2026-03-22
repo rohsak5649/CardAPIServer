@@ -1,22 +1,150 @@
 /*
-* RingPay (Wearable Contactless Payment) Processing Flow:
- *
- * 1. Customer taps wearable device linked to PRIMARY active card.
- * 2. System validates card status, priority, and linked account state.
- * 3. Secure payment token fetched or generated for the device.
- * 4. Multiple safety checks enforced:
- *    • Per-transaction spending limit
- *    • Daily spending limit
- *    • Merchant-specific spending limit
- *    • Real-time risk scoring based on usage patterns
- * 5. Account balance verified before debit.
- * 6. Amount debited and transaction recorded in processing state.
- * 7. Random failure simulation may trigger automatic reversal.
- * 8. Successful transactions finalized and linked to master records.
- * 9. Response returned with token, risk score, and updated balance.
- *
- * Designed for secure low-latency NFC wearable payments.
- */
+* Copyright (c) Rohan Sakhare
+* All rights reserved.
+*
+* RINGPAY (WEARABLE CONTACTLESS PAYMENT) ENGINE – NFC TRANSACTION FLOW
+*
+* 1. PURPOSE:
+*    - Handles contactless wearable payments (Ring / NFC devices).
+*    - Designed for ultra-fast, low-latency transactions.
+*    - Uses tokenization instead of exposing actual card details.
+*
+* 2. INPUT FLOW:
+*
+*    - Request contains:
+*        → Encrypted PAN + expiry
+*        → deviceId (wearable identifier)
+*        → ipAddress (risk tracking)
+*        → merchantId
+*        → amount + fee
+*
+*    - PAN mapped internally to account using cards table.
+*
+* 3. CARD VALIDATION:
+*
+*    - Validate PAN + expiry
+*    - Card must be:
+*        → ACTIVE
+*        → PRIMARY (only primary card allowed for RingPay)
+*
+*    - If invalid → transaction rejected
+*
+* 4. ACCOUNT VALIDATION:
+*
+*    - Fetch linked account
+*    - Check account freeze status
+*    - If frozen → transaction blocked
+*
+* 5. TOKENIZATION (SECURITY CORE):
+*
+*    - System uses token instead of PAN
+*
+*    FLOW:
+*        → Check existing active token (not expired)
+*        → If not found:
+*            → Generate new token (RING-<timestamp>-<random>)
+*            → Store in ringpay_tokens table
+*
+*    - Token used for all transaction references
+*
+* 6. LIMIT CONTROLS:
+*
+*    PER TRANSACTION LIMIT:
+*        → Max ₹2000
+*
+*    DAILY LIMIT:
+*        → Warning after ₹4000
+*        → Hard stop at ₹5000
+*
+*    MERCHANT LIMIT:
+*        → Max ₹3000 per merchant per day
+*
+* 7. RISK ENGINE (REAL-TIME):
+*
+*    - Risk score calculated dynamically:
+*
+*        → High amount (>1500)       → +40
+*        → High daily usage (>3000)  → +40
+*
+*    - If risk > 70:
+*        → Transaction BLOCKED
+*
+*    - Can be extended for:
+*        → device fingerprinting
+*        → geo-location checks
+*        → behavioral patterns
+*
+* 8. BALANCE VALIDATION:
+*
+*    - Ensure sufficient balance (amount + fee)
+*
+* 9. TRANSACTION EXECUTION:
+*
+*    Step 1: Debit account balance
+*
+*    Step 2: Insert transaction with:
+*        → status = "PROCESSING"
+*
+*    Step 3: Random failure simulation:
+*        → If failure:
+*            → Reverse balance
+*            → Mark transaction FAILED
+*            → reversal_status = REVERSED
+*
+*    Step 4: If success:
+*        → Update status = SUCCESS
+*        → Insert into master transactions table
+*
+* 10. RESPONSE:
+*
+*    - SUCCESS:
+*        → transactionId
+*        → token
+*        → updated balance
+*        → riskScore
+*
+*    - FAILURE:
+*        → errorCode / message
+*        → or reversal response
+*
+* 11. SECURITY NOTES:
+*
+*    - Tokenization ensures PAN is never exposed
+*    - Device + IP tracking improves fraud detection
+*    - No PIN required → relies on limits + risk engine
+*
+*    ⚠ PRODUCTION ENHANCEMENTS:
+*        → Token expiry enforcement
+*        → Device binding
+*        → Strong fraud engine (Falcon integration)
+*
+* 12. DESIGN NOTES:
+*
+*    - Combines:
+*        → Tokenization
+*        → Risk scoring
+*        → Limit enforcement
+*        → Reversal mechanism
+*
+*    - Mimics real-world:
+*        → Apple Pay / Google Pay / NFC rings
+*
+* 13. FUTURE ENHANCEMENTS:
+*
+*    - Add multi-device support
+*    - Add biometric validation
+*    - Integrate with fraud engine (Falcon)
+*    - Add offline transaction support
+*    - Add real-time notification system
+*
+* Unauthorized modification without understanding tokenization,
+* risk scoring, and reversal logic is strictly discouraged.
+*
+* For implementation details:
+* Email: rohanavinashsakhare@gmail.com
+* Mobile: +91 9112765649
+*/
+
 #include <iostream>
 #include "json.hpp"
 #include <mysqlx/xdevapi.h>

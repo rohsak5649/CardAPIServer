@@ -1,6 +1,51 @@
 /*
 * Copyright (c) Rohan Sakhare
 * All rights reserved.
+*
+* MOBILE TRANSACTION PROCESSING FLOW:
+*
+* 1. Transaction request received from MOBILE channel API.
+* 2. Input validation performed (transaction type, limits, structure).
+*
+* 3. PAN & PIN FLOW (SECURE ADDITION):
+*    - Encrypted PAN received from client.
+*    - PAN is decrypted internally using AES-GCM (panencrypted module).
+*    - If decryption fails → transaction declined.
+*    - If valid → mapped to debit account using cards table.
+*    - PIN verification performed using PIN service.
+*
+* 4. FRAUD CHECK (FALCON ENGINE):
+*    - Rapid repeat transaction detection.
+*    - Transaction velocity checks.
+*    - If fraud detected → transaction declined and logged.
+*
+* 5. LIMIT VALIDATIONS:
+*    - Per transaction limit (₹2,000)
+*    - Hourly rolling limit
+*    - Daily transaction limit
+*
+* 6. ACCOUNT VALIDATIONS:
+*    - Debit account existence & balance check
+*    - Credit account validation
+*
+* 7. TRANSACTION EXECUTION:
+*    - Debit & credit balance updates
+*    - Entry in transaction_mobile table
+*    - Entry in master transactions table
+*
+* 8. RESPONSE:
+*    - SUCCESS → transactionId + updated balance
+*    - FAILURE → errorCode + message
+*
+* SECURITY NOTES:
+* - PAN is never stored or processed in plain text externally.
+* - All PAN operations happen securely in backend.
+* - Encryption: AES-256-GCM
+*
+* Unauthorized modification without understanding transaction
+* and fraud handling logic is strongly discouraged.
+*
+* For implementation details, contact: +91 9112765649
 */
 
 #include <iostream>
@@ -13,6 +58,7 @@
 #include "falcon.h"
 #include "Database.h"
 #include "pin.h"
+#include "panencrypted.h"
 
 using namespace mysqlx;
 using json = nlohmann::json;
@@ -39,8 +85,9 @@ json processMobileTransactionCore(const json &data) {
 
         // ✅ KEEP EXISTING (fallback)
         std::string debitAcc = "";
-        if (data.contains("debitAccount"))
+        if (!data.contains("pan") && data.contains("debitAccount")) {
             debitAcc = data["debitAccount"]["accountNumber"];
+        }
 
         std::string creditAcc   = data["creditAccount"]["accountNumber"];
         double amount           = data["amount"];
@@ -59,11 +106,23 @@ json processMobileTransactionCore(const json &data) {
         sess.startTransaction();
 
         // ================== ✅ NEW: PAN FLOW (NON-BREAKING) ==================
+        std::string inputPan = "";
         if (data.contains("pan") && data.contains("pin")) {
 
-            std::string inputPan = data["pan"];
+            std::string inputPanEncrypted = data["pan"];
             std::string inputPin = data["pin"];
 
+            try {
+                // 🔐 decrypt PAN
+                auto& panService = PANEncryptionService::getInstance();
+                inputPan = panService.decryptPAN(inputPanEncrypted);
+            }
+            catch (const std::exception& e) {
+                response["errorCode"] = "ERR_INVALID_ENCRYPTED_PAN";
+                response["message"] = e.what();
+                sess.rollback();
+                return response;
+            }
             if (inputPan.length() != 16) {
                 response["errorCode"] = "ERR_INVALID_PAN";
                 response["message"] = "Invalid PAN format.";
@@ -104,6 +163,13 @@ json processMobileTransactionCore(const json &data) {
                 sess.rollback();
                 return response;
             }
+        }
+        // 🚨 FINAL SAFETY CHECK: ensure debit account is resolved
+        if (debitAcc.empty()) {
+            response["errorCode"] = "ERR_DEBIT_ACCOUNT_REQUIRED";
+            response["message"] = "Debit account could not be determined.";
+            sess.rollback();
+            return response;
         }
 
         // ================== EXISTING FALCON LOGIC ==================
@@ -281,6 +347,24 @@ json processMobileTransactionCore(const json &data) {
             .execute();
 
         sess.commit();
+        try {
+            if (!inputPan.empty()) {
+                cards.update()
+                    .set("last_transaction_time", mysqlx::expr("NOW()"))
+                    .where("pan = :pan")
+                    .bind("pan", inputPan)
+                    .execute();
+            }
+            else {
+                cards.update()
+                    .set("last_transaction_time", mysqlx::expr("NOW()"))
+                    .where("account_number = :acc AND card_priority = 'PRIMARY'")
+                    .bind("acc", debitAcc)
+                    .execute();
+            }
+        }
+        catch (...) {
+        }
 
         response["transactionId"] = txnId;
         response["status"] = "SUCCESS";
