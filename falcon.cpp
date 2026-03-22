@@ -1,20 +1,87 @@
 /*
 * Copyright (c) Rohan Sakhare
- * All rights reserved.
- *
- * Falcon Fraud Detection Flow:
- * 1. Transaction request received from mobile channel.
- * 2. System checks rapid repeat transactions (same-second rule).
- * 3. System checks transaction velocity (max 5 per 60 seconds).
- * 4. If fraud detected → transaction declined.
- * 5. Fraud details logged in Falcon table and Master table.
- * 6. Safe transactions proceed to normal processing.
- *
- * Unauthorized copying or modification without understanding
- * the fraud control logic is discouraged.
- *
- * For implementation details, contact: +91 9112765649
- */
+* All rights reserved.
+*
+* FALCON FRAUD DETECTION ENGINE:
+*
+* OVERVIEW:
+* Falcon is a real-time fraud detection module integrated across
+* multiple transaction channels:
+*    → MOBILE
+*    → ECOM
+*    → POS
+*
+* PURPOSE:
+* - Detect suspicious transaction patterns.
+* - Prevent fraud in high-frequency or abnormal activity scenarios.
+* - Provide centralized fraud monitoring across all channels.
+*
+* 1. INPUT:
+*    - accountNumber
+*    - transaction amount
+*    - transaction metadata (txnId, clientTxnId, etc.)
+*
+* 2. FRAUD CHECK MODULES:
+*
+*    A. SAME-SECOND DETECTION:
+*    - Detects multiple transactions within 1 second.
+*    - Applied across:
+*        → transaction_mobile
+*        → transaction_ecom
+*        → transaction_pos
+*    - Prevents bot attacks / rapid swipe fraud.
+*
+*    B. VELOCITY CHECK:
+*    - Detects excessive transactions within 60 seconds.
+*    - Threshold:
+*        → 5 transactions per minute
+*    - Applied across all channels.
+*
+* 3. CROSS-CHANNEL MONITORING:
+*    - Fraud detection is NOT limited to a single channel.
+*    - Combines activity from:
+*        → Mobile + ECOM + POS
+*    - Ensures holistic fraud detection.
+*
+* 4. DECISION ENGINE:
+*    - If any fraud rule triggers:
+*        → Transaction is DECLINED
+*        → Reason is recorded
+*
+* 5. FRAUD LOGGING:
+*    - Fraudulent transactions inserted into:
+*        → transaction_falcon table
+*    - Also logged into master transactions table.
+*
+* 6. RESPONSE:
+*    - TRUE  → Fraud detected
+*    - FALSE → Transaction safe
+*
+* SECURITY NOTES:
+* - Works in real-time before transaction commit.
+* - Prevents financial loss due to abnormal activity.
+*
+* DESIGN NOTES:
+* - Modular structure for easy rule extension.
+* - Can integrate:
+*        → Device fingerprinting
+*        → Geo-location anomaly detection
+*        → ML-based scoring (future scope)
+*
+* CURRENT RULES:
+* - Same-second detection
+* - Velocity detection (5 txns / 60 sec)
+*
+* FUTURE ENHANCEMENTS:
+* - Risk scoring engine
+* - AI/ML fraud detection
+* - Merchant-level fraud profiling
+*
+* Unauthorized modification without understanding fraud rules
+* and transaction flow may compromise system security.
+*
+* For implementation details, contact: +91 9112765649
+*/
 #include "falcon.h"
 #include "Database.h"
 
@@ -28,14 +95,20 @@ bool Falcon::checkFraud(const std::string& accountNumber,
                         double amount,
                         std::string& reason)
 {
-    // SAME SECOND (mobile + ecom)
-    if (checkSameSecond(accountNumber) || checkSameSecondForEcom(accountNumber)) {
+    // 🔥 SAME SECOND (ALL CHANNELS)
+    if (checkSameSecond(accountNumber) ||
+        checkSameSecondForEcom(accountNumber) ||
+        checkSameSecondForPOS(accountNumber)) {
+
         reason = "Multiple transactions within same second";
         return true;
     }
 
-    // VELOCITY (mobile + ecom)
-    if (checkVelocity(accountNumber) || checkVelocityForEcom(accountNumber)) {
+    // 🔥 VELOCITY (ALL CHANNELS)
+    if (checkVelocity(accountNumber) ||
+        checkVelocityForEcom(accountNumber) ||
+        checkVelocityForPOS(accountNumber)) {
+
         reason = "More than 5 transactions within 60 seconds";
         return true;
     }
@@ -43,14 +116,13 @@ bool Falcon::checkFraud(const std::string& accountNumber,
     return false;
 }
 
-// ================= MOBILE SAME SECOND =================
+// ================= MOBILE =================
 bool Falcon::checkSameSecond(const std::string& accountNumber)
 {
     RowResult res = sess.sql(
-        "SELECT 1 FROM bankingdb.transaction_mobile "
+        "SELECT 1 FROM transaction_mobile "
         "WHERE account_number = ? "
-        "AND created_at >= NOW() - INTERVAL 1 SECOND "
-        "LIMIT 1"
+        "AND created_at >= NOW() - INTERVAL 1 SECOND LIMIT 1"
     )
     .bind(accountNumber)
     .execute();
@@ -58,61 +130,80 @@ bool Falcon::checkSameSecond(const std::string& accountNumber)
     return res.count() > 0;
 }
 
-// ================= ECOM SAME SECOND =================
-bool Falcon::checkSameSecondForEcom(const std::string& accountNumber)
-{
-    RowResult res = sess.sql(
-        "SELECT 1 FROM bankingdb.transaction_ecom "
-        "WHERE account_number = ? "
-        "AND created_at >= NOW() - INTERVAL 1 SECOND "
-        "LIMIT 1"
-    )
-    .bind(accountNumber)
-    .execute();
-
-    return res.count() > 0;
-}
-
-// ================= MOBILE VELOCITY =================
 bool Falcon::checkVelocity(const std::string& accountNumber)
 {
     RowResult res = sess.sql(
-        "SELECT id FROM bankingdb.transaction_mobile "
+        "SELECT id FROM transaction_mobile "
         "WHERE account_number = ? "
-        "AND created_at >= NOW() - INTERVAL 60 SECOND "
-        "LIMIT 5"
+        "AND created_at >= NOW() - INTERVAL 60 SECOND LIMIT 5"
     )
     .bind(accountNumber)
     .execute();
 
-    int rowCount = 0;
+    int count = 0;
+    while (res.fetchOne()) count++;
 
-    while (res.fetchOne()) {
-        rowCount++;
-    }
-
-    return rowCount >= 5;
+    return count >= 5;
 }
 
-// ================= ECOM VELOCITY =================
+// ================= ECOM =================
+bool Falcon::checkSameSecondForEcom(const std::string& accountNumber)
+{
+    RowResult res = sess.sql(
+        "SELECT 1 FROM transaction_ecom "
+        "WHERE account_number = ? "
+        "AND created_at >= NOW() - INTERVAL 1 SECOND LIMIT 1"
+    )
+    .bind(accountNumber)
+    .execute();
+
+    return res.count() > 0;
+}
+
 bool Falcon::checkVelocityForEcom(const std::string& accountNumber)
 {
     RowResult res = sess.sql(
-        "SELECT id FROM bankingdb.transaction_ecom "
+        "SELECT id FROM transaction_ecom "
         "WHERE account_number = ? "
-        "AND created_at >= NOW() - INTERVAL 60 SECOND "
-        "LIMIT 5"
+        "AND created_at >= NOW() - INTERVAL 60 SECOND LIMIT 5"
     )
     .bind(accountNumber)
     .execute();
 
-    int rowCount = 0;
+    int count = 0;
+    while (res.fetchOne()) count++;
 
-    while (res.fetchOne()) {
-        rowCount++;
-    }
+    return count >= 5;
+}
 
-    return rowCount >= 5;
+// ================= POS (🔥 NEW) =================
+bool Falcon::checkSameSecondForPOS(const std::string& accountNumber)
+{
+    RowResult res = sess.sql(
+        "SELECT 1 FROM transaction_pos "
+        "WHERE account_number = ? "
+        "AND created_at >= NOW() - INTERVAL 1 SECOND LIMIT 1"
+    )
+    .bind(accountNumber)
+    .execute();
+
+    return res.count() > 0;
+}
+
+bool Falcon::checkVelocityForPOS(const std::string& accountNumber)
+{
+    RowResult res = sess.sql(
+        "SELECT id FROM transaction_pos "
+        "WHERE account_number = ? "
+        "AND created_at >= NOW() - INTERVAL 60 SECOND LIMIT 5"
+    )
+    .bind(accountNumber)
+    .execute();
+
+    int count = 0;
+    while (res.fetchOne()) count++;
+
+    return count >= 5;
 }
 
 // ================= FRAUD LOG =================
@@ -124,10 +215,8 @@ void Falcon::logFraud(const std::string& txnId,
                       double amount,
                       const std::string& reason)
 {
-    sess.sql("USE bankingdb").execute();
-
     auto result = sess.sql(
-        "INSERT INTO bankingdb.transaction_falcon "
+        "INSERT INTO transaction_falcon "
         "(transaction_id, client_txn_id, device_id, mobile_number, "
         "account_number, amount, fraud_reason, status) "
         "VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
@@ -142,15 +231,14 @@ void Falcon::logFraud(const std::string& txnId,
     .bind("DECLINED")
     .execute();
 
-    long childId = result.getAutoIncrementValue();
+    long id = result.getAutoIncrementValue();
 
     sess.sql(
-        "INSERT INTO bankingdb.transactions "
-        "(table_name, reference_id, status) "
+        "INSERT INTO transactions (table_name, reference_id, status) "
         "VALUES (?, ?, ?)"
     )
     .bind("transaction_falcon")
-    .bind(childId)
+    .bind(id)
     .bind("DECLINED")
     .execute();
 }

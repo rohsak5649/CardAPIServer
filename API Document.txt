@@ -19,37 +19,33 @@ POS  PURCHASE
     "transactionType": "PURCHASE",
     "merchantId": "MCH-POS-001",
     "terminalId": "TERM-7788",
-    "location": "Sydney Mall”,
-“mecrceht”: “Vijay Sales”
-    "amount": 150.00,
-    "fee": 1.50,
+    "location": "Sydney Mall",
+    "amount": 100.00,
+    "fee": 20.00,
     "currency": "AUD",
     "card": {
-      "pan": "5500004171373416",
+      "pan": "vKnRnkBeqsYXOfLfdU+gIEWnH3sGLRSGUzGqtp1B8chyTlPDSV2EzcNwSrA=",
+      "pin": "Py6^;a#,^{6v?1-^)az==K6XhKa[6z?_lA7Zh8RBBXOZaWU|R,E!8afZrr?iHQ0hw4NT_$n>i5aV2K,%fV89rguByu|j-91MvXe;|2ulN!&-l^t>S)}98v_a{c5W4@BepCu4g^/Y<9DeFyT?+Som,R",
       "expiry": "12/26",
-      "cvv": "815"
+      "cvv": "178"
     }
   }
 }
-
 
 POS  REFUND
 
 {
   "channelId": "POS",
   "data": {
-    "clientTxnId": "pos-refund-1001",
+    "clientTxnId": "pos-ref-1001",
     "transactionType": "REFUND",
-    "origClientTxnId": "pos-1001",
+    "origTransactionId": "pos-txn-1774206492941-4503",
     "merchantId": "MCH-POS-001",
     "terminalId": "TERM-7788",
-    "location": "Sydney Mall",
-    "amount": 150.00,
-    "currency": "AUD",
+    "amount": 100.00,
     "card": {
-      "pan": "5500004171373416",
-      "expiry": "12/26",
-      "cvv": "815"
+      "pan": "vKnRnkBeqsYXOfLfdU+gIEWnH3sGLRSGUzGqtp1B8chyTlPDSV2EzcNwSrA=",
+      "pin": "Py6^;a#,^{6v?1-^)az==K6XhKa[6z?_lA7Zh8RBBXOZaWU|R,E!8afZrr?iHQ0hw4NT_$n>i5aV2K,%fV89rguByu|j-91MvXe;|2ulN!&-l^t>S)}98v_a{c5W4@BepCu4g^/Y<9DeFyT?+Som,R"
     }
   }
 }
