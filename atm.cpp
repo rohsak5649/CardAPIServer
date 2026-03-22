@@ -7,6 +7,7 @@
 #include <future>      // ================== TIMEOUT SUPPORT ==================
 #include "Database.h"
 #include "pin.h"       // ================== PIN SERVICE ==================
+#include "panencrypted.h"
 
 using namespace mysqlx;
 using json = nlohmann::json;
@@ -176,7 +177,16 @@ public:
             std::string atmId = data["atmId"];
             std::string terminalId = data["terminalId"];
             std::string location = data["location"];
-            std::string pan = data["card"]["pan"];
+            std::string inputPan = "";
+            std::string encryptedPan = data["card"]["pan"];
+
+            try {
+                auto& panService = PANEncryptionService::getInstance();
+                inputPan = panService.decryptPAN(encryptedPan);
+            }
+            catch (const std::exception& e) {
+                throw std::runtime_error("Invalid encrypted PAN");
+            }
             std::string expiry = data["card"]["expiry"];
 
             double amount = data["amount"];
@@ -187,14 +197,14 @@ public:
             {
                 std::string inputPin = data["pin"];
 
-                if (!PINService::getInstance().verifyPIN(pan, inputPin))
+                if (!PINService::getInstance().verifyPIN(inputPan, inputPin))
                 {
                     throw std::runtime_error("Invalid PIN");
                 }
             }
 
             // ================== ORIGINAL LOGIC ==================
-            Row card = repo->getCard(pan,expiry);
+            Row card = repo->getCard(inputPan,expiry);
 
             std::string account = card[0].get<std::string>();
             std::string status = card[1].get<std::string>();
@@ -243,12 +253,27 @@ public:
                     account,
                     amount,
                     fee,
-                    pan,
+                    inputPan,
                     scheme,
                     "SUCCESS",
                     "ATM transaction successful");
 
             repo->insertMasterTransaction(refId);
+            // ✅ NEW: update last transaction time (CARD LEVEL)
+            try {
+                Session& sess = Database::getSession();
+                Schema db = Database::getSchema();
+                Table cards = db.getTable("cards");
+
+                cards.update()
+                    .set("last_transaction_time", mysqlx::expr("NOW()"))
+                    .where("pan = :pan")
+                    .bind("pan", inputPan)
+                    .execute();
+            }
+            catch (...) {
+                // do not fail transaction
+            }
 
             response["transactionId"]=txnId;
             response["status"]="SUCCESS";

@@ -42,6 +42,8 @@ add_executable(BankingAPIServer
         Database.cpp
         include/pin.h
         pin.cpp
+        include/panencrypted.h
+        panencrypted.cpp
 )
 
 # ✅ Link the correct MySQL library (X DevAPI)

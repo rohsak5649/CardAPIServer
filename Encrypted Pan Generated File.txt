@@ -1,0 +1,178 @@
+#include <iostream>
+#include <string>
+#include <cstring>
+#include <openssl/evp.h>
+#include <openssl/rand.h>
+#include <openssl/bio.h>
+#include <openssl/buffer.h>
+
+using namespace std;
+
+const int KEY_LEN = 32;   // AES-256
+const int IV_LEN = 12;    // GCM standard
+const int TAG_LEN = 16;
+
+// ================= BASE64 =================
+string base64_encode(const unsigned char* input, int length) {
+    BIO *bmem, *b64;
+    BUF_MEM *bptr;
+
+    b64 = BIO_new(BIO_f_base64());
+    bmem = BIO_new(BIO_s_mem());
+    b64 = BIO_push(b64, bmem);
+
+    BIO_set_flags(b64, BIO_FLAGS_BASE64_NO_NL);
+    BIO_write(b64, input, length);
+    BIO_flush(b64);
+    BIO_get_mem_ptr(b64, &bptr);
+
+    string output(bptr->data, bptr->length);
+    BIO_free_all(b64);
+
+    return output;
+}
+
+string base64_decode(const string& input) {
+    BIO *b64, *bmem;
+    char buffer[4096];
+
+    b64 = BIO_new(BIO_f_base64());
+    bmem = BIO_new_mem_buf(input.data(), input.length());
+    bmem = BIO_push(b64, bmem);
+
+    BIO_set_flags(bmem, BIO_FLAGS_BASE64_NO_NL);
+    int len = BIO_read(bmem, buffer, sizeof(buffer));
+
+    BIO_free_all(bmem);
+
+    if (len <= 0) throw runtime_error("Base64 decode failed");
+
+    return string(buffer, len);
+}
+
+// ================= MASK =================
+string maskPAN(const string& pan) {
+    if (pan.size() < 10) return pan;
+
+    string masked = pan;
+    for (size_t i = 4; i < pan.size() - 4; i++)
+        masked[i] = '*';
+
+    return masked;
+}
+
+// ================= ENCRYPT (AES-GCM) =================
+string encryptPAN(const string& plaintext, const unsigned char* key) {
+    EVP_CIPHER_CTX *ctx;
+    unsigned char iv[IV_LEN];
+    unsigned char tag[TAG_LEN];
+    unsigned char ciphertext[4096];
+
+    int len, ciphertext_len;
+
+    RAND_bytes(iv, IV_LEN);
+
+    ctx = EVP_CIPHER_CTX_new();
+    EVP_EncryptInit_ex(ctx, EVP_aes_256_gcm(), NULL, NULL, NULL);
+
+    EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_IVLEN, IV_LEN, NULL);
+    EVP_EncryptInit_ex(ctx, NULL, NULL, key, iv);
+
+    EVP_EncryptUpdate(ctx, ciphertext, &len,
+        (unsigned char*)plaintext.c_str(), plaintext.length());
+    ciphertext_len = len;
+
+    EVP_EncryptFinal_ex(ctx, ciphertext + len, &len);
+    ciphertext_len += len;
+
+    EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_GET_TAG, TAG_LEN, tag);
+
+    EVP_CIPHER_CTX_free(ctx);
+
+    // Combine: IV + TAG + CIPHERTEXT
+    string combined((char*)iv, IV_LEN);
+    combined.append((char*)tag, TAG_LEN);
+    combined.append((char*)ciphertext, ciphertext_len);
+
+    return base64_encode((unsigned char*)combined.c_str(), combined.size());
+}
+
+// ================= DECRYPT =================
+string decryptPAN(const string& encoded, const unsigned char* key) {
+    string decoded = base64_decode(encoded);
+
+    if (decoded.size() < IV_LEN + TAG_LEN)
+        throw runtime_error("Invalid encrypted data");
+
+    unsigned char iv[IV_LEN];
+    unsigned char tag[TAG_LEN];
+
+    memcpy(iv, decoded.data(), IV_LEN);
+    memcpy(tag, decoded.data() + IV_LEN, TAG_LEN);
+
+    unsigned char* ciphertext = (unsigned char*)decoded.data() + IV_LEN + TAG_LEN;
+    int ciphertext_len = decoded.size() - IV_LEN - TAG_LEN;
+
+    EVP_CIPHER_CTX *ctx;
+    unsigned char plaintext[4096];
+    int len, plaintext_len;
+
+    ctx = EVP_CIPHER_CTX_new();
+    EVP_DecryptInit_ex(ctx, EVP_aes_256_gcm(), NULL, NULL, NULL);
+
+    EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_IVLEN, IV_LEN, NULL);
+    EVP_DecryptInit_ex(ctx, NULL, NULL, key, iv);
+
+    EVP_DecryptUpdate(ctx, plaintext, &len, ciphertext, ciphertext_len);
+    plaintext_len = len;
+
+    EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_TAG, TAG_LEN, tag);
+
+    if (EVP_DecryptFinal_ex(ctx, plaintext + len, &len) <= 0) {
+        EVP_CIPHER_CTX_free(ctx);
+        throw runtime_error("Decryption failed (tampered or wrong key)");
+    }
+
+    plaintext_len += len;
+    EVP_CIPHER_CTX_free(ctx);
+
+    return string((char*)plaintext, plaintext_len);
+}
+
+// ================= MAIN =================
+int main() {
+    unsigned char key[] = "12345678901234567890123456789012";
+
+    int choice;
+    cout << "1. Encrypt PAN\n2. Decrypt PAN\nEnter choice: ";
+    cin >> choice;
+    cin.ignore();
+
+    try {
+        if (choice == 1) {
+            string pan;
+            cout << "\nEnter PAN: ";
+            getline(cin, pan);
+
+            cout << "Masked: " << maskPAN(pan) << endl;
+
+            string enc = encryptPAN(pan, key);
+            cout << "\nEncrypted: " << enc << endl;
+        }
+        else if (choice == 2) {
+            string enc;
+            cout << "\nEnter Encrypted PAN: ";
+            getline(cin, enc);
+
+            string dec = decryptPAN(enc, key);
+
+            cout << "\nDecrypted: " << dec << endl;
+            cout << "Masked: " << maskPAN(dec) << endl;
+        }
+    }
+    catch (exception &e) {
+        cout << "\nError: " << e.what() << endl;
+    }
+
+    return 0;
+}
