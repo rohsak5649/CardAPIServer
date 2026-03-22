@@ -171,8 +171,10 @@ CREATE TABLE `transaction_pos` (
                                    `status` enum('SUCCESS','FAILED') DEFAULT NULL,
                                    `message` varchar(255) DEFAULT NULL,
                                    `created_at` timestamp NULL DEFAULT CURRENT_TIMESTAMP,
+                                   `refunded_amount` double DEFAULT '0',
+                                   `flag` varchar(2) DEFAULT 'N',
                                    PRIMARY KEY (`id`)
-) ENGINE=InnoDB AUTO_INCREMENT=16 DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci
+) ENGINE=InnoDB AUTO_INCREMENT=6 DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci
 
 CREATE TABLE `transaction_qrcode` (
                                       `id` bigint NOT NULL AUTO_INCREMENT,
