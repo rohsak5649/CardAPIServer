@@ -1,24 +1,155 @@
+
 /*
-* QR Code Payment Processing Flow:
- *
- * PURCHASE:
- * 1. User scans QR or provides QR data manually.
- * 2. System extracts merchant, terminal, currency, and amount details.
- * 3. Customer selects debit account for payment.
- * 4. Balance check performed (amount + fee).
- * 5. Amount debited from account and QR transaction recorded.
- * 6. Transaction linked to master records and success response returned.
- *
- * REFUND:
- * 1. Refund request must reference original QR purchase.
- * 2. System verifies original transaction and account consistency.
- * 3. Strict single-refund policy enforced.
- * 4. Refund amount validated against original purchase amount.
- * 5. Amount credited back to customer account.
- * 6. Refund record stored with linkage to original transaction.
- *
- * Supports static and dynamic QR data parsing.
- */
+* Copyright (c) Rohan Sakhare
+* All rights reserved.
+*
+* QR CODE PAYMENT PROCESSING ENGINE – PURCHASE & REFUND FLOW
+*
+* 1. PURPOSE:
+*    - Handles QR-based payment transactions.
+*    - Supports:
+*        → PURCHASE (scan & pay)
+*        → REFUND (linked to original QR transaction)
+*
+*    - Designed for UPI-like / scan-based payment systems.
+*
+* 2. INPUT SOURCES:
+*
+*    - QR data may come in two forms:
+*        → Structured API request (JSON fields)
+*        → Raw QR string (qrData)
+*
+*    - System extracts values from qrData:
+*        → merchantId (mid)
+*        → merchantName
+*        → terminalId (tid)
+*        → currency
+*        → amount (optional)
+*
+*    - If fields exist in both:
+*        → qrData takes precedence
+*
+* 3. PURCHASE FLOW:
+*
+*    Step 1: Validation
+*        - Amount must be > 0
+*        - accountNumber required (user-selected debit account)
+*
+*    Step 2: Account Fetch
+*        - Validate account existence
+*        - Fetch balance and currency
+*
+*    Step 3: Balance Check
+*        - Ensure sufficient balance (amount + fee)
+*
+*    Step 4: Transaction Execution
+*        - Debit account balance
+*        - Insert QR purchase record:
+*            → message = "QR purchase successful"
+*        - Insert entry in master transactions table
+*
+*    Step 5: Response
+*        - txnId
+*        - updated balance
+*        - merchant details
+*        - transaction scope (DOMESTIC / INTERNATIONAL)
+*
+* 4. REFUND FLOW (STRICT SINGLE REFUND):
+*
+*    Step 1: Identify Original Transaction
+*        - Uses origClientTxnId (client reference)
+*
+*    Step 2: Validate Original Purchase
+*        - Must be a successful QR purchase
+*        - Fetch:
+*            → purchase amount
+*            → account number
+*
+*    Step 3: Account Validation
+*        - Refund must be processed to same account
+*
+*    Step 4: Refund Policy (STRICT)
+*
+*        - Only ONE refund allowed per purchase
+*
+*        Validation:
+*            → Check if any refund exists:
+*                WHERE orig_ref_id = purchaseId
+*
+*            → If exists → reject (already refunded)
+*
+*    Step 5: Amount Validation
+*        - Refund amount ≤ purchase amount
+*
+*    Step 6: Refund Execution
+*        - Credit account balance
+*        - Insert refund record:
+*            → message = "QR refund successful"
+*            → orig_ref_id = purchaseId
+*
+*        - Insert into master transactions table
+*
+*    Step 7: Response
+*        - txnId
+*        - updated balance
+*        - purchaseAmount
+*        - refundedAmount
+*
+* 5. TRANSACTION LINKING:
+*
+*    - Purchase:
+*        → orig_ref_id = NULL
+*
+*    - Refund:
+*        → orig_ref_id = purchaseId
+*
+*    - Enables traceability and audit tracking
+*
+* 6. ERROR HANDLING:
+*
+*    - ERR_INVALID_AMOUNT
+*    - ERR_MISSING_ACCOUNT
+*    - ERR_ACCOUNT_NOT_FOUND
+*    - ERR_INSUFFICIENT_FUNDS
+*    - ERR_MISSING_ORIG_REF
+*    - ERR_PURCHASE_NOT_FOUND
+*    - ERR_ACCOUNT_MISMATCH
+*    - ERR_ALREADY_REFUNDED
+*    - ERR_REFUND_EXCEEDS
+*    - ERR_INVALID_TYPE
+*
+* 7. DESIGN NOTES:
+*
+*    - Lightweight QR parser (key=value format)
+*    - Flexible input handling (API + raw QR)
+*    - Uses Database singleton for DB operations
+*
+* 8. SECURITY NOTES:
+*
+*    - No PAN usage → safer than card-based systems
+*    - Account-based debit reduces card exposure risk
+*    - Input validation prevents malformed QR abuse
+*
+* 9. LIMITATIONS:
+*
+*    - Supports only single refund (no partial refunds)
+*    - QR parsing is basic (not full EMVCo compliant)
+*
+* 10. FUTURE ENHANCEMENTS:
+*
+*    - Support partial refunds (like POS/ECOM)
+*    - EMVCo QR standard parsing
+*    - Fraud detection integration (Falcon)
+*    - Dynamic QR support (merchant-generated)
+*    - Add payer authentication (PIN/OTP)
+*
+* Unauthorized modification without understanding QR parsing,
+* refund policy, and transaction linkage is discouraged.
+*
+* For implementation details:
+* Email: rohanavinashsakhare@gmail.com
+* Mobile: +91 9112765649
+*/
 
 #include <iostream>
 #include <sstream>

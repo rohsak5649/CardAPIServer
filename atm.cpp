@@ -1,3 +1,79 @@
+/*
+* Copyright (c) Rohan Sakhare
+* All rights reserved.
+*
+* ATM TRANSACTION PROCESSING FLOW:
+*
+* 1. Transaction request received from ATM channel API.
+* 2. Input validation performed (transaction type, required fields, structure).
+*
+* 3. PAN & PIN FLOW (SECURE PROCESSING):
+*    - Encrypted PAN received from ATM terminal/client.
+*    - PAN is decrypted internally using AES-GCM (panencrypted module).
+*    - If decryption fails → transaction declined.
+*    - PIN verification performed using PIN service.
+*    - If PIN verification fails → transaction declined.
+*    - Card details validated using cards table (PAN + expiry).
+*
+* 4. CARD VALIDATIONS:
+*    - Card existence check.
+*    - Card status validation (ACTIVE / INACTIVE).
+*    - If inactive → transaction declined.
+*
+* 5. ACCOUNT VALIDATIONS:
+*    - Account fetched using card mapping.
+*    - Account balance locked using SELECT ... FOR UPDATE.
+*    - Ensures consistency in concurrent ATM operations.
+*
+* 6. DAILY LIMIT VALIDATIONS:
+*    - Total transaction amount calculated for current day.
+*    - Withdrawal limit:
+*        → Maximum ₹5,000 per day (amount + fee)
+*    - Deposit limit:
+*        → Maximum ₹10,000 per day
+*
+* 7. TRANSACTION TYPE HANDLING:
+*
+*    WITHDRAWAL:
+*    - Check sufficient balance (amount + fee).
+*    - Debit account balance.
+*
+*    DEPOSIT:
+*    - Validate daily deposit limit.
+*    - Credit account balance.
+*
+*    - Invalid type → transaction declined.
+*
+* 8. TRANSACTION EXECUTION:
+*    - Account balance updated in accounts table.
+*    - Entry inserted into transaction_atm table.
+*    - Entry inserted into master transactions table.
+*
+* 9. CARD ACTIVITY UPDATE:
+*    - last_transaction_time updated in cards table.
+*    - Helps in fraud detection & activity tracking.
+*
+* 10. RESPONSE:
+*    - SUCCESS → transactionId + updated balance
+*    - FAILURE → errorCode/message
+*
+* SECURITY NOTES:
+* - PAN is never exposed externally in plain text.
+* - All PAN operations handled securely within backend.
+* - Encryption standard: AES-256-GCM
+* - PIN verification ensures cardholder authentication.
+*
+* DESIGN NOTES:
+* - Uses repository pattern (ATMRepository) for DB operations.
+* - Service layer (ATMService) handles business logic.
+* - Transaction consistency ensured using DB locking.
+* - Timeout protection applied (6 seconds max execution).
+*
+* Unauthorized modification without understanding transaction,
+* limit validations, and concurrency handling is strongly discouraged.
+*
+* For implementation details, contact: +91 9112765649
+*/
 #include <iostream>
 #include "json.hpp"
 #include <mysqlx/xdevapi.h>
@@ -7,6 +83,7 @@
 #include <future>      // ================== TIMEOUT SUPPORT ==================
 #include "Database.h"
 #include "pin.h"       // ================== PIN SERVICE ==================
+#include "panencrypted.h"
 
 using namespace mysqlx;
 using json = nlohmann::json;
@@ -176,7 +253,16 @@ public:
             std::string atmId = data["atmId"];
             std::string terminalId = data["terminalId"];
             std::string location = data["location"];
-            std::string pan = data["card"]["pan"];
+            std::string inputPan = "";
+            std::string encryptedPan = data["card"]["pan"];
+
+            try {
+                auto& panService = PANEncryptionService::getInstance();
+                inputPan = panService.decryptPAN(encryptedPan);
+            }
+            catch (const std::exception& e) {
+                throw std::runtime_error("Invalid encrypted PAN");
+            }
             std::string expiry = data["card"]["expiry"];
 
             double amount = data["amount"];
@@ -187,14 +273,14 @@ public:
             {
                 std::string inputPin = data["pin"];
 
-                if (!PINService::getInstance().verifyPIN(pan, inputPin))
+                if (!PINService::getInstance().verifyPIN(inputPan, inputPin))
                 {
                     throw std::runtime_error("Invalid PIN");
                 }
             }
 
             // ================== ORIGINAL LOGIC ==================
-            Row card = repo->getCard(pan,expiry);
+            Row card = repo->getCard(inputPan,expiry);
 
             std::string account = card[0].get<std::string>();
             std::string status = card[1].get<std::string>();
@@ -243,12 +329,27 @@ public:
                     account,
                     amount,
                     fee,
-                    pan,
+                    inputPan,
                     scheme,
                     "SUCCESS",
                     "ATM transaction successful");
 
             repo->insertMasterTransaction(refId);
+            // ✅ NEW: update last transaction time (CARD LEVEL)
+            try {
+                Session& sess = Database::getSession();
+                Schema db = Database::getSchema();
+                Table cards = db.getTable("cards");
+
+                cards.update()
+                    .set("last_transaction_time", mysqlx::expr("NOW()"))
+                    .where("pan = :pan")
+                    .bind("pan", inputPan)
+                    .execute();
+            }
+            catch (...) {
+                // do not fail transaction
+            }
 
             response["transactionId"]=txnId;
             response["status"]="SUCCESS";

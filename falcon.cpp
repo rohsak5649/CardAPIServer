@@ -17,27 +17,33 @@
  */
 #include "falcon.h"
 #include "Database.h"
+
 Falcon::Falcon(Session& session) : sess(session)
 {
     sess.sql("USE bankingdb").execute();
 }
 
+// ================= MAIN FRAUD CHECK =================
 bool Falcon::checkFraud(const std::string& accountNumber,
                         double amount,
                         std::string& reason)
 {
-    if (checkSameSecond(accountNumber)) {
+    // SAME SECOND (mobile + ecom)
+    if (checkSameSecond(accountNumber) || checkSameSecondForEcom(accountNumber)) {
         reason = "Multiple transactions within same second";
         return true;
     }
 
-    if (checkVelocity(accountNumber)) {
+    // VELOCITY (mobile + ecom)
+    if (checkVelocity(accountNumber) || checkVelocityForEcom(accountNumber)) {
         reason = "More than 5 transactions within 60 seconds";
         return true;
     }
 
     return false;
 }
+
+// ================= MOBILE SAME SECOND =================
 bool Falcon::checkSameSecond(const std::string& accountNumber)
 {
     RowResult res = sess.sql(
@@ -51,6 +57,23 @@ bool Falcon::checkSameSecond(const std::string& accountNumber)
 
     return res.count() > 0;
 }
+
+// ================= ECOM SAME SECOND =================
+bool Falcon::checkSameSecondForEcom(const std::string& accountNumber)
+{
+    RowResult res = sess.sql(
+        "SELECT 1 FROM bankingdb.transaction_ecom "
+        "WHERE account_number = ? "
+        "AND created_at >= NOW() - INTERVAL 1 SECOND "
+        "LIMIT 1"
+    )
+    .bind(accountNumber)
+    .execute();
+
+    return res.count() > 0;
+}
+
+// ================= MOBILE VELOCITY =================
 bool Falcon::checkVelocity(const std::string& accountNumber)
 {
     RowResult res = sess.sql(
@@ -70,6 +93,29 @@ bool Falcon::checkVelocity(const std::string& accountNumber)
 
     return rowCount >= 5;
 }
+
+// ================= ECOM VELOCITY =================
+bool Falcon::checkVelocityForEcom(const std::string& accountNumber)
+{
+    RowResult res = sess.sql(
+        "SELECT id FROM bankingdb.transaction_ecom "
+        "WHERE account_number = ? "
+        "AND created_at >= NOW() - INTERVAL 60 SECOND "
+        "LIMIT 5"
+    )
+    .bind(accountNumber)
+    .execute();
+
+    int rowCount = 0;
+
+    while (res.fetchOne()) {
+        rowCount++;
+    }
+
+    return rowCount >= 5;
+}
+
+// ================= FRAUD LOG =================
 void Falcon::logFraud(const std::string& txnId,
                       const std::string& clientTxnId,
                       const std::string& deviceId,
@@ -108,4 +154,3 @@ void Falcon::logFraud(const std::string& txnId,
     .bind("DECLINED")
     .execute();
 }
-

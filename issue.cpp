@@ -1,20 +1,122 @@
-/* Copyright (c) Rohan Sakhare
- * All rights reserved.
- *
- * Card Issuance Flow:
- * 1. Client submits account number, cardholder name, and scheme.
- * 2. System validates request fields and supported card schemes.
- * 3. Account existence verified in database.
- * 4. Card priority assigned (Primary / Secondary / Tertiary).
- * 5. Unique PAN, CVV, and Expiry generated securely.
- * 6. Card details stored in Cards table with ACTIVE status.
- * 7. Masked PAN returned in response (CVV shown for demo only).
- *
- * Unauthorized copying or modification without understanding
- * the card issuance logic is discouraged.
- *
- * For implementation details, contact: +91 9112765649
- */
+
+/*
+* Copyright (c) Rohan Sakhare
+* All rights reserved.
+*
+* CARD ISSUANCE PROCESSING FLOW:
+*
+* 1. REQUEST HANDLING:
+*    - Card issuance request received from client/API.
+*    - Required fields:
+*        → accountNumber
+*        → cardholderName
+*        → scheme (VISA / MASTERCARD / RUPAY)
+*
+* 2. INPUT VALIDATION:
+*    - Validate presence of mandatory fields.
+*    - Normalize scheme to uppercase.
+*    - Validate supported schemes:
+*        → VISA
+*        → MASTERCARD
+*        → RUPAY
+*    - If invalid → request rejected.
+*
+* 3. ACCOUNT VALIDATION:
+*    - Verify account existence in accounts table.
+*    - If account not found → transaction rejected.
+*
+* 4. CARD PRIORITY ASSIGNMENT:
+*    - Count existing cards linked to account.
+*    - Assign priority based on count:
+*        → 0 cards → PRIMARY
+*        → 1 card  → SECONDARY
+*        → 2 cards → TERTIARY
+*    - Max limit: 3 cards per account.
+*    - If exceeded → request rejected.
+*
+* 5. CARD DATA GENERATION:
+*
+*    BIN GENERATION:
+*    - VISA        → 411111
+*    - MASTERCARD  → 550000
+*    - RUPAY       → 608014
+*
+*    PAN GENERATION:
+*    - BIN + random digits (16-digit PAN)
+*    - Generated using secure random generator.
+*
+*    CVV GENERATION:
+*    - 3-digit random number (100–999)
+*
+*    EXPIRY GENERATION:
+*    - Currently static (demo: 12/26)
+*    - Can be enhanced to dynamic future date.
+*
+*    CARD TYPE:
+*    - RUPAY → DOMESTIC
+*    - Others → INTERNATIONAL
+*
+* 6. DATABASE INSERTION:
+*    - Insert new record into cards table with:
+*        → PAN
+*        → Scheme
+*        → Card type
+*        → Expiry
+*        → CVV
+*        → Cardholder name
+*        → Account number
+*        → Status = ACTIVE
+*        → Priority (PRIMARY/SECONDARY/TERTIARY)
+*
+* 7. RESPONSE FORMATION:
+*    - PAN is masked before returning:
+*        → First 6 digits visible
+*        → Remaining digits masked
+*
+*    - Response includes:
+*        → masked PAN
+*        → scheme
+*        → card type
+*        → expiry
+*        → CVV (⚠ demo only)
+*        → cardholder name
+*        → account number
+*
+* 8. ERROR HANDLING:
+*    - ERR_INVALID_REQUEST → missing fields
+*    - ERR_INVALID_SCHEME → unsupported scheme
+*    - ERR_ACCOUNT_NOT_FOUND → invalid account
+*    - ERR_MAX_CARD_LIMIT → more than 3 cards
+*    - ERR_DB → database errors
+*
+* SECURITY NOTES:
+* - PAN is generated securely using randomization.
+* - PAN should be encrypted at rest in production.
+* - CVV must NEVER be stored or returned in real systems.
+* - Sensitive data exposure here is for demo purposes only.
+*
+* DESIGN NOTES:
+* - Modular helper functions used:
+*        → getBIN()
+*        → generatePAN()
+*        → generateCVV()
+*        → generateExpiry()
+*        → maskPAN()
+*
+* - Uses centralized Database session for DB operations.
+*
+* FUTURE ENHANCEMENTS:
+* - Luhn algorithm validation for PAN
+* - Dynamic expiry generation
+* - CVV hashing or elimination
+* - PAN encryption (PCI-DSS compliance)
+* - Card activation workflow (OTP based)
+*
+* Unauthorized modification without understanding card generation
+* and security implications is strongly discouraged.
+*
+* For implementation details, contact: +91 9112765649
+*/
 #include <iostream>
 #include "json.hpp"
 #include <mysqlx/xdevapi.h>
