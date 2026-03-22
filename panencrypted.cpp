@@ -2,14 +2,101 @@
 * Copyright (c) Rohan Sakhare
 * All rights reserved.
 *
-* This project involves complex transaction flow, fraud detection,
-* and secure PAN encryption. Proper understanding is required before use.
+* PAN ENCRYPTION & DECRYPTION SERVICE (AES-256-GCM)
 *
-* For support or implementation details:
+* 1. PURPOSE:
+*    - Provides secure handling of Primary Account Number (PAN).
+*    - Ensures PAN is never exposed in plain text outside backend.
+*    - Used across:
+*        → ECOM transactions
+*        → ATM transactions
+*        → MOBILE transactions
+*
+* 2. DESIGN PATTERN:
+*    - Singleton pattern used for PANEncryptionService.
+*    - Ensures single shared instance across application.
+*    - Avoids repeated initialization overhead.
+*
+* 3. ENCRYPTION STANDARD:
+*    - Algorithm: AES-256-GCM (Authenticated Encryption)
+*    - Key length: 256 bits (32 bytes)
+*    - IV length: 12 bytes
+*    - Authentication tag: 16 bytes
+*
+*    SECURITY BENEFITS:
+*    - Confidentiality (data encryption)
+*    - Integrity (tamper detection via GCM tag)
+*    - Protection against replay/tampering attacks
+*
+* 4. INPUT FORMAT (ENCRYPTED PAN):
+*
+*    Base64 Encoded Payload Structure:
+*
+*        [ IV (12 bytes) | TAG (16 bytes) | CIPHERTEXT ]
+*
+*    - Entire payload encoded using Base64 before transmission.
+*
+* 5. DECRYPTION FLOW:
+*
+*    Step 1: Base64 decode input string
+*    Step 2: Extract:
+*        → IV (first 12 bytes)
+*        → TAG (next 16 bytes)
+*        → Ciphertext (remaining bytes)
+*
+*    Step 3: Initialize AES-256-GCM context
+*    Step 4: Perform decryption using key + IV
+*    Step 5: Validate authentication tag
+*
+*    - If tag validation fails → decryption rejected
+*    - Prevents tampered PAN usage
+*
+* 6. ERROR HANDLING:
+*    - Base64 decode failure → exception
+*    - Invalid payload structure → exception
+*    - GCM authentication failure → exception
+*
+* 7. MASKING FUNCTION:
+*    - maskPAN():
+*        → Masks middle digits of PAN
+*        → Example:
+*            5500004249929296 → 5500********9296
+*
+*    - Used for:
+*        → Logging
+*        → API responses
+*        → Debugging (safe display)
+*
+* 8. SECURITY NOTES (VERY IMPORTANT):
+*    - AES key is currently hardcoded (FOR DEMO ONLY)
+*
+*    ⚠ PRODUCTION REQUIREMENTS:
+*        → Store key in environment variables
+*        → Use secure vault (AWS Secrets Manager / HSM)
+*        → Never expose key in source code
+*
+*    - PAN should never be:
+*        → Logged in plain text
+*        → Stored unencrypted
+*        → Sent over insecure channels
+*
+* 9. PERFORMANCE NOTES:
+*    - Uses OpenSSL EVP API (optimized and secure)
+*    - Efficient for high-frequency transaction systems
+*
+* 10. FUTURE ENHANCEMENTS:
+*    - Add encryption function (currently only decrypt shown)
+*    - Key rotation support
+*    - Hardware Security Module (HSM) integration
+*    - Tokenization instead of PAN usage
+*
+* Unauthorized modification without understanding cryptographic
+* implications is strictly discouraged.
+*
+* For implementation details:
 * Email: rohanavinashsakhare@gmail.com
 * Mobile: +91 9112765649
 */
-
 #include "panencrypted.h"
 #include <openssl/evp.h>
 #include <openssl/bio.h>

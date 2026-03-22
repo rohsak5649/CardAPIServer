@@ -1,24 +1,157 @@
 /*
-* POS Transaction Processing Flow:
- *
- * PURCHASE:
- * 1. POS sends card and payment details.
- * 2. System validates card status, CVV, and linked account.
- * 3. Balance check performed (amount + fee).
- * 4. Amount debited atomically from customer account.
- * 5. POS transaction stored and linked in master records.
- * 6. Success response returned with updated balance.
- *
- * REFUND:
- * 1. POS sends original transaction reference.
- * 2. System validates original purchase and merchant/terminal.
- * 3. Ensures refund does not exceed original purchase amount.
- * 4. Amount credited atomically back to customer account.
- * 5. Refund record stored with linkage to original purchase.
- * 6. Response returned with refund status and balance update.
- *
- * Ensures transactional integrity using database transactions.
- */
+* Copyright (c) Rohan Sakhare
+* All rights reserved.
+*
+* POS TRANSACTION PROCESSING ENGINE – PURCHASE & REFUND FLOW
+*
+* 1. PURPOSE:
+*    - Handles Point-of-Sale (POS) transactions.
+*    - Supports:
+*        → PURCHASE (debit)
+*        → REFUND (credit)
+*    - Ensures transactional integrity and audit traceability.
+*
+* 2. REQUEST FLOW:
+*
+*    - Client sends POS request with:
+*        → merchantId
+*        → terminalId
+*        → amount / fee
+*        → card details (PAN, expiry, optional CVV)
+*
+*    - System validates request and routes internally.
+*
+* 3. PURCHASE FLOW:
+*
+*    Step 1: Card Validation
+*        - Validate PAN + expiry from cards table
+*        - Check card status = ACTIVE
+*        - Optional CVV validation
+*
+*    Step 2: Account Fetch
+*        - Fetch linked account using card mapping
+*        - Retrieve balance and currency
+*
+*    Step 3: Validation Checks
+*        - Amount + fee must be positive
+*        - Sufficient balance check
+*
+*    Step 4: Transaction Execution (Atomic)
+*        - Start DB transaction
+*        - Debit account balance
+*        - Insert POS purchase record:
+*            → message = "POS purchase successful"
+*            → original_purchase_id = NULL
+*        - Insert entry into master transactions table
+*        - Commit transaction
+*
+*    Step 5: Response
+*        - Return txnId, updated balance, transaction scope
+*
+* 4. REFUND FLOW (TRANSACTION LINKED):
+*
+*    Step 1: Identify Original Purchase
+*        - Prefer origTransactionId (recommended)
+*        - Fallback: origClientTxnId (latest match)
+*
+*    Step 2: Validate Original Transaction
+*        - Must be a successful POS purchase
+*        - Validate merchantId and terminalId consistency
+*
+*    Step 3: Card Validation (Optional but recommended)
+*        - Ensure refund PAN matches original purchase PAN
+*
+*    Step 4: Refund Eligibility Check
+*
+*        - Calculate already refunded amount:
+*            → SUM(amount) WHERE original_purchase_id = purchaseId
+*
+*        - Compute remaining refundable:
+*            → remaining = purchaseAmount - alreadyRefunded
+*
+*        - Validation rules:
+*            → remaining <= 0 → already fully refunded ❌
+*            → refund > remaining → reject ❌
+*
+*    Step 5: Refund Execution (Atomic)
+*        - Start DB transaction
+*        - Credit amount to account
+*        - Insert refund record:
+*            → message = "Refund successful"
+*            → original_purchase_id = purchaseDbId
+*        - Insert into master transactions table
+*        - Commit transaction
+*
+*    Step 6: Response
+*        - txnId
+*        - updated balance
+*        - purchaseAmount
+*        - alreadyRefunded
+*        - remainingRefundable
+*
+* 5. TRANSACTION LINKING:
+*
+*    - Purchase:
+*        → original_purchase_id = NULL
+*
+*    - Refund:
+*        → original_purchase_id = purchaseDbId
+*
+*    - Enables:
+*        → multiple partial refunds
+*        → audit tracking
+*        → refund aggregation
+*
+* 6. ERROR HANDLING:
+*
+*    - ERR_MISSING_CARD
+*    - ERR_CARD_NOT_FOUND
+*    - ERR_CARD_NOT_ACTIVE
+*    - ERR_CVV_MISMATCH
+*    - ERR_ACCOUNT_NOT_FOUND
+*    - ERR_INSUFFICIENT_FUNDS
+*    - ERR_PURCHASE_NOT_FOUND
+*    - ERR_ALREADY_REFUNDED
+*    - ERR_REFUND_EXCEEDS_REMAINING
+*    - ERR_INVALID_TYPE
+*
+* 7. CONSISTENCY & ATOMICITY:
+*
+*    - Uses DB transactions:
+*        → startTransaction()
+*        → commit()
+*
+*    - Ensures:
+*        → balance update + insert operations are atomic
+*        → no partial updates
+*
+* 8. SECURITY NOTES:
+*
+*    - PAN handled securely (should be encrypted in production)
+*    - CVV validation optional but recommended
+*    - Sensitive data should never be logged in plain text
+*
+* 9. DESIGN NOTES:
+*
+*    - Uses Database singleton for session management
+*    - Follows modular transaction processing
+*    - Refund logic is purchase-linked (correct financial design)
+*
+* 10. FUTURE ENHANCEMENTS:
+*
+*    - Add fraud detection (Falcon integration)
+*    - Add idempotency (duplicate request protection)
+*    - Add device / terminal risk scoring
+*    - Add currency conversion handling
+*    - Add real-time reconciliation system
+*
+* Unauthorized modification without understanding transaction
+* linkage, refund logic, and atomic DB operations is discouraged.
+*
+* For implementation details:
+* Email: rohanavinashsakhare@gmail.com
+* Mobile: +91 9112765649
+*/
 
 #include <iostream>
 #include <sstream>

@@ -2,6 +2,13 @@
 #define ECOM_H
 
 #include "json.hpp"
-nlohmann::json processECOMTransaction(const nlohmann::json& data);
 
-#endif // ECOM_H
+using json = nlohmann::json;
+
+// Wrapper (with timeout like mobile)
+json processECOMTransaction(const json &data);
+
+// Core logic (internal)
+json processECOMTransactionCore(const json &data);
+
+#endif

@@ -63,41 +63,40 @@ ECOM  PURCHASE
 {
   "channelId": "ECOM",
   "data": {
-    "clientTxnId": "ecom-pur-1001",
+    "clientTxnId": "ecom-pur-3002",
     "transactionType": "PURCHASE",
     "merchantId": "MCH-ECOM-55",
-    "orderId": "ORD-20251116-1001",
-    "amount": 49.99,
+    "orderId": "ORD-SECURE-3001",
+    "amount": 100.99,
     "fee": 0.50,
     "currency": "AUD",
     "card": {
-      "pan": "5500004249929296",
+      "pan": "CBwBBJr4ysXiKsjSckij5bIE+K90EkGPl0XHIU0aexg1K+oPF/lRCRgKg5M=",
+      "pin": "Fx1$%w*NbHo#$IZ_VD*G(S|5^@IP(b+&a8dsuuLrlq>3$.2e9xC^df.-2}af;=1{V<HCQ*$/,_.Uk^1Lc)g#cOX7*]049/Cq+}/NFe|r;d|i2F6fQ&SL2&l%?h]Do*<4NFZNQ<x$^rzna@s5JNhj%=",
       "expiry": "12/26",
-      "cvv": "178"
+      "cvv": "905"
     }
   }
 }
 
 ECOM  REFUND
 
-
 {
   "channelId": "ECOM",
   "data": {
-    "clientTxnId": "ecom-refund-1001",
+    "clientTxnId": "ecom-ref-3002",
     "transactionType": "REFUND",
-    "merchantId": "MCH-ECOM-55",
-    "orderId": "ORD-20251116-1001",
-    "amount": 49.99,
+    "originalTxnId": "ecom-txn-1774184114934-1492",
+    "amount": 1000.99,
     "currency": "AUD",
     "card": {
-      "pan": "5500009004544990",
+      "pan": "CBwBBJr4ysXiKsjSckij5bIE+K90EkGPl0XHIU0aexg1K+oPF/lRCRgKg5M=",
+      "pin": "Fx1$%w*NbHo#$IZ_VD*G(S|5^@IP(b+&a8dsuuLrlq>3$.2e9xC^df.-2}af;=1{V<HCQ*$/,_.Uk^1Lc)g#cOX7*]049/Cq+}/NFe|r;d|i2F6fQ&SL2&l%?h]Do*<4NFZNQ<x$^rzna@s5JNhj%=",
       "expiry": "12/26",
-      "cvv": "420"
+      "cvv": "905"
     }
   }
 }
-
 MOBILE  Banking
 {
   "channelId": "MOBILE",

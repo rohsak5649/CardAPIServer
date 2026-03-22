@@ -25,8 +25,13 @@ public:
 private:
     Session& sess;
 
+    // EXISTING (MOBILE)
     bool checkSameSecond(const std::string& accountNumber);
     bool checkVelocity(const std::string& accountNumber);
+
+    // ✅ NEW (ECOM)
+    bool checkSameSecondForEcom(const std::string& accountNumber);
+    bool checkVelocityForEcom(const std::string& accountNumber);
 };
 
 #endif

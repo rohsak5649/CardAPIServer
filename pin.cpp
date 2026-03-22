@@ -1,3 +1,127 @@
+/*
+* Copyright (c) Rohan Sakhare
+* All rights reserved.
+*
+* PIN SERVICE – SECURE PIN GENERATION & VERIFICATION ENGINE
+*
+* 1. PURPOSE:
+*    - Provides secure PIN generation and verification mechanism.
+*    - Eliminates need to store PINs in database.
+*    - Ensures deterministic, tamper-resistant PIN validation.
+*
+* 2. DESIGN PATTERN:
+*    - Singleton pattern used for PINService.
+*    - Ensures single shared instance across application.
+*    - Thread-safe initialization (C++11 static instance).
+*
+* 3. CORE CONCEPT:
+*    - PIN is NOT stored anywhere.
+*    - PIN is derived dynamically using:
+*        → PAN (Primary Account Number)
+*        → Secret Key
+*        → Cryptographic transformations
+*
+*    - Verification:
+*        → Re-generate PIN from PAN
+*        → Compare with input PIN
+*
+* 4. CRYPTOGRAPHIC FLOW:
+*
+*    Step 1: HMAC-SHA256
+*        - Input: PAN / evolving state
+*        - Key: Secret key (server-side only)
+*        - Output: 256-bit hash
+*
+*    Step 2: Compression
+*        - Hash reduced to 64-bit value
+*        - Uses:
+*            → Bit rotation (rotl)
+*            → Avalanche function (strong mixing)
+*
+*    Step 3: Multi-round Derivation
+*        - 6 rounds of transformation
+*        - Each round feeds into next state
+*        - Produces multiple entropy blocks
+*
+*    Step 4: Final PIN Generation
+*        - Combines derived blocks
+*        - Generates PIN using character pool:
+*            → Uppercase letters
+*            → Lowercase letters
+*            → Digits
+*            → Special characters
+*
+*        - Ensures complexity:
+*            → At least 1 uppercase
+*            → At least 1 lowercase
+*            → At least 1 digit
+*            → At least 1 special character
+*
+* 5. PIN VERIFICATION:
+*
+*    - Input PIN received from client
+*    - System regenerates PIN using PAN
+*    - Compares generated PIN with input
+*
+*    - If match → VALID
+*    - Else → INVALID
+*
+* 6. SECURITY ADVANTAGES:
+*
+*    - No PIN storage (eliminates DB leakage risk)
+*    - Deterministic verification (no lookup needed)
+*    - Resistant to:
+*        → Replay attacks
+*        → Database compromise
+*        → Brute-force attacks (high entropy)
+*
+* 7. KEY MANAGEMENT (CRITICAL):
+*
+*    - Secret key used for HMAC:
+*        → "ULTRA_SECRET_KEY_2026_!@#"
+*
+*    ⚠ PRODUCTION REQUIREMENTS:
+*        → Move key to environment variables
+*        → Use secure vault / HSM
+*        → Rotate keys periodically
+*
+* 8. ERROR HANDLING:
+*
+*    - Empty input → exception
+*    - Invalid PAN → exception
+*    - HMAC failure → exception
+*    - Internal failures wrapped with context
+*
+* 9. PERFORMANCE:
+*
+*    - Lightweight computation (no DB calls)
+*    - Suitable for high-frequency transaction systems
+*    - Constant-time operations (low latency)
+*
+* 10. FUTURE ENHANCEMENTS:
+*
+*    - Add rate limiting for PIN attempts
+*    - Add device/IP binding for extra security
+*    - Add PIN retry lock mechanism
+*    - Integrate with hardware security module (HSM)
+*
+* DESIGN NOTES:
+*    - Combines cryptographic hashing + custom mixing
+*    - Inspired by secure key derivation techniques
+*    - Ensures strong randomness and unpredictability
+*
+* SECURITY WARNING:
+*    - Any modification in logic will break PIN consistency
+*    - Must maintain backward compatibility for existing users
+*
+* Unauthorized modification without understanding
+* cryptographic derivation logic is strictly discouraged.
+*
+* For implementation details:
+* Email: rohanavinashsakhare@gmail.com
+* Mobile: +91 9112765649
+*/
+
 #include "pin.h"
 #include <openssl/hmac.h>
 #include <vector>
