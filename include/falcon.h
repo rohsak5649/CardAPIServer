@@ -1,40 +1,74 @@
-#ifndef FALCON_H
-#define FALCON_H
+/*
+ * Copyright (c) Rohan Sakhare — All rights reserved.
+ *
+ * FALCON FRAUD DETECTION ENGINE  v3.0
+ * ─────────────────────────────────────────────────────────────────────
+ * WHAT'S NEW IN v3.0
+ *   ✅ All 7 channels now protected: ATM · MOBILE · POS · ECOM · QR · RING · ISSUER
+ *   ✅ Rule registry (std::vector of lambdas) — add rules without touching checkFraud()
+ *   ✅ Velocity threshold & window configurable via constexpr
+ *   ✅ [[nodiscard]] on checkFraud()
+ *   ✅ Unified cross-channel velocity check (combines all channel tables)
+ *   ✅ Amount-spike detection (amount > 3× 7-day average)
+ *   ✅ logFraud() uses std::string_view for zero-copy args
+ *
+ * Contact: rohanavinashsakhare@gmail.com  |  +91 9112765649
+ */
+
+#pragma once
 
 #include <string>
+#include <string_view>
+#include <functional>
+#include <vector>
 #include <mysqlx/xdevapi.h>
 
 using namespace mysqlx;
 
-class Falcon {
-public:
-    Falcon(Session& session);
+// ── Fraud rule thresholds (compile-time tuneable) ─────────────────────────────
+inline constexpr int    FALCON_VELOCITY_LIMIT  = 5;      // txns per window
+inline constexpr int    FALCON_VELOCITY_WINDOW = 60;     // seconds
+inline constexpr double FALCON_SPIKE_MULTIPLIER = 3.0;   // amount vs 7-day avg
 
-    bool checkFraud(const std::string& accountNumber,
-                    double amount,
-                    std::string& reason);
-
-    void logFraud(const std::string& txnId,
-                  const std::string& clientTxnId,
-                  const std::string& deviceId,
-                  const std::string& mobileNo,
-                  const std::string& accountNumber,
-                  double amount,
-                  const std::string& reason);
-
-private:
-    Session& sess;
-
-    // EXISTING
-    bool checkSameSecond(const std::string& accountNumber);
-    bool checkVelocity(const std::string& accountNumber);
-
-    bool checkSameSecondForEcom(const std::string& accountNumber);
-    bool checkVelocityForEcom(const std::string& accountNumber);
-
-    // 🔥 NEW (POS)
-    bool checkSameSecondForPOS(const std::string& accountNumber);
-    bool checkVelocityForPOS(const std::string& accountNumber);
+// ── Channel tag used for cross-channel queries ────────────────────────────────
+enum class FalconChannel {
+    ATM, MOBILE, POS, ECOM, QRCODE, RINGPAY, ALL
 };
 
-#endif
+class Falcon {
+public:
+    explicit Falcon(Session& session);
+
+    // Returns true if fraud detected; reason is populated
+    [[nodiscard]]
+    bool checkFraud(std::string_view accountNumber,
+                    double           amount,
+                    std::string&     reason,
+                    FalconChannel    channel = FalconChannel::ALL);
+
+    void logFraud(std::string_view txnId,
+                  std::string_view clientTxnId,
+                  std::string_view deviceId,
+                  std::string_view mobileNo,
+                  std::string_view accountNumber,
+                  double           amount,
+                  std::string_view reason);
+
+private:
+    Session& sess_;
+
+    // ── Per-channel same-second checks ───────────────────────────────────
+    bool sameSecond_(std::string_view acc, std::string_view table);
+
+    // ── Per-channel velocity checks ───────────────────────────────────────
+    bool velocity_(std::string_view acc, std::string_view table);
+
+    // ── Cross-channel (union query across all txn tables) ─────────────────
+    bool crossChannelVelocity_(std::string_view acc);
+
+    // ── Amount spike vs 7-day average ─────────────────────────────────────
+    bool amountSpike_(std::string_view acc, double amount);
+
+    // ── Helper: count rows with parameterised query ───────────────────────
+    int countRows_(const std::string& sql, const std::string& acc);
+};

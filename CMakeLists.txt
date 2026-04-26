@@ -5,23 +5,29 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
-# ✅ Include directories
+# ── Include directories ────────────────────────────────────────────────────────
 include_directories(
         ${PROJECT_SOURCE_DIR}/include
         /opt/homebrew/include
         /opt/homebrew/Cellar/mysql-connector-c++/9.5.0/include
 )
 
-# ✅ Link directories
+# ── Link directories ───────────────────────────────────────────────────────────
 link_directories(
         /opt/homebrew/lib
         /opt/homebrew/Cellar/mysql-connector-c++/9.5.0/lib
 )
+
+# ── OpenSSL ────────────────────────────────────────────────────────────────────
 set(OPENSSL_ROOT_DIR /opt/homebrew/opt/openssl@3)
 find_package(OpenSSL REQUIRED)
-# ✅ Add your source files
+
+# ── Threads (REQUIRED for multithreading) ─────────────────────────────────────
+find_package(Threads REQUIRED)
+
+# ── Source files ───────────────────────────────────────────────────────────────
 add_executable(BankingAPIServer
-        parser&router.cpp
+        "parser&router.cpp"
         atm.cpp
         mobile.cpp
         include/atm.h
@@ -46,10 +52,17 @@ add_executable(BankingAPIServer
         panencrypted.cpp
 )
 
-# ✅ Link the correct MySQL library (X DevAPI)
+# ── Compiler flags ─────────────────────────────────────────────────────────────
+# CPPHTTPLIB_THREAD_POOL_COUNT is respected by httplib when using ThreadPool.
+target_compile_definitions(BankingAPIServer PRIVATE
+        CPPHTTPLIB_THREAD_POOL_COUNT=100
+)
+
+# ── Link libraries ─────────────────────────────────────────────────────────────
 target_link_libraries(BankingAPIServer
         mysqlcppconnx
         OpenSSL::Crypto
+        Threads::Threads       # ← adds -pthread on Linux/macOS
 )
 
-set(CMAKE_BUILD_TYPE Debug)
+set(CMAKE_BUILD_TYPE Release)   # use Release for production; Debug for development
