@@ -21,6 +21,7 @@
 #include "pin.h"
 #include "panencrypted.h"
 #include "falcon.h"
+#include "AccountLockManager.h"
 
 #include <iostream>
 #include <sstream>
@@ -144,6 +145,8 @@ using ATMHandler = std::function<json(const json&, ATMRepository&, Session&,
 
 static json handleWithdrawal(const json& data, ATMRepository& repo, Session& sess,
                               std::string_view acc, std::string_view pan, std::string_view scheme) {
+    AccountLockManager::ScopedLock accLock(AccountLockManager::getInstance(), std::string(acc), TxnPriority::DEBIT);
+
     double amount = data["amount"].get<double>();
     double fee    = data["fee"].get<double>();
 
@@ -177,6 +180,8 @@ static json handleWithdrawal(const json& data, ATMRepository& repo, Session& ses
 
 static json handleDeposit(const json& data, ATMRepository& repo, Session& sess,
                            std::string_view acc, std::string_view pan, std::string_view scheme) {
+    AccountLockManager::ScopedLock accLock(AccountLockManager::getInstance(), std::string(acc), TxnPriority::CREDIT);
+
     double amount = data["amount"].get<double>();
 
     double todayD = repo.getTodayDepositTotal(acc);
