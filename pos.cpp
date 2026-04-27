@@ -19,6 +19,7 @@
 #include "falcon.h"
 #include "panencrypted.h"
 #include "pin.h"
+#include "AccountLockManager.h"
 
 #include <chrono>
 #include <functional>
@@ -142,6 +143,8 @@ struct POSContext {
       return {{"status", "DECLINED"}, {"message", fraudReason}};
     }
 
+    AccountLockManager::ScopedLock accLock(AccountLockManager::getInstance(), accNo, TxnPriority::DEBIT);
+
     double balance = ctx.accounts.select("balance")
                          .where("account_number=:a")
                          .bind("a", accNo)
@@ -238,6 +241,8 @@ struct POSContext {
       return err("ERR_ALREADY_REFUNDED");
     if (amount <= 0 || amount > purchAmt)
       return err("ERR_INVALID_REFUND_AMOUNT");
+
+    AccountLockManager::ScopedLock accLock(AccountLockManager::getInstance(), acc, TxnPriority::CREDIT);
 
     double balance = ctx.accounts.select("balance")
                          .where("account_number=:a")
