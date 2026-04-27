@@ -107,6 +107,7 @@ static const std::unordered_map<std::string, ChannelFn> CHANNEL_DISPATCH = {
     { "ECOM",    processECOMTransaction     },
     { "QRCODE",  processQRCodePayment       },
     { "RINGPAY", processRingPayTransaction  },
+    { "CARD_DETAILS", processGetCardDetails },
 };
 
 // ── Structured logger ─────────────────────────────────────────────────────────

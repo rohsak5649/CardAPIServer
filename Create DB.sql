@@ -43,12 +43,14 @@ CREATE TABLE `accounts` (
                             `currency_id` int NOT NULL,
                             PRIMARY KEY (`account_id`),
                             UNIQUE KEY `account_number` (`account_number`)
-) ENGINE=InnoDB AUTO_INCREMENT=7 DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci
+) ENGINE=InnoDB AUTO_INCREMENT=1 DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci
 
 
 CREATE TABLE `cards` (
                          `card_id` int NOT NULL AUTO_INCREMENT,
                          `pan` varchar(20) NOT NULL,
+                         `masked_pan` varchar(20) DEFAULT NULL,
+                         `encrypted_pan` varchar(255) DEFAULT NULL,
                          `scheme` varchar(20) DEFAULT NULL,
                          `card_type` varchar(20) DEFAULT NULL,
                          `expiry` varchar(10) NOT NULL,
@@ -59,7 +61,7 @@ CREATE TABLE `cards` (
                          `card_priority` enum('PRIMARY','SECONDARY','TERTIARY') DEFAULT 'PRIMARY',
                          PRIMARY KEY (`card_id`),
                          UNIQUE KEY `pan` (`pan`)
-) ENGINE=InnoDB AUTO_INCREMENT=17 DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci
+) ENGINE=InnoDB AUTO_INCREMENT=1 DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci
 
 CREATE TABLE `currency` (
                             `currency_id` int NOT NULL AUTO_INCREMENT,
@@ -69,7 +71,7 @@ CREATE TABLE `currency` (
                             `is_base` tinyint(1) DEFAULT '0',
                             PRIMARY KEY (`currency_id`),
                             UNIQUE KEY `currency_code` (`currency_code`)
-) ENGINE=InnoDB AUTO_INCREMENT=4 DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci
+) ENGINE=InnoDB AUTO_INCREMENT=1 DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci
 
 CREATE TABLE `ringpay_tokens` (
                                   `token_id` bigint NOT NULL AUTO_INCREMENT,
@@ -83,7 +85,7 @@ CREATE TABLE `ringpay_tokens` (
                                   `expires_at` timestamp NULL DEFAULT NULL,
                                   PRIMARY KEY (`token_id`),
                                   UNIQUE KEY `token` (`token`)
-) ENGINE=InnoDB AUTO_INCREMENT=9 DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci
+) ENGINE=InnoDB AUTO_INCREMENT=1 DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci
 
 CREATE TABLE `transaction_atm` (
                                    `id` bigint NOT NULL AUTO_INCREMENT,
@@ -123,7 +125,7 @@ CREATE TABLE `transaction_ecom` (
                                     `flag` varchar(5) DEFAULT 'N',
                                     `created_at` timestamp NULL DEFAULT CURRENT_TIMESTAMP,
                                     PRIMARY KEY (`id`)
-) ENGINE=InnoDB AUTO_INCREMENT=10 DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci
+) ENGINE=InnoDB AUTO_INCREMENT=1 DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci
 
 CREATE TABLE `transaction_falcon` (
                                       `id` int NOT NULL AUTO_INCREMENT,
@@ -137,7 +139,7 @@ CREATE TABLE `transaction_falcon` (
                                       `status` varchar(20) DEFAULT NULL,
                                       `created_at` timestamp NULL DEFAULT CURRENT_TIMESTAMP,
                                       PRIMARY KEY (`id`)
-) ENGINE=InnoDB AUTO_INCREMENT=42 DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci
+) ENGINE=InnoDB AUTO_INCREMENT=1 DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci
 
 CREATE TABLE `transaction_mobile` (
                                       `id` bigint NOT NULL AUTO_INCREMENT,
@@ -153,7 +155,7 @@ CREATE TABLE `transaction_mobile` (
                                       `created_at` timestamp NULL DEFAULT CURRENT_TIMESTAMP,
                                       PRIMARY KEY (`id`),
                                       KEY `idx_mobile_acc_time` (`account_number`,`created_at`)
-) ENGINE=InnoDB AUTO_INCREMENT=5 DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci
+) ENGINE=InnoDB AUTO_INCREMENT=1 DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci
 
 CREATE TABLE `transaction_pos` (
                                    `id` bigint NOT NULL AUTO_INCREMENT,
@@ -174,7 +176,7 @@ CREATE TABLE `transaction_pos` (
                                    `refunded_amount` double DEFAULT '0',
                                    `flag` varchar(2) DEFAULT 'N',
                                    PRIMARY KEY (`id`)
-) ENGINE=InnoDB AUTO_INCREMENT=6 DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci
+) ENGINE=InnoDB AUTO_INCREMENT=1 DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci
 
 CREATE TABLE `transaction_qrcode` (
                                       `id` bigint NOT NULL AUTO_INCREMENT,
@@ -194,7 +196,7 @@ CREATE TABLE `transaction_qrcode` (
                                       `orig_ref_id` bigint DEFAULT NULL,
                                       `created_at` timestamp NULL DEFAULT CURRENT_TIMESTAMP,
                                       PRIMARY KEY (`id`)
-) ENGINE=InnoDB AUTO_INCREMENT=3 DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci
+) ENGINE=InnoDB AUTO_INCREMENT=1 DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci
 
 
 CREATE TABLE `transaction_ringpay` (
@@ -212,7 +214,7 @@ CREATE TABLE `transaction_ringpay` (
                                        `ip_address` varchar(50) DEFAULT NULL,
                                        `merchant_id` varchar(30) DEFAULT NULL,
                                        PRIMARY KEY (`id`)
-) ENGINE=InnoDB AUTO_INCREMENT=50 DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci
+) ENGINE=InnoDB AUTO_INCREMENT=1 DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci
 
 CREATE TABLE `transactions` (
                                 `id` bigint NOT NULL AUTO_INCREMENT,
@@ -221,4 +223,4 @@ CREATE TABLE `transactions` (
                                 `status` varchar(20) DEFAULT NULL,
                                 `created_at` timestamp NULL DEFAULT CURRENT_TIMESTAMP,
                                 PRIMARY KEY (`id`)
-) ENGINE=InnoDB AUTO_INCREMENT=190 DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci
+) ENGINE=InnoDB AUTO_INCREMENT=1 DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci

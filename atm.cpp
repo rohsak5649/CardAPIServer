@@ -57,14 +57,14 @@ class ATMRepository {
 public:
     explicit ATMRepository(Session* s) : s_(s), db_(s->getSchema("bankingdb")) {}
 
-    // Returns {account_number, status, scheme}
-    [[nodiscard]] Row getCard(std::string_view pan, std::string_view expiry) {
+    // Returns {account_number, status, scheme, expiry, cvv}
+    [[nodiscard]] std::optional<Row> getCard(std::string_view pan) {
         auto res = db_.getTable("cards")
-            .select("account_number","status","scheme")
-            .where("pan = :p AND expiry = :e")
-            .bind("p", std::string(pan)).bind("e", std::string(expiry))
+            .select("account_number","status","scheme","expiry","cvv")
+            .where("pan = :p")
+            .bind("p", std::string(pan))
             .execute();
-        if (res.count() == 0) throw std::runtime_error("Card not found or expiry mismatch");
+        if (res.count() == 0) return std::nullopt;
         return res.fetchOne();
     }
 
@@ -233,10 +233,40 @@ static const std::unordered_map<std::string, ATMHandler> ATM_DISPATCH = {
         }
 
         // ── Card lookup ───────────────────────────────────────────────────
-        Row cardRow = repo.getCard(pan, expiry);
+        auto cardOpt = repo.getCard(pan);
+        if (!cardOpt) {
+            return {
+                {"status", "FAILED"},
+                {"errorCode", "ERR_CARD_NOT_FOUND"},
+                {"message", "Card not found"}
+            };
+        }
+        
+        Row cardRow = *cardOpt;
         std::string acc    = cardRow[0].get<std::string>();
         std::string status = cardRow[1].get<std::string>();
         std::string scheme = cardRow[2].isNull() ? "" : cardRow[2].get<std::string>();
+        std::string dbExpiry = cardRow[3].get<std::string>();
+        std::string dbCvv    = cardRow[4].isNull() ? "" : cardRow[4].get<std::string>();
+
+        if (expiry != dbExpiry) {
+            return {
+                {"status", "FAILED"},
+                {"errorCode", "ERR_INVALID_EXPIRY"},
+                {"message", "Wrong expiry date"}
+            };
+        }
+        
+        if (data["card"].contains("cvv")) {
+            std::string reqCvv = data["card"]["cvv"].get<std::string>();
+            if (reqCvv != dbCvv) {
+                return {
+                    {"status", "FAILED"},
+                    {"errorCode", "ERR_INVALID_CVV"},
+                    {"message", "Wrong CVV"}
+                };
+            }
+        }
 
         if (status != "ACTIVE") throw std::runtime_error("Card is not active");
 
