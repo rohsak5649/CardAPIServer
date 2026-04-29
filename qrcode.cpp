@@ -18,6 +18,8 @@
 #include <mysqlx/xdevapi.h>
 #include "json.hpp"
 #include "Database.h"
+#include "TransactionLogger.h"
+#include "falcon.h"
 
 using namespace mysqlx;
 using json = nlohmann::json;
@@ -56,6 +58,13 @@ static std::string find_kv(const std::string& qrData, const std::string& key) {
 
 json processQRCodePayment(const json& data) {
     json res;
+    TransactionLogger::ScopedFunctionTrace trace("processQRCodePayment",
+                                                 {{"transactionType", data.value("transactionType", "PURCHASE")}});
+    std::string uuid = data.value("_correlationUuid", TransactionLogger::currentUuid());
+    TransactionLogger::ScopedContext scope(uuid, "QRCODE");
+    TransactionLogger::instance().logCurrent(
+        "INFO", "channel_handler_started", "QR Code transaction handler started",
+        {{"transactionType", data.value("transactionType", "PURCHASE")}});
 
     // ★ Each request acquires its OWN session from the pool
     Database::ScopedConnection sc;
@@ -87,11 +96,13 @@ json processQRCodePayment(const json& data) {
         if (txnType == "PURCHASE" && amount <= 0.0) {
             res["errorCode"] = "ERR_INVALID_AMOUNT";
             res["message"]   = "Purchase amount must be > 0.";
+            trace.fail("invalid QR purchase amount", {{"amount", std::to_string(amount)}});
             return res;
         }
         if (accountNumber.empty()) {
             res["errorCode"] = "ERR_MISSING_ACCOUNT";
             res["message"]   = "accountNumber is required.";
+            trace.fail("missing account number");
             return res;
         }
 
@@ -104,6 +115,7 @@ json processQRCodePayment(const json& data) {
         if (accRes.count() == 0) {
             res["errorCode"] = "ERR_ACCOUNT_NOT_FOUND";
             res["message"]   = "Debit account not found.";
+            trace.fail("account not found", {{"accountNumber", accountNumber}});
             return res;
         }
 
@@ -113,11 +125,30 @@ json processQRCodePayment(const json& data) {
         std::string txnId = genQRTxnId();
         std::string scope = (accCurrency == currency) ? "DOMESTIC" : "INTERNATIONAL";
 
+        // ── Falcon fraud and AI security check ───────────────────────────────
+        Falcon falcon(sess);
+        std::string fraudReason;
+        if (falcon.checkFraud(accountNumber, amount, fraudReason,
+                              FalconChannel::QRCODE, &data)) {
+            falcon.logFraud(txnId, clientTxnId, tid, "", accountNumber,
+                            amount, fraudReason);
+            res["transactionId"] = txnId;
+            res["status"] = "DECLINED";
+            res["errorCode"] = "ERR_FRAUD";
+            res["message"] = fraudReason;
+            trace.fail("fraud declined QR transaction", {{"reason", fraudReason}});
+            return res;
+        }
+
         // ── PURCHASE ──────────────────────────────────────────────────────────
         if (txnType == "PURCHASE") {
             if (balance < amount + fee) {
                 res["errorCode"] = "ERR_INSUFFICIENT_FUNDS";
                 res["message"]   = "Insufficient balance.";
+                trace.fail("insufficient balance",
+                           {{"balance", std::to_string(balance)},
+                            {"amount", std::to_string(amount)},
+                            {"fee", std::to_string(fee)}});
                 return res;
             }
             double newBal = balance - (amount + fee);
@@ -142,6 +173,9 @@ json processQRCodePayment(const json& data) {
             res["merchantName"]    = merchantName;
             res["merchantId"]      = mid;
             res["transactionScope"]= scope;
+            trace.success({{"transactionId", txnId},
+                           {"merchantId", mid},
+                           {"scope", scope}});
             return res;
         }
 
@@ -150,6 +184,7 @@ json processQRCodePayment(const json& data) {
             if (!data.contains("origClientTxnId")) {
                 res["errorCode"] = "ERR_MISSING_ORIG_REF";
                 res["message"]   = "origClientTxnId required for refund.";
+                trace.fail("missing original client transaction id");
                 return res;
             }
             std::string origClient = data["origClientTxnId"].get<std::string>();
@@ -157,21 +192,39 @@ json processQRCodePayment(const json& data) {
             RowResult pRes = qrTable.select("id","amount","account_number")
                 .where("client_txn_id = :cid AND message = 'QR purchase successful'")
                 .bind("cid",origClient).execute();
-            if (pRes.count() == 0) { res["errorCode"]="ERR_PURCHASE_NOT_FOUND"; return res; }
+            if (pRes.count() == 0) {
+                res["errorCode"]="ERR_PURCHASE_NOT_FOUND";
+                trace.fail("original QR purchase not found", {{"origClientTxnId", origClient}});
+                return res;
+            }
 
             Row pRow = pRes.fetchOne();
             int64_t purchaseId  = pRow[0].get<int64_t>();
             double purchaseAmt  = pRow[1].get<double>();
             std::string purchAcc = pRow[2].get<std::string>();
 
-            if (purchAcc != accountNumber) { res["errorCode"]="ERR_ACCOUNT_MISMATCH"; return res; }
+            if (purchAcc != accountNumber) {
+                res["errorCode"]="ERR_ACCOUNT_MISMATCH";
+                trace.fail("refund account mismatch");
+                return res;
+            }
 
             RowResult already = qrTable.select("id")
                 .where("orig_ref_id = :pid AND message = 'QR refund successful'")
                 .bind("pid",purchaseId).execute();
-            if (already.count() > 0) { res["errorCode"]="ERR_ALREADY_REFUNDED"; return res; }
+            if (already.count() > 0) {
+                res["errorCode"]="ERR_ALREADY_REFUNDED";
+                trace.fail("QR purchase already refunded");
+                return res;
+            }
 
-            if (amount > purchaseAmt) { res["errorCode"]="ERR_REFUND_EXCEEDS"; return res; }
+            if (amount > purchaseAmt) {
+                res["errorCode"]="ERR_REFUND_EXCEEDS";
+                trace.fail("QR refund exceeds purchase amount",
+                           {{"amount", std::to_string(amount)},
+                            {"purchaseAmount", std::to_string(purchaseAmt)}});
+                return res;
+            }
 
             double newBal = balance + amount;
             accounts.update().set("balance",newBal)
@@ -194,16 +247,20 @@ json processQRCodePayment(const json& data) {
             res["balanceAfter"]  = newBal;
             res["purchaseAmount"]= purchaseAmt;
             res["refundedAmount"]= amount;
+            trace.success({{"transactionId", txnId},
+                           {"refundedAmount", std::to_string(amount)}});
             return res;
         }
 
         res["errorCode"] = "ERR_INVALID_TYPE";
         res["message"]   = "Unsupported QR transactionType";
+        trace.fail("unsupported QR transaction type", {{"transactionType", txnType}});
         return res;
 
     } catch (const std::exception& e) {
         res["errorCode"] = "ERR_EXCEPTION";
         res["message"]   = e.what();
+        trace.fail("QR code payment exception", {{"error", e.what()}});
         return res;
     }
 }

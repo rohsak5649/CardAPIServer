@@ -19,6 +19,7 @@
 #include "falcon.h"
 #include "panencrypted.h"
 #include "pin.h"
+#include "TransactionLogger.h"
 
 #include <chrono>
 #include <iostream>
@@ -61,6 +62,14 @@ inline constexpr int RING_RISK_BLOCK = 70;
 
 json processRingPayTransaction(const json &data) {
   json response;
+  TransactionLogger::ScopedFunctionTrace trace("processRingPayTransaction");
+  std::string uuid = data.value("_correlationUuid", TransactionLogger::currentUuid());
+  TransactionLogger::ScopedContext scope(uuid, "RINGPAY");
+  TransactionLogger::instance().logCurrent(
+      "INFO", "channel_handler_started",
+      "RingPay transaction handler started",
+      {{"transactionType", data.value("transactionType", "PURCHASE")}});
+
   Database::ScopedConnection sc;
   Session &sess = *sc;
   Schema db = sess.getSchema("bankingdb");
@@ -79,14 +88,17 @@ json processRingPayTransaction(const json &data) {
     try {
       pan = PANEncryptionService::getInstance().decryptPAN(encPan);
     } catch (const std::exception &e) {
+      trace.fail("encrypted PAN decrypt failed", {{"error", e.what()}});
       return err("ERR_INVALID_ENCRYPTED_PAN", e.what());
     }
 
     // ── PIN verify (optional for contactless) ─────────────────────────
     if (data.contains("pin")) {
       std::string pin = data["pin"].get<std::string>();
-      if (!PINService::getInstance().verifyPIN(pan, pin))
+      if (!PINService::getInstance().verifyPIN(pan, pin)) {
+        trace.fail("PIN verification failed");
         return err("ERR_INVALID_PIN", "PIN verification failed");
+      }
     }
 
     Table cards = db.getTable("cards");
@@ -100,8 +112,10 @@ json processRingPayTransaction(const json &data) {
                        .where("pan=:p")
                        .bind("p", pan)
                        .execute();
-    if (cardRes.count() == 0)
+    if (cardRes.count() == 0) {
+      trace.fail("card not found");
       return err("ERR_INVALID_CARD", "Card not found");
+    }
 
     Row cardRow = cardRes.fetchOne();
     std::string accNo = cardRow[0].get<std::string>();
@@ -111,19 +125,24 @@ json processRingPayTransaction(const json &data) {
     std::string dbCvv = cardRow[4].isNull() ? "" : cardRow[4].get<std::string>();
 
     if (!expiry.empty() && expiry != dbExpiry) {
+      trace.fail("invalid expiry");
       return err("ERR_INVALID_EXPIRY", "Wrong expiry date");
     }
 
     if (data.contains("cvv")) {
       std::string reqCvv = data["cvv"].get<std::string>();
       if (!reqCvv.empty() && reqCvv != dbCvv) {
+        trace.fail("invalid CVV");
         return err("ERR_INVALID_CVV", "Wrong CVV");
       }
     }
 
-    if (cStatus != "ACTIVE" || cPrio != "PRIMARY")
+    if (cStatus != "ACTIVE" || cPrio != "PRIMARY") {
+      trace.fail("card priority/status rule failed",
+                 {{"cardStatus", cStatus}, {"cardPriority", cPrio}});
       return err("ERR_CARD_RULE",
                  "Only PRIMARY ACTIVE card allowed for RingPay");
+    }
 
     // ── Account freeze check ─────────────────────────────────────────
     bool frozen = accounts.select("is_frozen")
@@ -132,17 +151,21 @@ json processRingPayTransaction(const json &data) {
                       .execute()
                       .fetchOne()[0]
                       .get<bool>();
-    if (frozen)
+    if (frozen) {
+      trace.fail("account frozen", {{"accountNumber", accNo}});
       return err("ERR_ACCOUNT_FROZEN", "Account is frozen");
+    }
 
     // ── Falcon fraud check (NEW in v3) ────────────────────────────────
     Falcon falcon(sess);
     std::string fraudReason;
     std::string txnId = genTxnId();
-    if (falcon.checkFraud(accNo, amount, fraudReason, FalconChannel::RINGPAY)) {
+    if (falcon.checkFraud(accNo, amount, fraudReason, FalconChannel::RINGPAY,
+                          &data)) {
       std::string clientId = data.value("clientTxnId", txnId);
       falcon.logFraud(txnId, clientId, deviceId, "", accNo, amount,
                       fraudReason);
+      trace.fail("fraud declined RingPay transaction", {{"reason", fraudReason}});
       return {{"transactionId", txnId},
               {"status", "DECLINED"},
               {"message", fraudReason}};
@@ -166,10 +189,14 @@ json processRingPayTransaction(const json &data) {
     }
 
     // ── Limits ────────────────────────────────────────────────────────
-    if (amount > RING_SINGLE_LIMIT)
+    if (amount > RING_SINGLE_LIMIT) {
+      trace.fail("RingPay single limit exceeded",
+                 {{"amount", std::to_string(amount)},
+                  {"limit", std::to_string(RING_SINGLE_LIMIT)}});
       return err("ERR_SINGLE_LIMIT", "Max " +
                                          std::to_string(RING_SINGLE_LIMIT) +
                                          " per RingPay txn");
+    }
 
     double usedToday =
         ringTable.select("IFNULL(SUM(amount),0)")
@@ -180,8 +207,12 @@ json processRingPayTransaction(const json &data) {
             .fetchOne()[0]
             .get<double>();
 
-    if (usedToday + amount > RING_DAILY_LIMIT)
+    if (usedToday + amount > RING_DAILY_LIMIT) {
+      trace.fail("RingPay daily limit exceeded",
+                 {{"usedToday", std::to_string(usedToday)},
+                  {"amount", std::to_string(amount)}});
       return err("ERR_DAILY_LIMIT", "Daily RingPay limit exceeded");
+    }
 
     if (usedToday + amount > RING_WARNING_LEVEL)
       response["warning"] = "Approaching daily RingPay limit";
@@ -194,8 +225,12 @@ json processRingPayTransaction(const json &data) {
                               .execute()
                               .fetchOne()[0]
                               .get<double>();
-    if (merchantUsed + amount > RING_MERCHANT_LIMIT)
+    if (merchantUsed + amount > RING_MERCHANT_LIMIT) {
+      trace.fail("RingPay merchant daily limit exceeded",
+                 {{"merchantUsed", std::to_string(merchantUsed)},
+                  {"amount", std::to_string(amount)}});
       return err("ERR_MERCHANT_LIMIT", "Merchant daily limit exceeded");
+    }
 
     // ── Risk scoring ──────────────────────────────────────────────────
     int risk = 0;
@@ -203,9 +238,11 @@ json processRingPayTransaction(const json &data) {
       risk += 40;
     if (usedToday > 3000)
       risk += 40;
-    if (risk >= RING_RISK_BLOCK)
+    if (risk >= RING_RISK_BLOCK) {
+      trace.fail("RingPay high risk score blocked", {{"riskScore", std::to_string(risk)}});
       return {{"status", "BLOCKED"},
               {"reason", "High risk score: " + std::to_string(risk)}};
+    }
 
     // ── Balance ───────────────────────────────────────────────────────
     double balance = accounts.select("balance")
@@ -214,8 +251,13 @@ json processRingPayTransaction(const json &data) {
                          .execute()
                          .fetchOne()[0]
                          .get<double>();
-    if (balance < amount + fee)
+    if (balance < amount + fee) {
+      trace.fail("insufficient balance",
+                 {{"balance", std::to_string(balance)},
+                  {"amount", std::to_string(amount)},
+                  {"fee", std::to_string(fee)}});
       return err("ERR_INSUFFICIENT_FUNDS", "Insufficient balance");
+    }
 
     double newBal = balance - (amount + fee);
     accounts.update()
@@ -248,6 +290,7 @@ json processRingPayTransaction(const json &data) {
           .where("transaction_id=:t")
           .bind("t", txnId)
           .execute();
+      trace.fail("RingPay network failure auto reversed", {{"transactionId", txnId}});
       return {{"status", "FAILED"},
               {"message", "Network failure — auto reversed"}};
     }
@@ -266,9 +309,13 @@ json processRingPayTransaction(const json &data) {
     response["token"] = token;
     response["balanceAfter"] = newBal;
     response["riskScore"] = risk;
+    trace.success({{"transactionId", txnId},
+                   {"riskScore", std::to_string(risk)},
+                   {"balanceAfter", std::to_string(newBal)}});
     return response;
 
   } catch (const std::exception &e) {
+    trace.fail("RingPay exception", {{"error", e.what()}});
     return err("ERR_EXCEPTION", e.what());
   }
 }

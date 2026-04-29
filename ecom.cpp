@@ -3,6 +3,7 @@
 #include "falcon.h"
 #include "panencrypted.h"
 #include "pin.h"
+#include "TransactionLogger.h"
 
 #include <chrono>
 #include <future>
@@ -38,6 +39,8 @@ static json err(const std::string &code, const std::string &msg = "") {
 // CORE LOGIC
 // ═══════════════════════════════════════════════════════
 json processECOMTransactionCore(const json &data) {
+  TransactionLogger::ScopedFunctionTrace trace("processECOMTransactionCore",
+                                               {{"transactionType", data.value("transactionType", "PURCHASE")}});
 
   Database::ScopedConnection sc;
   Session &sess = *sc;
@@ -59,7 +62,10 @@ json processECOMTransactionCore(const json &data) {
       const json &card = data["card"];
 
       if (!card.contains("pan"))
+      {
+        trace.fail("missing card PAN");
         return err("ERR_MISSING_PAN", "Card PAN is required");
+      }
 
       std::string encPan = card["pan"].get<std::string>();
       std::string expiry = card.value("expiry", "");
@@ -68,14 +74,17 @@ json processECOMTransactionCore(const json &data) {
       try {
         cardPan = PANEncryptionService::getInstance().decryptPAN(encPan);
       } catch (const std::exception &e) {
+        trace.fail("encrypted PAN decrypt failed", {{"error", e.what()}});
         return err("ERR_INVALID_ENCRYPTED_PAN", e.what());
       }
 
       // Verify PIN
       if (card.contains("pin")) {
         std::string pin = card["pin"].get<std::string>();
-        if (!PINService::getInstance().verifyPIN(cardPan, pin))
+        if (!PINService::getInstance().verifyPIN(cardPan, pin)) {
+          trace.fail("PIN verification failed");
           return err("ERR_INVALID_PIN", "PIN verification failed");
+        }
       }
 
       // Card lookup
@@ -85,8 +94,10 @@ json processECOMTransactionCore(const json &data) {
                          .bind("p", cardPan)
                          .execute();
 
-      if (cardRes.count() == 0)
+      if (cardRes.count() == 0) {
+        trace.fail("card not found");
         return err("ERR_CARD_NOT_FOUND", "Card not found");
+      }
 
       Row cardRow = cardRes.fetchOne();
       accountNumber = cardRow[0].get<std::string>();
@@ -96,27 +107,35 @@ json processECOMTransactionCore(const json &data) {
       std::string dbCvv = cardRow[4].isNull() ? "" : cardRow[4].get<std::string>();
 
       if (!expiry.empty() && expiry != dbExpiry) {
+        trace.fail("invalid expiry");
         return err("ERR_INVALID_EXPIRY", "Wrong expiry date");
       }
 
       std::string reqCvv = card.value("cvv", "");
       if (!reqCvv.empty() && reqCvv != dbCvv) {
+        trace.fail("invalid CVV");
         return err("ERR_INVALID_CVV", "Wrong CVV");
       }
 
-      if (cardStatus != "ACTIVE")
+      if (cardStatus != "ACTIVE") {
+        trace.fail("card inactive", {{"cardStatus", cardStatus}});
         return err("ERR_CARD_INACTIVE", "Card is not active");
+      }
 
     } else {
       // Fallback: direct accountNumber (backward compatibility)
       accountNumber = data.value("accountNumber", "");
     }
 
-    if (accountNumber.empty())
+    if (accountNumber.empty()) {
+      trace.fail("missing account number");
       return err("ERR_MISSING_ACCOUNT", "accountNumber or card data required");
+    }
 
-    if (txnType == "PURCHASE" && amount <= 0)
+    if (txnType == "PURCHASE" && amount <= 0) {
+      trace.fail("invalid amount", {{"amount", std::to_string(amount)}});
       return err("ERR_INVALID_AMOUNT", "Amount must be > 0");
+    }
 
     Table accounts = db.getTable("accounts");
     Table ecomTable = db.getTable("transaction_ecom");
@@ -127,8 +146,10 @@ json processECOMTransactionCore(const json &data) {
                       .bind("a", accountNumber)
                       .execute();
 
-    if (accRes.count() == 0)
+    if (accRes.count() == 0) {
+      trace.fail("account not found", {{"accountNumber", accountNumber}});
       return err("ERR_ACCOUNT_NOT_FOUND");
+    }
 
     Row accRow = accRes.fetchOne();
     double balance = accRow[0].get<double>();
@@ -141,9 +162,11 @@ json processECOMTransactionCore(const json &data) {
     // ── FRAUD CHECK ───────────────────────────────
     Falcon falcon(sess);
     std::string reason;
-    if (falcon.checkFraud(accountNumber, amount, reason, FalconChannel::ECOM)) {
+    if (falcon.checkFraud(accountNumber, amount, reason, FalconChannel::ECOM,
+                          &data)) {
       falcon.logFraud(txnId, clientTxnId, "", "", accountNumber, amount,
                       reason);
+      trace.fail("fraud declined ECOM transaction", {{"reason", reason}});
       return {{"transactionId", txnId},
               {"status", "DECLINED"},
               {"message", reason}};
@@ -152,8 +175,12 @@ json processECOMTransactionCore(const json &data) {
     // ── PURCHASE ─────────────────────────────────
     if (txnType == "PURCHASE") {
 
-      if (balance < amount)
+      if (balance < amount) {
+        trace.fail("insufficient funds",
+                   {{"balance", std::to_string(balance)},
+                    {"amount", std::to_string(amount)}});
         return err("ERR_INSUFFICIENT_FUNDS");
+      }
 
       double newBal = balance - amount;
 
@@ -176,6 +203,7 @@ json processECOMTransactionCore(const json &data) {
           .values("transaction_ecom", ins.getAutoIncrementValue(), "SUCCESS")
           .execute();
 
+      trace.success({{"transactionId", txnId}, {"scope", scope}});
       return {{"transactionId", txnId},
               {"status", "SUCCESS"},
               {"balanceAfter", newBal},
@@ -185,8 +213,10 @@ json processECOMTransactionCore(const json &data) {
     // ── REFUND ───────────────────────────────────
     if (txnType == "REFUND") {
 
-      if (!data.contains("origClientTxnId"))
+      if (!data.contains("origClientTxnId")) {
+        trace.fail("missing original client transaction id");
         return err("ERR_MISSING_ORIG_REF");
+      }
 
       std::string orig = data["origClientTxnId"].get<std::string>();
 
@@ -196,15 +226,21 @@ json processECOMTransactionCore(const json &data) {
               .bind("c", orig)
               .execute();
 
-      if (pRes.count() == 0)
+      if (pRes.count() == 0) {
+        trace.fail("original ECOM purchase not found", {{"origClientTxnId", orig}});
         return err("ERR_ORIGINAL_NOT_FOUND");
+      }
 
       Row pRow = pRes.fetchOne();
       int64_t refId = pRow[0].get<int64_t>();
       double origAmt = pRow[1].get<double>();
 
-      if (amount > origAmt)
+      if (amount > origAmt) {
+        trace.fail("refund exceeds original amount",
+                   {{"amount", std::to_string(amount)},
+                    {"originalAmount", std::to_string(origAmt)}});
         return err("ERR_REFUND_EXCEEDS");
+      }
 
       double newBal = balance + amount;
 
@@ -226,14 +262,17 @@ json processECOMTransactionCore(const json &data) {
           .values("transaction_ecom", ins.getAutoIncrementValue(), "SUCCESS")
           .execute();
 
+      trace.success({{"transactionId", txnId}, {"refundAmount", std::to_string(amount)}});
       return {{"transactionId", txnId},
               {"status", "SUCCESS"},
               {"balanceAfter", newBal}};
     }
 
+    trace.fail("unsupported ECOM transaction type", {{"transactionType", txnType}});
     return err("ERR_INVALID_TYPE", "Unsupported transactionType");
 
   } catch (const std::exception &e) {
+    trace.fail("ECOM core exception", {{"error", e.what()}});
     return err("ERR_EXCEPTION", e.what());
   }
 }
@@ -243,14 +282,49 @@ json processECOMTransactionCore(const json &data) {
 // ═══════════════════════════════════════════════════════
 json processECOMTransaction(const json &data) {
 
-  auto fut = std::async(std::launch::async, processECOMTransactionCore, data);
+  TransactionLogger::ScopedFunctionTrace trace("processECOMTransaction",
+                                               {{"transactionType", data.value("transactionType", "PURCHASE")}});
+  std::string uuid = data.value("_correlationUuid", TransactionLogger::currentUuid());
+  TransactionLogger::ScopedContext scope(uuid, "ECOM");
+  TransactionLogger::instance().logCurrent(
+      "INFO", "channel_handler_scheduled",
+      "ECOM transaction handler scheduled",
+      {{"transactionType", data.value("transactionType", "PURCHASE")}});
+
+  auto fut = std::async(std::launch::async, [data, uuid]() {
+    TransactionLogger::ScopedContext asyncScope(uuid, "ECOM");
+    TransactionLogger::instance().logCurrent(
+        "INFO", "channel_handler_started",
+        "ECOM transaction handler started",
+        {{"transactionType", data.value("transactionType", "PURCHASE")}});
+    return processECOMTransactionCore(data);
+  });
 
   if (fut.wait_for(std::chrono::seconds(ECOM_TIMEOUT_SEC)) ==
       std::future_status::timeout) {
+    TransactionLogger::instance().logCurrent(
+        "WARN", "channel_handler_timeout",
+        "ECOM transaction handler timeout",
+        {{"timeoutSeconds", std::to_string(ECOM_TIMEOUT_SEC)}});
+    trace.fail("ECOM transaction timeout");
     return {{"status", "FAILED"},
             {"errorCode", "ERR_TIMEOUT"},
             {"message", "ECOM transaction timeout"}};
   }
 
-  return fut.get();
+  json result = fut.get();
+  TransactionLogger::instance().logCurrent(
+      "INFO", "channel_handler_finished",
+      "ECOM transaction handler finished",
+      {{"transactionId", result.value("transactionId", "")},
+       {"status", result.value("status", "")},
+       {"errorCode", result.value("errorCode", "")}});
+  if (result.contains("errorCode")) {
+    trace.fail("ECOM transaction failed",
+               {{"errorCode", result["errorCode"].get<std::string>()}});
+  } else {
+    trace.success({{"transactionId", result.value("transactionId", "")},
+                   {"status", result.value("status", "")}});
+  }
+  return result;
 }

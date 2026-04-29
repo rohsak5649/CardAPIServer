@@ -1,0 +1,1491 @@
+
+
+===== PAGE 1 =====
+PAYMENT SWITCHING ENGINE  v3.0
+CONFIDENTIAL — TECHNICAL ARCHITECTURE DOCUMENT
+© 2025 Rohan Sakhare — CardAPIServer  |  Architecture & Design Document
+Page 1
+PAYMENT SWITCHING ENGINE
+Technical Architecture & System Design Document
+ Version
+ v3.0
+ Author
+Rohan Sakhare
+ Classification
+ Confidential
+ Date
+April 2025
+The Payment Switching Engine is a high-performance, multi-channel financial transaction
+routing platform built in C++20. It processes real-time payment transactions across seven
+distinct channels — ATM, POS, ECOM, Mobile, QR Code, RingPay, and Card Issuance —
+with integrated fraud detection, AES-256-GCM encryption, and a 1,000-thread concurrent
+processing model. The system is architected to handle enterprise-scale banking workloads
+comparable to those operated by global payment networks.
+ 7
+Payment
+Channels
+ 1,000
+Concurrent
+ Threads
+ 30
+DB Connections
+ Pool
+ 4
+Fraud Detection
+ Rules
+AES-256
+ GCM Encryption
+ 200/min
+Rate Limit per IP
+ Contact: rohanavinashsakhare@gmail.com | +91 9112765649
+
+
+
+===== PAGE 2 =====
+PAYMENT SWITCHING ENGINE  v3.0
+CONFIDENTIAL — TECHNICAL ARCHITECTURE DOCUMENT
+© 2025 Rohan Sakhare — CardAPIServer  |  Architecture & Design Document
+Page 2
+SECTION
+Table of Contents
+1
+Executive Summary
+2
+High-Level System Architecture
+ System Overview & Technology Stack
+ Component Interaction Map
+ Data Flow Description
+3
+Detailed Component Breakdown
+ API Gateway Layer
+ Payment Routing Engine
+ Channel Processors (All 7 Channels)
+ Database Pool Manager
+ Account Lock Manager
+4
+End-to-End Transaction Flows
+ POS Purchase Flow (Step-by-Step)
+ ECOM Purchase Flow (Step-by-Step)
+ ATM Withdrawal Flow
+ Mobile Fund Transfer Flow
+5
+Multithreading Architecture
+ Thread Pool Design
+ Concurrency Model
+ Performance Characteristics
+6
+Security Design
+ PAN Encryption (AES-256-GCM)
+ PIN Derivation Engine
+ Data Protection Strategy
+7
+Falcon Fraud Detection Engine
+ Rule Set & Detection Logic
+ Cross-Channel Velocity Analysis
+ Fraud Logging & Audit Trail
+8
+Database Schema & Design
+ Schema Architecture
+ Channel Transaction Tables
+ Master Transaction Registry
+9
+API Reference
+ Endpoint Specification
+ Request/Response Structures
+ Error Code Reference
+10
+Design Patterns & Architecture Quality
+
+
+
+===== PAGE 3 =====
+PAYMENT SWITCHING ENGINE  v3.0
+CONFIDENTIAL — TECHNICAL ARCHITECTURE DOCUMENT
+© 2025 Rohan Sakhare — CardAPIServer  |  Architecture & Design Document
+Page 3
+11
+System Strengths & Recommendations
+
+
+
+===== PAGE 4 =====
+PAYMENT SWITCHING ENGINE  v3.0
+CONFIDENTIAL — TECHNICAL ARCHITECTURE DOCUMENT
+© 2025 Rohan Sakhare — CardAPIServer  |  Architecture & Design Document
+Page 4
+SECTION 01
+Executive Summary
+Strategic overview of the Payment Switching Engine and its real-world relevance.
+What This System Does
+The Payment Switching Engine v3.0 is a production-grade, multi-channel payment routing and processing
+platform. Built entirely in C++20 and deployed as an HTTP API server, it functions as the central nervous
+system of a banking infrastructure — receiving incoming payment transactions, routing them to the correct
+processing channel, validating card and account credentials, applying fraud detection rules, and returning
+authorisation decisions in real time.
+The system exposes a single unified API endpoint (POST /transaction/initiate) that accepts JSON payloads
+and dispatches them across seven payment channels: ATM, POS terminal, E-Commerce, Mobile Banking,
+QR Code payments, RingPay (wearable/contactless), and Card Issuance. This design mirrors the
+architecture of real-world payment switches deployed by financial institutions and third-party processors
+globally.
+Problem It Solves
+■ Multi-channel complexity: Modern banks must support a dozen different payment interfaces. Without
+a unified switch, each channel would require its own standalone server, leading to duplicated logic,
+inconsistent fraud controls, and higher operational cost.
+■ Concurrency at scale: Payment volumes at peak hours can spike to thousands of transactions per
+second. A synchronous, single-threaded system would immediately become a bottleneck. This engine
+uses a 1,000-worker thread pool with a 30-connection database pool to handle massively concurrent
+workloads.
+■ Security and compliance: PAN (card number) data must never travel unencrypted. The engine
+enforces AES-256-GCM encryption on every card transaction and derives PINs cryptographically without
+ever storing them in a database.
+■ Fraud prevention: The integrated Falcon engine runs four layered fraud rules on every transaction
+before any money movement occurs, providing real-time protection comparable to dedicated fraud
+platforms.
+Real-World Relevance
+
+
+
+===== PAGE 5 =====
+PAYMENT SWITCHING ENGINE  v3.0
+CONFIDENTIAL — TECHNICAL ARCHITECTURE DOCUMENT
+© 2025 Rohan Sakhare — CardAPIServer  |  Architecture & Design Document
+Page 5
+This engine addresses the same architectural challenges solved by enterprise systems at Visa, Mastercard,
+and Stripe. The key parallels are:
+Feature
+This Engine
+Industry Equivalent
+API gateway
+httplib C++ server, port 8080
+Visa DPS API / Stripe gateway
+Routing
+O(1) hash-map dispatch by channelId
+ISO 8583 message routing
+Fraud engine
+Falcon — 4 real-time rules
+Falcon Fraud Manager (FICO)
+Encryption
+AES-256-GCM, Base64 payload
+PCI-DSS P2PE / HSM encryption
+PIN handling
+HMAC-SHA256 derivation, no storage
+PIN Block / 3DES / HSM PIN
+Concurrency
+1,000-thread pool, 30 DB sessions
+Kubernetes pod auto-scaling
+Observability
+Prometheus-style /metrics endpoint
+Datadog, Dynatrace APM
+DB access
+RAII scoped pool with self-healing
+PgBouncer / Vitess pool
+
+
+
+===== PAGE 6 =====
+PAYMENT SWITCHING ENGINE  v3.0
+CONFIDENTIAL — TECHNICAL ARCHITECTURE DOCUMENT
+© 2025 Rohan Sakhare — CardAPIServer  |  Architecture & Design Document
+Page 6
+SECTION 02
+High-Level System Architecture
+Complete component map showing how data flows from client request to final response.
+System Overview & Technology Stack
+Layer
+Technology
+Purpose
+HTTP Server
+cpp-httplib (header-only)
+Receives and responds to REST requests
+JSON Processing
+nlohmann/json (header-only)
+Parse/serialize all request/response data
+Database ORM
+MySQL Connector/C++ X DevAPI
+Object-oriented DB query interface
+Database
+MySQL 8.x (bankingdb)
+Persistent storage for all transaction data
+Cryptography
+OpenSSL EVP API (AES-256-GCM, HMAC-SHA256)
+PAN encryption and PIN derivation
+Concurrency
+C++20 std::atomic, std::mutex, std::async
+Thread safety and async execution
+Build System
+CMake
+Cross-platform compilation
+Language
+C++20
+Core implementation language
+Architecture Diagram — System Component Map
+ CLIENT / API CONSUMER
+(HTTP POST /transaction/initiate)
+ ▼
+ API GATEWAY LAYER
+Rate Limiter · Request-ID · CORS · JSON Parser
+ ▼
+ PAYMENT ROUTING ENGINE
+ O(1) Channel Dispatch Map
+ ▼
+ CHANNEL PROCESSORS
+ATM | POS | ECOM | MOBILE | QR | RingPay | ISSUER
+ ▼
+
+
+
+===== PAGE 7 =====
+PAYMENT SWITCHING ENGINE  v3.0
+CONFIDENTIAL — TECHNICAL ARCHITECTURE DOCUMENT
+© 2025 Rohan Sakhare — CardAPIServer  |  Architecture & Design Document
+Page 7
+ SECURITY LAYER
+PAN Decrypt (AES-256-GCM) · PIN Verify (HMAC-SHA256) · Card Validation
+ ▼
+ FALCON FRAUD ENGINE
+Same-Second · Velocity · Cross-Channel · Amount Spike
+ ▼
+ ACCOUNT LOCK MANAGER
+Priority Queue · CREDIT > DEBIT · Deadlock-Free
+ ▼
+ DATABASE POOL (30 sessions)
+MySQL bankingdb · Self-Healing · RAII ScopedConnection
+ ▼
+ RESPONSE
+{ transactionId, status, balanceAfter, requestId }
+ Figure 1 — Payment Switching Engine: End-to-End Component Architecture
+Data Flow Description
+Every transaction follows a strict, deterministic path through the system. The flow is initiated by an external
+client (banking app, POS terminal firmware, ATM software) sending an HTTP POST request with a JSON
+body to the single API endpoint.
+ 1. Receive
+■
+ 2. Validate
+■
+ 3. Route
+■
+ 4. Decrypt
+■
+ 5. Fraud
+ Check
+■
+ 6.
+Debit/Credit
+■
+ 7. Persist
+■
+ 8. Respond
+ Figure 2 — High-Level Transaction Processing Pipeline
+Step 1 — Receive: httplib server accepts the incoming HTTP POST on port 8080. A unique
+X-Request-ID is generated, active counter incremented.
+Step 2 — Validate: IP rate limiter checks 200 req/min quota. JSON body is parsed and validated for
+required fields (channelId, data).
+Step 3 — Route: channelId is looked up in the O(1) unordered_map dispatch table. The matching
+processor function is invoked.
+Step 4 — Decrypt & Authenticate: Encrypted PAN is decrypted via AES-256-GCM. Expiry, CVV, and
+PIN are verified against stored values.
+Step 5 — Fraud Check: Falcon engine runs 4 rules: same-second duplicate, per-channel velocity,
+cross-channel velocity, and amount spike detection.
+
+
+
+===== PAGE 8 =====
+PAYMENT SWITCHING ENGINE  v3.0
+CONFIDENTIAL — TECHNICAL ARCHITECTURE DOCUMENT
+© 2025 Rohan Sakhare — CardAPIServer  |  Architecture & Design Document
+Page 8
+Step 6 — Account Operation: AccountLockManager acquires a scoped lock on the account (CREDIT
+has priority over DEBIT). Balance is verified and updated atomically.
+Step 7 — Persist: Transaction details are written to the channel-specific table and the central
+transactions master table within a single DB transaction.
+Step 8 — Respond: A JSON response with transactionId, status, requestId, and updated balance is
+returned to the client.
+
+
+
+===== PAGE 9 =====
+PAYMENT SWITCHING ENGINE  v3.0
+CONFIDENTIAL — TECHNICAL ARCHITECTURE DOCUMENT
+© 2025 Rohan Sakhare — CardAPIServer  |  Architecture & Design Document
+Page 9
+SECTION 03
+Detailed Component Breakdown
+Deep-dive into each system component, its responsibilities, and internal logic.
+3.1 API Gateway Layer (parser&router.cpp;)
+The API Gateway is the entry point for all external communication. Implemented using the cpp-httplib library,
+it handles the full HTTP lifecycle including connection management, CORS pre-flight, request parsing,
+routing, and response serialisation.
+Component
+Implementation
+Description
+HTTP Server
+httplib::Server on port 8080
+Single-threaded event loop with thread pool delegation
+Thread Pool
+httplib::ThreadPool(1000)
+1,000 worker threads handle concurrent requests
+Rate Limiter
+Per-IP RateBucket with mutex
+200 req/min per IP; returns HTTP 429 if exceeded
+Request ID
+makeRequestId() — timestamp + random
+UUID-style ID injected as X-Request-ID header
+CORS
+addCORS() on every response
+Allow-Origin: * for all methods
+JSON Parsing
+nlohmann::json::parse()
+Exception-safe parse with structured error response
+Dispatch
+CHANNEL_DISPATCH unordered_map
+O(1) lookup; unknown channelId returns HTTP 400
+Metrics
+Prometheus-style /metrics GET
+Atomic counters: total, active, ok, fail requests
+Health
+/health and /status GET
+DB pool stats, thread pool info, live request counts
+Graceful Shutdown
+SIGINT/SIGTERM signal handler
+Stops server, destroys DB pool cleanly
+Channel Dispatch Map
+The router uses a compile-time-initialised std::unordered_map to map channelId strings to processor
+functions. This is an O(1) hash lookup, replacing a brittle if-else chain and following the Open/Closed
+Principle — adding a new channel only requires inserting one entry into this map.
+channelId
+Handler Function
+Module
+ATM
+processATMTransaction()
+atm.cpp
+MOBILE
+processMobileTransaction()
+mobile.cpp
+POS
+processPOSTransaction()
+pos.cpp
+ISSUER
+processIssueCard()
+issue.cpp
+
+
+
+===== PAGE 10 =====
+PAYMENT SWITCHING ENGINE  v3.0
+CONFIDENTIAL — TECHNICAL ARCHITECTURE DOCUMENT
+© 2025 Rohan Sakhare — CardAPIServer  |  Architecture & Design Document
+Page 10
+channelId
+Handler Function
+Module
+ECOM
+processECOMTransaction()
+ecom.cpp
+QRCODE
+processQRCodePayment()
+qrcode.cpp
+RINGPAY
+processRingPayTransaction()
+ringpay.cpp
+CARD_DETAILS
+processGetCardDetails()
+issue.cpp
+3.2 Payment Routing Engine
+The routing engine is responsible for the single most critical decision in payment processing: which channel
+should handle this transaction? The design is deliberately simple yet highly extensible. The channelId in the
+request payload acts as the routing key.
+■ The routing key (channelId) is extracted from the outer JSON wrapper before the data payload is
+passed to any processor.
+■ Validation occurs at the routing layer — unknown channels fail fast with a 400 error before any DB
+connection is acquired.
+■ Each channel handler receives only the inner data object, maintaining clear separation of concerns.
+■ The 5-second std::async timeout wrapper ensures no single slow transaction can monopolise a thread
+indefinitely.
+3.3 Channel Processors
+Each channel is implemented as an independent compilation unit (.cpp file) with a clearly defined public
+interface (.h file). Channels share common services (Falcon, PANEncryption, PINService,
+AccountLockManager) through dependency injection via the shared session.
+Channel
+Transaction Types
+Key Validations
+Limit
+ATM
+WITHDRAWAL, DEPOSIT
+Encrypted PAN, Expiry, PIN
+—
+POS
+PURCHASE, REFUND
+Encrypted PAN, CVV, Expiry, PIN (optional)
+■50,000/txn
+ECOM
+PURCHASE, REFUND
+Encrypted PAN, CVV, Expiry, PIN, Scope (DOM/INT)
+—
+MOBILE
+FUND_TRANSFER
+Encrypted PAN, PIN, Credit Account
+—
+QRCODE
+PAYMENT, REFUND
+QR raw data, Merchant ID, Account
+—
+RINGPAY
+PAYMENT, REVERSAL
+Token-based, Daily limit, Single-txn limit
+■2,000/txn, ■5,000/day
+ISSUER
+ISSUE_CARD
+Account existence, Scheme, Priority assignment
+—
+CARD_DETAILS
+GET
+Encrypted PAN decryption, masked PAN return
+—
+
+
+
+===== PAGE 11 =====
+PAYMENT SWITCHING ENGINE  v3.0
+CONFIDENTIAL — TECHNICAL ARCHITECTURE DOCUMENT
+© 2025 Rohan Sakhare — CardAPIServer  |  Architecture & Design Document
+Page 11
+POS Channel — Internal Structure
+The POS processor uses an internal dispatch map (POS_DISPATCH) identical in pattern to the top-level
+router, enabling clean separation of PURCHASE and REFUND flows. Both flows share the same
+POSContext struct which holds pre-fetched table references to avoid repeated schema lookups.
+Step
+Action
+Error Response
+1
+Extract card, amount, merchantId, terminalId from payload
+ERR_MISSING_CARD
+2
+Validate amount > 0 and <= 50,000
+ERR_INVALID_AMOUNT / ERR_SINGLE_LIMIT
+3
+Decrypt AES-256-GCM encrypted PAN
+ERR_INVALID_ENCRYPTED_PAN
+4
+Verify PIN via HMAC-SHA256 derivation (if provided)
+ERR_INVALID_PIN
+5
+Lookup card in DB; validate expiry and CVV
+ERR_CARD_NOT_FOUND / ERR_INVALID_EXPIRY
+6
+Check card status == ACTIVE
+ERR_CARD_INACTIVE
+7
+Run Falcon fraud check (FalconChannel::POS)
+DECLINED + fraud reason
+8
+Acquire AccountLockManager ScopedLock (DEBIT priority)
+—
+9
+Fetch current balance; verify sufficient funds
+ERR_INSUFFICIENT_FUNDS
+10
+BEGIN DB transaction; debit account; insert POS record; insert master record; COMMIT
+ERR_DB_FAILURE (rollback)
+11
+Return SUCCESS with transactionId and balanceAfter
+—
+ECOM Channel — Domestic vs International Scope
+The ECOM processor adds a transaction scope classification (DOMESTIC or INTERNATIONAL) by
+comparing the request currency with the account's registered currency. This metadata is stored in the
+transaction record and can be used downstream for regulatory reporting or currency conversion workflows.
+The ECOM channel also supports a direct account number flow (without card data) for backward
+compatibility with merchant integrations that manage their own tokenisation. When a card object is present,
+the full decrypt → verify → lookup path is executed.
+RingPay Channel — Token-Based Wearable Payments
+RingPay processes transactions from wearable devices (smart rings, NFC bands) using a pre-registered
+token rather than a raw PAN. The token is resolved to an account via the ringpay_tokens table, which also
+enforces per-device spending limits (daily limit: ■5,000; single transaction limit: ■2,000). This design isolates
+wearable payment credentials from the core card infrastructure, reducing PCI scope.
+3.4 Database Pool Manager (Database.h / Database.cpp)
+
+
+
+===== PAGE 12 =====
+PAYMENT SWITCHING ENGINE  v3.0
+CONFIDENTIAL — TECHNICAL ARCHITECTURE DOCUMENT
+© 2025 Rohan Sakhare — CardAPIServer  |  Architecture & Design Document
+Page 12
+The database pool provides up to 30 concurrent MySQL sessions. It implements a full RAII (Resource
+Acquisition Is Initialisation) pattern via the ScopedConnection class, ensuring connections are always
+returned to the pool even if exceptions are thrown.
+Feature
+Detail
+Pool size
+30 sessions (POOL_SIZE constant)
+Acquisition timeout
+5,000 ms — throws if no free connection available
+Self-healing
+acquire() pings session; reconnects if stale (up to 3 retries)
+Non-blocking variant
+tryAcquire() returns std::optional<Session*>
+Health reporting
+poolHealth() returns total, free, staleReconnects counts
+Env-var config
+Credentials loaded from environment variables with fallback
+Graceful shutdown
+destroyPool() closes all sessions on SIGTERM
+Usage pattern
+Database::ScopedConnection sc; sc->sql(...).execute();
+3.5 Account Lock Manager (AccountLockManager.h)
+The AccountLockManager prevents race conditions when multiple concurrent transactions attempt to debit or
+credit the same account simultaneously. It uses a priority queue per account to ensure CREDIT operations
+(deposits, refunds) are always processed before DEBIT operations (purchases, withdrawals) when both are
+waiting.
+Priority
+Transaction Types
+Behaviour
+CREDIT (0 — highest)
+Deposit, Refund, Fund-in
+Proceeds immediately if account is unlocked
+DEBIT (1 — lower)
+Purchase, Withdrawal, Fund-out
+50ms initial delay; waits if any CREDIT is active
+The lock is held only for the duration of the critical section (balance check → DB update → commit). It is
+automatically released when the ScopedLock destructor fires, providing deadlock-free, fair, priority-aware
+concurrent access per account.
+
+
+
+===== PAGE 13 =====
+PAYMENT SWITCHING ENGINE  v3.0
+CONFIDENTIAL — TECHNICAL ARCHITECTURE DOCUMENT
+© 2025 Rohan Sakhare — CardAPIServer  |  Architecture & Design Document
+Page 13
+SECTION 04
+End-to-End Transaction Flows
+Step-by-step walkthrough of real transaction scenarios through the complete system.
+4.1 POS Purchase — ■500 Transaction at a Retail Terminal
+Scenario: A customer presents their MASTERCARD at a point-of-sale terminal in a retail store. The terminal
+software sends a purchase request for ■500 with a ■20 processing fee.
+#
+Component
+Action
+Result / Outcome
+1
+Client (POS Terminal)
+POST /transaction/initiate with channelId=POS, encrypted PAN, PIN, amount=500
+HTTP request dispatched
+2
+API Gateway
+Rate limit check (IP quota), Request-ID generated, JSON parsed
+req-1234567-4521 assigned
+3
+Router
+CHANNEL_DISPATCH["POS"] → processPOSTransaction()
+POS handler invoked
+4
+POS Processor
+Validate amount (500 <= 50,000 ✓), extract card data
+Validation passed
+5
+PANEncryptionService
+AES-256-GCM decrypt of encrypted PAN → 5500004249929296
+Plain PAN available (in memory only)
+6
+PINService
+HMAC-SHA256 derive PIN from PAN, compare with input PIN
+PIN verified ✓
+7
+Database
+SELECT card WHERE pan=5500...9296; check status, expiry, CVV
+Card ACTIVE, expiry 04/31 ✓
+8
+Falcon
+Run rules: same-second=NO, velocity=NO, cross-channel=NO, spike=NO
+No fraud detected ✓
+9
+AccountLockManager
+Acquire DEBIT lock on account AU1234567890
+Lock acquired
+10
+Database
+SELECT balance (e.g., ■10,000); check >= 520 ✓
+Sufficient funds
+11
+Database
+BEGIN TXN; UPDATE balance=9480; INSERT transaction_pos; INSERT transactions; COMMIT
+Transaction persisted
+12
+AccountLockManager
+ScopedLock destructor fires — lock released
+Account unlocked
+13
+API Gateway
+Assemble JSON response; log request (15ms)
+Response ready
+14
+Client
+Receive {transactionId, status:SUCCESS, balanceAfter:9480}
+Customer receipt printed
+POS PURCHASE — REQUEST PAYLOAD
+{
+"channelId": "POS",
+"data": {
+"clientTxnId": "pos-1001",
+"transactionType": "PURCHASE",
+"merchantId": "MCH-POS-001",
+"terminalId": "TERM-7788",
+"location": "Sydney Mall",
+
+
+
+===== PAGE 14 =====
+PAYMENT SWITCHING ENGINE  v3.0
+CONFIDENTIAL — TECHNICAL ARCHITECTURE DOCUMENT
+© 2025 Rohan Sakhare — CardAPIServer  |  Architecture & Design Document
+Page 14
+"amount": 500.00,
+"fee": 20.00,
+"card": {
+"pan": "",
+"pin": "",
+"expiry": "04/31",
+"cvv": "617"
+}
+}
+}
+POS PURCHASE — SUCCESS RESPONSE
+{
+"transactionId": "pos-txn-1714204800000-3521",
+"status": "SUCCESS",
+"balanceAfter": 9480.00,
+"message": "POS purchase successful",
+"requestId": "req-1714204800015-4521"
+}
+4.2 E-Commerce Purchase — International Online Transaction
+Scenario: A customer completes a checkout on an international e-commerce platform. The merchant
+backend submits a purchase request in AUD while the account currency is INR, triggering international
+transaction classification.
+#
+Component
+Action
+Outcome
+1
+Merchant Backend
+POST /transaction/initiate with channelId=ECOM, amount=100.99 AUD
+Request received
+2
+API Gateway
+Rate limit, JSON parse, channelId extraction
+Routes to ECOM processor
+3
+ECOM Processor
+Extract card object; encrypted PAN detected
+Card-based flow selected
+4
+PANEncryptionService
+Decrypt PAN; verify expiry, CVV
+Card credentials valid ✓
+5
+PINService
+Optional PIN verify (present for card-not-present auth)
+PIN valid ✓
+6
+Database
+Lookup account currency (INR) vs request currency (AUD)
+Scope = INTERNATIONAL
+7
+Falcon
+Full fraud check for ECOM channel
+No fraud ✓
+8
+Database
+Verify balance >= 100.99; debit account; insert transaction_ecom + master
+Committed ✓
+9
+Response
+Return transactionId, SUCCESS, balanceAfter, scope=INTERNATIONAL
+Merchant displays confirmation
+4.3 ATM Withdrawal — Cash Dispensing Flow
+
+
+
+===== PAGE 15 =====
+PAYMENT SWITCHING ENGINE  v3.0
+CONFIDENTIAL — TECHNICAL ARCHITECTURE DOCUMENT
+© 2025 Rohan Sakhare — CardAPIServer  |  Architecture & Design Document
+Page 15
+The ATM channel handles WITHDRAWAL (debit) and DEPOSIT (credit) transactions. The ATM hardware
+sends card and PIN data alongside the ATM/terminal identifiers. A deposit uses TxnPriority::CREDIT
+ensuring it takes precedence over simultaneous debit requests on the same account.
+■ Step 1: Client sends encrypted PAN + PIN + ATM/terminal IDs + amount + fee
+■ Step 2: PAN decrypted, PIN verified via HMAC derivation (same mechanism as POS)
+■ Step 3: Card expiry validated against database record
+■ Step 4: Falcon fraud check runs with FalconChannel::ATM
+■ Step 5: AccountLockManager DEBIT lock acquired after 50ms delay
+■ Step 6: Balance check: must have balance >= (amount + fee)
+■ Step 7: Account debited by (amount + fee); transaction_atm and transactions tables updated in single
+DB transaction
+■ Step 8: ATM machine receives SUCCESS response and dispenses cash
+4.4 Mobile Banking — Fund Transfer Between Accounts
+Mobile banking fund transfers use the encrypted PAN as the source account identifier rather than a direct
+account number. The recipient is specified via creditAccount.accountNumber. The system performs a
+dual-leg update: debiting the source account and crediting the destination account within the same database
+transaction to ensure atomicity.
+Key difference from other channels: Mobile transfers involve two accounts. The AccountLockManager
+handles this by first acquiring the debit lock (with DEBIT priority) on the source account, then the credit lock
+(CREDIT priority) on the destination account. The 50ms DEBIT delay ensures that if a concurrent deposit is
+in-flight on the source account, it completes first.
+
+
+
+===== PAGE 16 =====
+PAYMENT SWITCHING ENGINE  v3.0
+CONFIDENTIAL — TECHNICAL ARCHITECTURE DOCUMENT
+© 2025 Rohan Sakhare — CardAPIServer  |  Architecture & Design Document
+Page 16
+SECTION 05
+Multithreading Architecture
+How the system achieves 1,000+ concurrent transaction processing capacity.
+5.1 Thread Pool Design
+The server uses cpp-httplib's built-in ThreadPool mechanism configured for 1,000 worker threads. This is a
+pre-allocated pool that avoids thread creation overhead per request — a critical optimisation for payment
+systems where latency spikes during thread spawn would be unacceptable.
+Parameter
+Value
+Rationale
+Thread pool size
+1,000 workers
+Handles burst traffic without queuing delay
+DB connection pool
+30 sessions
+DB is the bottleneck; over-provisioning wastes DB server resources
+Channel timeout
+5 seconds (std::async)
+Prevents slow DB queries from holding threads indefinitely
+Rate limit
+200 req/min per IP
+Protects against DoS at the gateway before threads are consumed
+Atomic counters
+g_totalRequests, g_activeRequests
+Lock-free monitoring without mutex overhead
+5.2 Concurrency Model
+The system uses a layered concurrency model with different synchronisation primitives at different levels of
+the stack:
+Layer
+Primitive
+Protected Resource
+API Gateway
+std::atomic<long long>
+Request counters (lock-free)
+Rate Limiter
+std::mutex + lock_guard
+Per-IP bucket map
+DB Pool
+std::mutex + condition_variable
+Free connection queue; blocks until slot available
+Account Operations
+AccountLockManager (priority mutex)
+Per-account balance state; prevents double-spend
+Channel Timeout
+std::async + future::wait_for
+Channel processor execution time
+5.3 Performance Characteristics
+Under normal operating conditions, the system can process multiple transactions simultaneously with the
+following performance profile:
+
+
+
+===== PAGE 17 =====
+PAYMENT SWITCHING ENGINE  v3.0
+CONFIDENTIAL — TECHNICAL ARCHITECTURE DOCUMENT
+© 2025 Rohan Sakhare — CardAPIServer  |  Architecture & Design Document
+Page 17
+■ Throughput: Up to 1,000 simultaneous HTTP connections. With average processing time of
+~15–50ms per transaction, throughput is approximately 20–60 TPS sustained, spiking higher for simple
+GET requests.
+■ Latency: Non-fraud, non-insufficient-fund POS transactions complete in approximately 10–30ms under
+light DB load. The 5-second async timeout acts as the worst-case SLA.
+■ DB Bottleneck: With 30 DB connections and 1,000 threads, DB contention becomes the primary
+bottleneck at high load. Threads waiting for a connection block on the condition_variable with a 5-second
+timeout.
+■ Lock-free paths: Counter updates (g_totalRequests, g_activeRequests, g_okResponses) use
+std::atomic operations, eliminating mutex overhead for the most frequent operation in the hot path.
+■ Zero-copy optimisations: Channel lookup uses std::string_view to avoid string copies during
+dispatch. The [[nodiscard]] attribute on key functions prevents silent error-return drops.
+
+
+
+===== PAGE 18 =====
+PAYMENT SWITCHING ENGINE  v3.0
+CONFIDENTIAL — TECHNICAL ARCHITECTURE DOCUMENT
+© 2025 Rohan Sakhare — CardAPIServer  |  Architecture & Design Document
+Page 18
+SECTION 06
+Security Design
+PAN encryption, PIN derivation, and data protection strategy.
+6.1 PAN Encryption — AES-256-GCM
+The Primary Account Number (PAN) — the 16-digit card number — is the most sensitive data element in
+payment processing. Under PCI-DSS requirements, PANs must never be transmitted or stored in plaintext.
+The engine enforces this through AES-256-GCM Authenticated Encryption applied at the source (client
+application or test tool) before the PAN enters the network.
+Encryption Algorithm Details
+Property
+Value
+Algorithm
+AES-256-GCM (Galois/Counter Mode)
+Key length
+256 bits (32 bytes)
+IV (Nonce) length
+12 bytes — randomly generated per encryption
+Authentication tag
+16 bytes — appended to ciphertext
+Encoded format
+Base64(IV || TAG || CIPHERTEXT)
+Library
+OpenSSL EVP API (EVP_aes_256_gcm)
+Security properties
+Confidentiality + Integrity + Authenticity — GCM detects tampering
+Encryption Payload Structure
+AES-256-GCM PAYLOAD FORMAT
+Base64 encoded payload (transmitted as string in JSON):
+[ IV: 12 bytes ] [ AUTH TAG: 16 bytes ] [ CIPHERTEXT: variable ]
+|
+Total: Base64(IV || TAG || CIPHERTEXT)
+Decryption Steps:
+1. Base64 decode input string
+2. Extract IV (bytes 0-11)
+3. Extract AUTH TAG (bytes 12-27)
+4. Extract CIPHERTEXT (bytes 28+)
+5. EVP_DecryptInit_ex with AES-256-GCM, key, IV
+6. EVP_DecryptUpdate → plaintext buffer
+
+
+
+===== PAGE 19 =====
+PAYMENT SWITCHING ENGINE  v3.0
+CONFIDENTIAL — TECHNICAL ARCHITECTURE DOCUMENT
+© 2025 Rohan Sakhare — CardAPIServer  |  Architecture & Design Document
+Page 19
+7. EVP_CTRL_GCM_SET_TAG → validate auth tag
+8. EVP_DecryptFinal_ex → fail if tag mismatch
+PAN Masking
+Once decrypted, the PAN is masked for all logging and API responses using the maskPAN() function, which
+replaces digits 5-12 with asterisks, following PCI-DSS masking requirements:
+PAN MASKING EXAMPLE
+Plain PAN: 5500004249929296
+Masked PAN: 5500********9296
+(First 4 and last 4 digits visible — PCI-DSS compliant display)
+6.2 PIN Derivation Engine — Zero-Storage PIN
+The PIN system is architecturally significant: PINs are never stored anywhere in the database. Instead,
+each PIN is deterministically derived from the cardholder's PAN using a cryptographic key derivation function.
+Verification re-derives the PIN and compares it with the input.
+Step
+Operation
+Detail
+1
+HMAC-SHA256
+Compute HMAC(PAN, secretKey) → 256-bit hash
+2
+Compress
+Reduce hash to 64-bit value using bit rotation (rotl) and avalanche mixing
+3
+Multi-round derive
+6 rounds of HMAC computation, each feeding previous state into next
+4
+State mixing
+XOR all 6 derived blocks through avalanche function
+5
+Character selection
+Index into pool (A-Z, a-z, 0-9, specials) using rotated state
+6
+Complexity enforcement
+Positions 0-3 forced to uppercase, lowercase, digit, special
+7
+Verification
+Re-run generation from PAN; compare with submitted PIN
+Security Advantages of Zero-Storage PIN
+■ No database exposure risk: A complete database breach cannot expose any PIN since they are
+never written to storage.
+■ Deterministic verification: The same PAN always derives the same PIN with the same secret key,
+enabling reliable re-verification.
+■ High entropy: 6 rounds of HMAC with avalanche mixing produce a PIN with high computational cost
+for brute-force attacks.
+■ Secret key protection: The security of the entire PIN system depends entirely on the secret key
+(currently ULTRA_SECRET_KEY_2026_!@#) being kept confidential.
+
+
+
+===== PAGE 20 =====
+PAYMENT SWITCHING ENGINE  v3.0
+CONFIDENTIAL — TECHNICAL ARCHITECTURE DOCUMENT
+© 2025 Rohan Sakhare — CardAPIServer  |  Architecture & Design Document
+Page 20
+■ Production Security Recommendations
+The current implementation hardcodes both the AES-256-GCM key and the HMAC secret key in source code.
+This is explicitly marked in the codebase as demo-only behaviour. Before any production deployment, these keys
+MUST be loaded from environment variables, a hardware security module (HSM), or a secrets manager such as
+AWS Secrets Manager or HashiCorp Vault. Key rotation procedures must also be implemented to support
+periodic key changes without breaking active card credentials.
+
+
+
+===== PAGE 21 =====
+PAYMENT SWITCHING ENGINE  v3.0
+CONFIDENTIAL — TECHNICAL ARCHITECTURE DOCUMENT
+© 2025 Rohan Sakhare — CardAPIServer  |  Architecture & Design Document
+Page 21
+SECTION 07
+Falcon Fraud Detection Engine
+Real-time, multi-rule fraud prevention covering all seven payment channels.
+The Falcon engine is the system's integrated fraud detection module, named after the real-world FICO Falcon
+Fraud Manager used by major banks globally. It evaluates every money-out transaction against four
+sequential rules before any account operation is performed. A single rule trigger results in immediate
+transaction decline and full audit logging.
+7.1 Fraud Rules — Ordered Evaluation
+Rules are evaluated in order. The first rule that triggers causes an immediate DECLINE. Subsequent rules
+are not evaluated, optimising performance and ensuring predictable behaviour.
+Rule #
+Rule Name
+Condition
+Threshold
+Target
+1
+Same-Second Detection
+Any transaction on any channel within the last 1 second
+< 1 second gap
+All money-out channels
+2
+Per-Channel Velocity
+More than N transactions on the same channel within 60 seconds
+> 5 txns / 60s
+Per-channel table
+3
+Cross-Channel Velocity
+More than N transactions combined across ALL channels in 60 seconds
+> 5 txns / 60s
+UNION of all 6 tables
+4
+Amount Spike
+Current transaction amount exceeds 3× the 7-day average
+> 3× avg (7 days)
+All money-out channels
+7.2 Rule Implementation Details
+Rule 1: Same-Second Duplicate Detection
+Uses a per-table SQL query checking for any transaction record with the same account_number where
+created_at >= NOW() - INTERVAL 1 SECOND. This catches accidental duplicate submissions from network
+retries, double-clicks, and replay attacks.
+SQL — SAME-SECOND DETECTION
+SELECT 1 FROM transaction_pos
+WHERE account_number = ?
+AND created_at >= NOW() - INTERVAL 1 SECOND
+LIMIT 1
+Rule 2: Per-Channel Velocity
+Counts transactions on a specific channel within the last 60 seconds. Detects card-testing attacks where
+fraudsters rapidly run small transactions on a single channel to verify a compromised card before escalating
+to larger amounts.
+
+
+
+===== PAGE 22 =====
+PAYMENT SWITCHING ENGINE  v3.0
+CONFIDENTIAL — TECHNICAL ARCHITECTURE DOCUMENT
+© 2025 Rohan Sakhare — CardAPIServer  |  Architecture & Design Document
+Page 22
+Rule 3: Cross-Channel Velocity
+Uses a UNION ALL query across all six money-out transaction tables to count total activity in the last 60
+seconds, regardless of channel. This catches sophisticated attacks that deliberately spread activity across
+multiple channels to evade per-channel velocity limits. The ISSUER channel is exempt as it does not involve
+money movement.
+SQL — CROSS-CHANNEL VELOCITY (SIMPLIFIED)
+SELECT COUNT(*) FROM (
+SELECT id FROM transaction_atm WHERE account_number=? AND created_at >=
+NOW()-INTERVAL 60 SECOND
+UNION ALL
+SELECT id FROM transaction_mobile WHERE account_number=? AND created_at >=
+NOW()-INTERVAL 60 SECOND
+UNION ALL
+SELECT id FROM transaction_pos WHERE account_number=? AND created_at >=
+NOW()-INTERVAL 60 SECOND
+UNION ALL
+SELECT id FROM transaction_ecom WHERE account_number=? AND created_at >=
+NOW()-INTERVAL 60 SECOND
+UNION ALL
+SELECT id FROM transaction_qrcode WHERE account_number=? AND created_at >=
+NOW()-INTERVAL 60 SECOND
+UNION ALL
+SELECT id FROM transaction_ringpay WHERE account_number=? AND created_at >=
+NOW()-INTERVAL 60 SECOND
+) AS combined
+Rule 4: Amount Spike Detection
+Computes the average transaction amount across all channels over the past 7 days. If the current transaction
+exceeds 3× this average (the FALCON_SPIKE_MULTIPLIER constant), it is flagged as an anomaly. This
+catches account takeover scenarios where a fraudster immediately attempts a large withdrawal after
+compromising credentials.
+7.3 Fraud Logging & Audit Trail
+Every detected fraud event is written to the transaction_falcon table and the central transactions master
+table with status=DECLINED. The log record captures:
+■ transaction_id and client_txn_id — for correlation with the originating request
+■ device_id and mobile_number — channel-specific metadata for pattern analysis
+■ account_number and amount — for trend monitoring and alert thresholds
+■ fraud_reason — human-readable rule description (e.g., "Amount spike detected: 15000 exceeds 3×
+7-day average")
+
+
+
+===== PAGE 23 =====
+PAYMENT SWITCHING ENGINE  v3.0
+CONFIDENTIAL — TECHNICAL ARCHITECTURE DOCUMENT
+© 2025 Rohan Sakhare — CardAPIServer  |  Architecture & Design Document
+Page 23
+■ status = DECLINED — ensures the transaction is traceable in the central audit trail
+■ created_at — automatic timestamp for time-series fraud analytics
+7.4 Channel Coverage Matrix
+Channel
+Same-Second
+Per-Channel Velocity
+Cross-Channel
+Amount Spike
+ATM
+✓
+✓
+✓
+✓
+POS
+✓
+✓
+✓
+✓
+ECOM
+✓
+✓
+✓
+✓
+MOBILE
+✓
+✓
+✓
+✓
+QRCODE
+✓
+✓
+✓
+✓
+RINGPAY
+✓
+✓
+✓
+✓
+ISSUER
+—
+—
+—
+—
+ Table — Falcon fraud rule coverage across all channels (ISSUER exempt: no money movement)
+
+
+
+===== PAGE 24 =====
+PAYMENT SWITCHING ENGINE  v3.0
+CONFIDENTIAL — TECHNICAL ARCHITECTURE DOCUMENT
+© 2025 Rohan Sakhare — CardAPIServer  |  Architecture & Design Document
+Page 24
+SECTION 08
+Database Schema & Design
+Complete relational schema overview for the bankingdb MySQL database.
+The database schema is designed around the principle of channel isolation — each payment channel has its
+own dedicated transaction table. This allows independent scaling, archival, and querying of channel-specific
+data while a central transactions table provides a unified audit trail across all channels.
+8.1 Schema Architecture
+Table
+Purpose
+Key Columns
+accounts
+Customer account balances and metadata
+account_number (UNIQUE), balance, currency_id, is_frozen
+cards
+Card-to-account mappings with encrypted PAN
+pan (UNIQUE), encrypted_pan, scheme, expiry, cvv, status, card_priority
+currency
+Supported currency master table
+currency_code (UNIQUE), currency_name, is_base
+ringpay_tokens
+Wearable device payment tokens
+token (UNIQUE), card_pan, daily_limit, single_txn_limit, expires_at
+transaction_atm
+ATM withdrawal and deposit records
+transaction_id, atm_id, account_number, amount, fee, status
+transaction_pos
+POS purchase and refund records
+transaction_id, merchant_id, terminal_id, amount, fee, flag, refunded_amount
+transaction_ecom
+E-commerce transaction records
+transaction_id, merchant_id, order_id, currency, transaction_scope, orig_ref_id
+transaction_mobile
+Mobile banking transfer records
+transaction_id, device_id, mobile_number, amount, fee
+transaction_qrcode
+QR code payment records
+transaction_id, qr_raw_data, merchant_id, currency, transaction_scope
+transaction_ringpay
+Wearable contactless payment records
+token, device_id, ip_address, reversal_status
+transaction_falcon
+Fraud detection event log
+transaction_id, account_number, fraud_reason, status=DECLINED
+transactions
+Master transaction registry (all channels)
+table_name, reference_id, status — links to all channel tables
+8.2 Central Transaction Registry
+The transactions table is the master ledger. Every successful channel transaction (and every
+Falcon-declined transaction) inserts a reference record into this table. This enables a single query to retrieve
+all transactions regardless of channel, supporting regulatory reporting, reconciliation, and cross-channel
+analytics without joining multiple large tables.
+MASTER REGISTRY INSERT PATTERN (ALL CHANNELS)
+-- After inserting into channel-specific table:
+INSERT INTO transactions (table_name, reference_id, status)
+
+
+
+===== PAGE 25 =====
+PAYMENT SWITCHING ENGINE  v3.0
+CONFIDENTIAL — TECHNICAL ARCHITECTURE DOCUMENT
+© 2025 Rohan Sakhare — CardAPIServer  |  Architecture & Design Document
+Page 25
+VALUES ('transaction_pos', , 'SUCCESS');
+-- To query all transactions for an account:
+SELECT t.table_name, t.reference_id, t.status, t.created_at
+FROM transactions t
+JOIN transaction_pos p ON t.table_name="transaction_pos" AND t.reference_id=p.id
+WHERE p.account_number = ?
+ORDER BY t.created_at DESC;
+8.3 Refund Flag System (POS / ECOM)
+Flag Value
+Meaning
+Trigger Condition
+N
+No refund processed
+Initial state on all purchase records
+RF
+Fully Refunded
+Refund amount equals original purchase amount
+PR
+Partially Refunded
+Refund amount is less than original purchase amount
+
+
+
+===== PAGE 26 =====
+PAYMENT SWITCHING ENGINE  v3.0
+CONFIDENTIAL — TECHNICAL ARCHITECTURE DOCUMENT
+© 2025 Rohan Sakhare — CardAPIServer  |  Architecture & Design Document
+Page 26
+SECTION 09
+API Reference
+Complete endpoint specification, request/response structures, and error codes.
+9.1 Endpoint Specification
+Method
+Endpoint
+Purpose
+POST
+/transaction/initiate
+Process any payment transaction across all channels
+GET
+/health
+Basic health check — server up, DB pool status
+GET
+/status
+Extended status — active requests, counters, pool stats
+GET
+/metrics
+Prometheus-format metrics for monitoring systems
+OPTIONS
+/transaction/initiate
+CORS pre-flight response for browser clients
+9.2 Request Structure
+All transaction requests follow a consistent two-level JSON structure. The outer wrapper contains the routing
+key (channelId). The inner data object contains all channel-specific payload fields. This separation allows the
+router to dispatch without deserialising the full payload.
+UNIVERSAL REQUEST WRAPPER
+{
+"channelId": "",
+"data": {
+"transactionType": "",
+"clientTxnId": "",
+"amount": ,
+"card": {
+"pan": "",
+"pin": "",
+"expiry": "MM/YY",
+"cvv": "<3-4 digit CVV>"
+},
+""
+}
+}
+9.3 Response Structure
+
+
+
+===== PAGE 27 =====
+PAYMENT SWITCHING ENGINE  v3.0
+CONFIDENTIAL — TECHNICAL ARCHITECTURE DOCUMENT
+© 2025 Rohan Sakhare — CardAPIServer  |  Architecture & Design Document
+Page 27
+SUCCESS RESPONSE
+{
+"transactionId": "pos-txn-1714204800000-3521",
+"status": "SUCCESS",
+"balanceAfter": 9480.00,
+"message": "POS purchase successful",
+"requestId": "req-1714204800015-4521"
+}
+FRAUD DECLINE RESPONSE
+{
+"status": "DECLINED",
+"message": "Velocity limit exceeded: >5 transactions in 60 seconds on
+transaction_pos",
+"requestId": "req-1714204801000-7823"
+}
+ERROR RESPONSE (HTTP 400/429/500)
+{
+"errorCode": "ERR_INVALID_PIN",
+"message": "PIN verification failed",
+"requestId": "req-1714204802000-1234"
+}
+9.4 Error Code Reference
+Error Code
+HTTP Status
+Cause & Resolution
+ERR_CARD_NOT_FOUND
+200 (body)
+PAN decrypted but not in DB. Verify card was issued first.
+ERR_INVALID_EXPIRY
+200 (body)
+expiry field does not match DB record. Use exact value from ISSUER response.
+ERR_INVALID_CVV
+200 (body)
+CVV field does not match DB record.
+ERR_INVALID_ENCRYPTED_PAN
+200 (body)
+AES decryption failed — wrong key or corrupted Base64 payload.
+ERR_INVALID_PIN
+200 (body)
+PIN derivation mismatch. Re-generate PIN with correct PAN using offline tool.
+ERR_CARD_INACTIVE
+200 (body)
+Card status is BLOCKED. Cannot process transactions.
+ERR_ACCOUNT_NOT_FOUND
+200 (body)
+Account number does not exist in the accounts table.
+ERR_INSUFFICIENT_FUNDS
+200 (body)
+Account balance is less than (amount + fee).
+ERR_SINGLE_LIMIT
+200 (body)
+POS: Amount exceeds ■50,000 single transaction limit.
+ERR_ALREADY_REFUNDED
+200 (body)
+POS refund: original transaction has already been fully refunded (flag=RF).
+ERR_RATE_LIMIT
+429
+IP has exceeded 200 requests/minute. Back off and retry.
+ERR_TIMEOUT
+200 (body)
+Channel processor exceeded 5-second SLA. Usually indicates DB slowness.
+
+
+
+===== PAGE 28 =====
+PAYMENT SWITCHING ENGINE  v3.0
+CONFIDENTIAL — TECHNICAL ARCHITECTURE DOCUMENT
+© 2025 Rohan Sakhare — CardAPIServer  |  Architecture & Design Document
+Page 28
+Error Code
+HTTP Status
+Cause & Resolution
+ERR_DB_FAILURE
+200 (body)
+Database operation failed; transaction rolled back.
+ERR_SERVER
+500
+Unhandled exception. Check server logs with requestId.
+DECLINED (Falcon)
+200 (body)
+Fraud rule triggered. See message field for specific rule details.
+
+
+
+===== PAGE 29 =====
+PAYMENT SWITCHING ENGINE  v3.0
+CONFIDENTIAL — TECHNICAL ARCHITECTURE DOCUMENT
+© 2025 Rohan Sakhare — CardAPIServer  |  Architecture & Design Document
+Page 29
+SECTION 10
+Design Patterns & Architecture Quality
+Analysis of the software engineering patterns applied throughout the system.
+Pattern
+Where Applied
+Benefit
+Singleton
+PANEncryptionService, PINService, AccountLockManager
+Single shared instance; avoids re-initialisation of cryptographic contexts
+RAII
+Database::ScopedConnection, AccountLockManager::ScopedLock
+Guarantees resource release even on exception paths
+Strategy / Dispatch Map
+CHANNEL_DISPATCH, POS_DISPATCH
+O(1) routing; adding channels requires only map insertion (Open/Closed Principle)
+Context Object
+POSContext (session + table refs)
+Avoids repeated schema lookups; groups related state into one struct
+Observer / Metrics
+std::atomic counters + /metrics endpoint
+Lock-free monitoring without blocking the hot path
+Facade
+processPOSTransaction() public entry point
+Hides internal dispatch, timeout, and DB scoping complexity from the router
+Template Method
+All channel processors follow identical validation → fraud → lock → DB → respond pattern
+Consistent behaviour across all channels
+Factory (implicit)
+makeRequestId(), genTxnId(), genECOMTxnId()
+Centralised ID generation with consistent format
+SOLID Principles Adherence
+Principle
+Evidence in Codebase
+Single Responsibility
+Each .cpp file handles exactly one channel. Falcon.cpp handles only fraud. PANEncryptionService handles only crypto.
+Open/Closed
+Adding a new channel: insert one entry in CHANNEL_DISPATCH. No existing code modified.
+Liskov Substitution
+Channel handler functions all share json(const json&) signature — substitutable in the dispatch map.
+Interface Segregation
+Headers (.h files) expose only the minimum public API — single function per channel.
+Dependency Inversion
+Channel processors depend on abstractions (Database::ScopedConnection) not concrete instantiation.
+Scalability Design Analysis
+The architecture supports both vertical and horizontal scaling:
+■ Vertical: Thread pool size (THREAD_POOL_SIZE) and DB pool size (POOL_SIZE) are compile-time
+constants tunable without code changes — increase these to utilise more CPU cores and DB capacity on
+a larger server.
+■ Horizontal (stateless design): The API server itself holds no per-request state between calls. Multiple
+instances can run behind a load balancer, all sharing the same MySQL database. The only stateful
+components are the in-process rate limiter bucket map and account lock manager — these would need to
+
+
+
+===== PAGE 30 =====
+PAYMENT SWITCHING ENGINE  v3.0
+CONFIDENTIAL — TECHNICAL ARCHITECTURE DOCUMENT
+© 2025 Rohan Sakhare — CardAPIServer  |  Architecture & Design Document
+Page 30
+be externalised (Redis-based distributed lock, API gateway rate limiting) for true horizontal scale.
+■ DB read/write separation: Falcon fraud rules (Rules 1-4) are read-only queries. In a high-scale
+deployment, these could be directed to a MySQL replica, reducing load on the primary write node.
+■ Channel isolation: Each channel has its own transaction table. High-volume channels (POS, ECOM)
+can be independently partitioned, archived, or migrated to separate DB nodes without affecting other
+channels.
+
+
+
+===== PAGE 31 =====
+PAYMENT SWITCHING ENGINE  v3.0
+CONFIDENTIAL — TECHNICAL ARCHITECTURE DOCUMENT
+© 2025 Rohan Sakhare — CardAPIServer  |  Architecture & Design Document
+Page 31
+SECTION 11
+System Strengths & Future Recommendations
+Assessment of current capabilities and a roadmap for production hardening.
+11.1 System Strengths
+✓ Unified multi-channel API: Seven payment channels behind a single endpoint, dramatically reducing
+integration complexity for client applications and providing a single point of monitoring.
+✓ Zero-storage PIN system: An innovative security design that eliminates an entire class of database
+breach risk. No PIN can be extracted from a database compromise because no PIN exists in the
+database.
+✓ Enterprise-grade concurrency: 1,000-thread pool with a 30-connection self-healing database pool
+provides strong burst handling while the RAII patterns ensure clean resource management.
+✓ Layered fraud protection: Four complementary fraud rules at increasing granularity (duplicate,
+per-channel, cross-channel, amount spike) provide defence-in-depth without requiring an external fraud
+service.
+✓ Operational observability: Built-in Prometheus-compatible /metrics endpoint and structured
+per-request logging with request IDs enables immediate integration with monitoring stacks like
+Grafana/Prometheus.
+✓ Atomic transaction integrity: Every money movement is wrapped in a MySQL transaction with
+rollback on failure, ensuring no partial state is persisted even during system crashes.
+✓ Open/Closed architecture: Adding a new payment channel requires zero modification of existing code
+— only an addition to the dispatch map and a new processor module.
+11.2 Future Enhancements & Production Roadmap
+The following improvements are recommended for production deployment:
+Priority
+Enhancement
+Description
+Critical
+HSM key management
+Move AES-256 key and HMAC secret from source code to Hardware Security Module or AWS Secrets Manager
+Critical
+TLS/HTTPS
+Wrap httplib server with SSL — all payment traffic must be encrypted in transit (PCI-DSS Req. 4)
+Critical
+PIN retry lockout
+Add configurable PIN attempt counter per card; block card after N failed attempts to prevent brute-force
+High
+JWT authentication
+Add bearer token authentication to /transaction/initiate — currently any client can call the API
+High
+Distributed rate limiting
+Move per-IP rate limiter to Redis for multi-instance deployments
+High
+Distributed account locking
+Move AccountLockManager to Redis-based distributed lock for horizontal scaling
+
+
+
+===== PAGE 32 =====
+PAYMENT SWITCHING ENGINE  v3.0
+CONFIDENTIAL — TECHNICAL ARCHITECTURE DOCUMENT
+© 2025 Rohan Sakhare — CardAPIServer  |  Architecture & Design Document
+Page 32
+Priority
+Enhancement
+Description
+Medium
+Async fraud evaluation
+Execute Falcon checks asynchronously in parallel rather than sequentially to reduce latency
+Medium
+PAN tokenisation
+Replace PAN-based flows with a tokenisation service — issue a payment token at card-on-file time
+Medium
+ML-based fraud model
+Augment rule-based Falcon with a machine learning model for behavioural pattern detection
+Low
+gRPC support
+Add gRPC endpoint for internal service-to-service calls with lower serialisation overhead than JSON/HTTP
+Low
+Database sharding
+Implement read/write replica routing for Falcon queries (read-only) vs. transaction writes
+Low
+Key rotation
+Implement AES key version field in encrypted PAN payload to support periodic key rotation
+11.3 Compliance Considerations
+For production deployment in a regulated financial environment, the following compliance standards should
+be addressed:
+Standard
+Requirement
+Current Status
+PCI-DSS v4.0
+Encrypt PAN at rest and in transit
+AES-256-GCM ✓ (transit TLS needed)
+PCI-DSS v4.0
+Never store CVV after authorisation
+CVV stored in DB — must be purged post-auth
+PCI-DSS v4.0
+Key management and rotation
+Hardcoded keys — needs HSM integration
+PCI-DSS v4.0
+Access control and authentication
+No auth on API — needs JWT/mTLS
+RBI Guidelines
+Transaction logging and audit trail
+Master transactions table ✓
+GDPR/Privacy
+PAN masking in logs
+maskPAN() implemented ✓
+ Payment Switching Engine v3.0
+Designed and developed by Rohan Sakhare
+rohanavinashsakhare@gmail.com | +91 9112765649
+This document is confidential and intended for technical review purposes only.
