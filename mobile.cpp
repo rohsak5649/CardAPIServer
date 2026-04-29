@@ -21,6 +21,7 @@
 #include "falcon.h"
 #include "panencrypted.h"
 #include "pin.h"
+#include "TransactionLogger.h"
 
 #include <chrono>
 #include <future>
@@ -62,6 +63,8 @@ inline constexpr int MOB_TIMEOUT_SEC = 6;
 //  CORE
 // ═══════════════════════════════════════════════════════════════════════════════
 [[nodiscard]] static json processMobileCore(const json &data) {
+  TransactionLogger::ScopedFunctionTrace trace("processMobileCore",
+                                               {{"transactionType", data.value("transactionType", "")}});
   Database::ScopedConnection sc;
   Session &sess = *sc;
   Schema db = sess.getSchema("bankingdb");
@@ -95,17 +98,20 @@ inline constexpr int MOB_TIMEOUT_SEC = 6;
         pan = PANEncryptionService::getInstance().decryptPAN(encPan);
       } catch (const std::exception &e) {
         sess.rollback();
+        trace.fail("encrypted PAN decrypt failed", {{"error", e.what()}});
         return err("ERR_INVALID_ENCRYPTED_PAN", e.what());
       }
 
       if (pan.length() != 16) {
         sess.rollback();
+        trace.fail("invalid PAN length");
         return err("ERR_INVALID_PAN", "PAN must be 16 digits");
       }
 
       // PIN verify (logic unchanged per client requirement)
       if (!PINService::getInstance().verifyPIN(pan, pin)) {
         sess.rollback();
+        trace.fail("PIN verification failed");
         return err("ERR_INVALID_PIN", "PIN verification failed");
       }
 
@@ -115,6 +121,7 @@ inline constexpr int MOB_TIMEOUT_SEC = 6;
                         .execute();
       if (accRes.count() == 0) {
         sess.rollback();
+        trace.fail("primary card not found for PAN");
         return err("ERR_CARD_NOT_FOUND", "No PRIMARY card for PAN");
       }
       debitAccOpt = accRes.fetchOne()[0].get<std::string>();
@@ -125,6 +132,7 @@ inline constexpr int MOB_TIMEOUT_SEC = 6;
 
     if (!debitAccOpt) {
       sess.rollback();
+      trace.fail("debit account could not be determined");
       return err("ERR_DEBIT_ACCOUNT_REQUIRED",
                  "Could not determine debit account");
     }
@@ -134,11 +142,12 @@ inline constexpr int MOB_TIMEOUT_SEC = 6;
     Falcon falcon(sess);
     std::string fraudReason;
     if (falcon.checkFraud(debitAcc, amount, fraudReason,
-                          FalconChannel::MOBILE)) {
+                          FalconChannel::MOBILE, &data)) {
       std::string txnId = makeTxnId();
       falcon.logFraud(txnId, clientTxnId, deviceId, mobileNo, debitAcc, amount,
                       fraudReason);
       sess.commit();
+      trace.fail("fraud declined mobile transaction", {{"reason", fraudReason}});
       return {{"transactionId", txnId},
               {"status", "DECLINED"},
               {"message", fraudReason}};
@@ -147,12 +156,16 @@ inline constexpr int MOB_TIMEOUT_SEC = 6;
     // ── Transaction type validation ───────────────────────────────────
     if (txnType != "FUND_TRANSFER") {
       sess.rollback();
+      trace.fail("unsupported mobile transaction type", {{"transactionType", txnType}});
       return err("ERR_INVALID_TYPE", "Only FUND_TRANSFER supported for MOBILE");
     }
 
     // ── Single-transaction limit ──────────────────────────────────────
     if (amount > MOB_SINGLE_LIMIT) {
       sess.rollback();
+      trace.fail("single transaction limit exceeded",
+                 {{"amount", std::to_string(amount)},
+                  {"limit", std::to_string(MOB_SINGLE_LIMIT)}});
       return err("ERR_ONE_TIME_LIMIT", "Single transaction limit is " +
                                            std::to_string(MOB_SINGLE_LIMIT));
     }
@@ -186,6 +199,9 @@ inline constexpr int MOB_TIMEOUT_SEC = 6;
     double hourlyTotal = hourlyRes.fetchOne()[0].get<double>();
     if (hourlyTotal + amount > MOB_HOURLY_LIMIT) {
       sess.rollback();
+      trace.fail("hourly limit exceeded",
+                 {{"hourlyTotal", std::to_string(hourlyTotal)},
+                  {"amount", std::to_string(amount)}});
       return json{{"errorCode", "ERR_HOURLY_LIMIT"},
                   {"message", "Hourly limit exceeded"},
                   {"remainingLimit", MOB_HOURLY_LIMIT - hourlyTotal}};
@@ -201,6 +217,9 @@ inline constexpr int MOB_TIMEOUT_SEC = 6;
                             .get<double>();
     if (dailyTotal + amount > MOB_DAILY_LIMIT) {
       sess.rollback();
+      trace.fail("daily limit exceeded",
+                 {{"dailyTotal", std::to_string(dailyTotal)},
+                  {"amount", std::to_string(amount)}});
       return err("ERR_DAILY_LIMIT", "Daily limit of " +
                                         std::to_string(MOB_DAILY_LIMIT) +
                                         " exceeded");
@@ -213,6 +232,7 @@ inline constexpr int MOB_TIMEOUT_SEC = 6;
                         .execute();
     if (debitRow.count() == 0) {
       sess.rollback();
+      trace.fail("debit account not found", {{"accountNumber", debitAcc}});
       return err("ERR_DEBIT_NOT_FOUND", "Debit account not found");
     }
     double debitBal = debitRow.fetchOne()[0].get<double>();
@@ -223,12 +243,17 @@ inline constexpr int MOB_TIMEOUT_SEC = 6;
                          .execute();
     if (creditRow.count() == 0) {
       sess.rollback();
+      trace.fail("credit account not found", {{"accountNumber", creditAcc}});
       return err("ERR_CREDIT_NOT_FOUND", "Credit account not found");
     }
     double creditBal = creditRow.fetchOne()[0].get<double>();
 
     if (debitBal < amount + fee) {
       sess.rollback();
+      trace.fail("insufficient balance",
+                 {{"balance", std::to_string(debitBal)},
+                  {"amount", std::to_string(amount)},
+                  {"fee", std::to_string(fee)}});
       return err("ERR_INSUFFICIENT_FUNDS", "Insufficient balance");
     }
 
@@ -270,6 +295,9 @@ inline constexpr int MOB_TIMEOUT_SEC = 6;
     } catch (...) {
     }
 
+    trace.success({{"transactionId", txnId},
+                   {"debitAccount", debitAcc},
+                   {"creditAccount", creditAcc}});
     return {{"transactionId", txnId},
             {"status", "SUCCESS"},
             {"balanceAfterDebit", debitBal - amount - fee},
@@ -280,6 +308,7 @@ inline constexpr int MOB_TIMEOUT_SEC = 6;
       sess.rollback();
     } catch (...) {
     }
+    trace.fail("mobile core exception", {{"error", e.what()}});
     return err("ERR_EXCEPTION", e.what());
   }
 }
@@ -287,13 +316,48 @@ inline constexpr int MOB_TIMEOUT_SEC = 6;
 // ── Public entry point
 // ────────────────────────────────────────────────────────
 json processMobileTransaction(const json &data) {
-  auto future = std::async(std::launch::async, processMobileCore, data);
+  TransactionLogger::ScopedFunctionTrace trace("processMobileTransaction",
+                                               {{"transactionType", data.value("transactionType", "")}});
+  std::string uuid = data.value("_correlationUuid", TransactionLogger::currentUuid());
+  TransactionLogger::ScopedContext scope(uuid, "MOBILE");
+  TransactionLogger::instance().logCurrent(
+      "INFO", "channel_handler_scheduled",
+      "Mobile transaction handler scheduled",
+      {{"transactionType", data.value("transactionType", "")}});
+
+  auto future = std::async(std::launch::async, [data, uuid]() {
+    TransactionLogger::ScopedContext asyncScope(uuid, "MOBILE");
+    TransactionLogger::instance().logCurrent(
+        "INFO", "channel_handler_started",
+        "Mobile transaction handler started",
+        {{"transactionType", data.value("transactionType", "")}});
+    return processMobileCore(data);
+  });
   if (future.wait_for(std::chrono::seconds(MOB_TIMEOUT_SEC)) ==
       std::future_status::timeout) {
+    TransactionLogger::instance().logCurrent(
+        "WARN", "channel_handler_timeout",
+        "Mobile transaction handler timeout",
+        {{"timeoutSeconds", std::to_string(MOB_TIMEOUT_SEC)}});
+    trace.fail("mobile transaction timeout");
     return {{"status", "DECLINED"},
             {"errorCode", "ERR_TIMEOUT"},
             {"message", "Mobile transaction timeout (>" +
                             std::to_string(MOB_TIMEOUT_SEC) + "s)"}};
   }
-  return future.get();
+  json result = future.get();
+  TransactionLogger::instance().logCurrent(
+      "INFO", "channel_handler_finished",
+      "Mobile transaction handler finished",
+      {{"transactionId", result.value("transactionId", "")},
+       {"status", result.value("status", "")},
+       {"errorCode", result.value("errorCode", "")}});
+  if (result.contains("errorCode")) {
+    trace.fail("mobile transaction failed",
+               {{"errorCode", result["errorCode"].get<std::string>()}});
+  } else {
+    trace.success({{"transactionId", result.value("transactionId", "")},
+                   {"status", result.value("status", "")}});
+  }
+  return result;
 }

@@ -14,6 +14,7 @@
  */
 
 #include "Database.h"
+#include "TransactionLogger.h"
 #include <iostream>
 #include <cstdlib>
 
@@ -34,6 +35,7 @@ static std::string env(const char* key, const char* fallback) {
 
 // ── Internal: create a fresh authenticated Session ────────────────────────────
 Session* Database::createSession_() {
+    TransactionLogger::ScopedFunctionTrace trace("Database::createSession_");
     std::string host = env("DB_HOST", "localhost");
     int         port = std::atoi(env("DB_PORT", "33060").c_str());
     std::string user = env("DB_USER", "root");
@@ -42,17 +44,27 @@ Session* Database::createSession_() {
 
     Session* s = new Session(host, port, user, pass);
     s->sql("USE " + name).execute();
+    trace.success({{"host", host}, {"port", std::to_string(port)}, {"database", name}});
     return s;
 }
 
 // ── Ping a session: returns true if alive ────────────────────────────────────
 bool Database::pingSession_(Session* s) noexcept {
-    try { s->sql("SELECT 1").execute(); return true; }
-    catch (...) { return false; }
+    TransactionLogger::ScopedFunctionTrace trace("Database::pingSession_");
+    try {
+        s->sql("SELECT 1").execute();
+        trace.success({{"alive", "true"}});
+        return true;
+    }
+    catch (...) {
+        trace.fail("session ping failed");
+        return false;
+    }
 }
 
 // ── Heal: close stale session, open fresh one ────────────────────────────────
 Session* Database::healSession_(Session* old) {
+    TransactionLogger::ScopedFunctionTrace trace("Database::healSession_");
     try { old->close(); } catch (...) {}
     delete old;
     ++staleReconnects_;
@@ -61,16 +73,24 @@ Session* Database::healSession_(Session* old) {
         try { return createSession_(); }
         catch (const std::exception& ex) {
             std::cerr << "[DB] Reconnect attempt " << (i+1) << " failed: " << ex.what() << "\n";
+            trace.checkpoint("reconnect_attempt_failed", "DB reconnect attempt failed",
+                             {{"attempt", std::to_string(i + 1)}, {"error", ex.what()}});
         }
     }
+    trace.fail("cannot reconnect stale database session");
     throw std::runtime_error("[DB] Cannot reconnect after " +
                              std::to_string(HEALTH_CHECK_RETRIES) + " attempts");
 }
 
 // ── initPool() ────────────────────────────────────────────────────────────────
 void Database::initPool() {
+    TransactionLogger::ScopedFunctionTrace trace("Database::initPool",
+                                                 {{"poolSize", std::to_string(POOL_SIZE)}});
     std::lock_guard<std::mutex> lk(poolMutex_);
-    if (poolReady_) return;
+    if (poolReady_) {
+        trace.success({{"status", "already_ready"}});
+        return;
+    }
 
     std::cout << "[DB] Initialising connection pool (" << POOL_SIZE << " sessions)…\n";
     allConnections_.reserve(POOL_SIZE);
@@ -82,16 +102,20 @@ void Database::initPool() {
             freeConnections_.push(s);
         } catch (const std::exception& ex) {
             std::cerr << "[DB] Failed to create connection " << i << ": " << ex.what() << "\n";
+            trace.fail("failed to create database connection",
+                       {{"connectionIndex", std::to_string(i)}, {"error", ex.what()}});
             throw;
         }
     }
 
     poolReady_ = true;
     std::cout << "[DB] Pool ready — " << POOL_SIZE << " connections available.\n";
+    trace.success({{"connections", std::to_string(POOL_SIZE)}});
 }
 
 // ── destroyPool() ────────────────────────────────────────────────────────────
 void Database::destroyPool() {
+    TransactionLogger::ScopedFunctionTrace trace("Database::destroyPool");
     std::lock_guard<std::mutex> lk(poolMutex_);
     for (Session* s : allConnections_) {
         try { s->close(); } catch (...) {}
@@ -102,71 +126,109 @@ void Database::destroyPool() {
     poolReady_ = false;
     std::cout << "[DB] Pool destroyed. Total stale reconnects: "
               << staleReconnects_.load() << "\n";
+    trace.success({{"staleReconnects", std::to_string(staleReconnects_.load())}});
 }
 
 // ── acquire() — blocks up to POOL_TIMEOUT_MS, heals stale sessions ───────────
 Session* Database::acquire() {
+    TransactionLogger::ScopedFunctionTrace trace("Database::acquire");
     std::unique_lock<std::mutex> lk(poolMutex_);
 
     bool ok = poolCV_.wait_for(lk,
         std::chrono::milliseconds(POOL_TIMEOUT_MS),
         [] { return !Database::freeConnections_.empty(); });
 
-    if (!ok || freeConnections_.empty())
+    if (!ok || freeConnections_.empty()) {
+        trace.fail("database pool exhausted",
+                   {{"timeoutMs", std::to_string(POOL_TIMEOUT_MS)}});
         throw std::runtime_error("[DB] Pool exhausted — no free connection within timeout");
+    }
 
     Session* s = freeConnections_.front();
     freeConnections_.pop();
+    trace.checkpoint("session_checked_out", "Database session checked out",
+                     {{"freeConnections", std::to_string(freeConnections_.size())}});
     lk.unlock();   // release lock before potentially slow ping
 
     // Health check — heal if stale
     if (!pingSession_(s)) {
         std::cerr << "[DB] Stale session detected, reconnecting…\n";
-        s = healSession_(s);
-        // Replace in allConnections_
+        trace.checkpoint("stale_session", "Stale database session detected");
+        Session* stale = s;
+        Session* healed = healSession_(stale);
+
         std::lock_guard<std::mutex> lk2(poolMutex_);
-        for (auto& ptr : allConnections_)
-            if (ptr != s) { /* find stale */ }
-        // (allConnections_ already updated via healSession_ delete/new)
+        for (auto& ptr : allConnections_) {
+            if (ptr == stale) {
+                ptr = healed;
+                break;
+            }
+        }
+        s = healed;
     }
+    trace.success();
     return s;
 }
 
 // ── tryAcquire() — non-blocking ───────────────────────────────────────────────
 std::optional<Session*> Database::tryAcquire() {
+    TransactionLogger::ScopedFunctionTrace trace("Database::tryAcquire");
     std::lock_guard<std::mutex> lk(poolMutex_);
-    if (freeConnections_.empty()) return std::nullopt;
+    if (freeConnections_.empty()) {
+        trace.fail("no free database session available");
+        return std::nullopt;
+    }
     Session* s = freeConnections_.front();
     freeConnections_.pop();
+    trace.success({{"freeConnections", std::to_string(freeConnections_.size())}});
     return s;
 }
 
 // ── release() ────────────────────────────────────────────────────────────────
 void Database::release(Session* session) {
-    if (!session) return;
+    TransactionLogger::ScopedFunctionTrace trace("Database::release");
+    if (!session) {
+        trace.fail("null database session release requested");
+        return;
+    }
     {
         std::lock_guard<std::mutex> lk(poolMutex_);
         freeConnections_.push(session);
+        trace.checkpoint("session_returned", "Database session returned",
+                         {{"freeConnections", std::to_string(freeConnections_.size())}});
     }
     poolCV_.notify_one();
+    trace.success();
 }
 
 // ── poolHealth() ─────────────────────────────────────────────────────────────
 PoolHealth Database::poolHealth() {
+    TransactionLogger::ScopedFunctionTrace trace("Database::poolHealth");
     std::lock_guard<std::mutex> lk(poolMutex_);
-    return {
+    PoolHealth health{
         static_cast<int>(allConnections_.size()),
         static_cast<int>(freeConnections_.size()),
         staleReconnects_.load()
     };
+    trace.success({{"total", std::to_string(health.total)},
+                   {"free", std::to_string(health.free)},
+                   {"staleReconnects", std::to_string(health.staleReconnects)}});
+    return health;
 }
 
 // ── ScopedConnection ─────────────────────────────────────────────────────────
 Database::ScopedConnection::ScopedConnection()
-    : session_(Database::acquire()) {}
+    : session_(Database::acquire()) {
+    TransactionLogger::instance().logCurrent(
+        "DEBUG", "db_scoped_connection_acquired", "Scoped DB connection acquired");
+}
 
 Database::ScopedConnection::~ScopedConnection() {
-    if (session_) Database::release(session_);
+    if (session_) {
+        TransactionLogger::instance().logCurrent(
+            "DEBUG", "db_scoped_connection_released", "Scoped DB connection released");
+        Database::release(session_);
+    }
 }
 
 Database::ScopedConnection::ScopedConnection(ScopedConnection&& o) noexcept
@@ -183,10 +245,16 @@ Database::ScopedConnection& Database::ScopedConnection::operator=(ScopedConnecti
 
 // ── Legacy shim ───────────────────────────────────────────────────────────────
 Session& Database::getSession() {
+    TransactionLogger::ScopedFunctionTrace trace("Database::getSession");
     if (!legacySession_) legacySession_ = createSession_();
+    trace.success();
     return *legacySession_;
 }
 
 Schema Database::getSchema() {
-    return getSession().getSchema(env("DB_NAME", "bankingdb"));
+    TransactionLogger::ScopedFunctionTrace trace("Database::getSchema");
+    std::string name = env("DB_NAME", "bankingdb");
+    Schema schema = getSession().getSchema(name);
+    trace.success({{"database", name}});
+    return schema;
 }

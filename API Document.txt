@@ -14,6 +14,111 @@ DO NOT hardcode expiry — it is generated dynamically
 (current cards = 04/31). Using a wrong expiry = CARD NOT FOUND.
 
 =========================================================
+ ADD NEW ACCOUNT
+=========================================================
+POST /account/add
+
+{
+  "accountNumber": "AU1234567890",
+  "balance": 10000.00,
+  "countryCode": "AU",
+  "currencyId": 1,
+  "isFrozen": false
+}
+
+Alternative through existing router:
+
+POST /transaction/initiate
+
+{
+  "channelId": "ADD_ACCOUNT",
+  "data": {
+    "accountNumber": "AU1234567890",
+    "balance": 10000.00,
+    "countryCode": "AU",
+    "currencyCode": "AUD",
+    "isFrozen": false
+  }
+}
+
+Required:
+accountNumber and either currencyId or currencyCode.
+
+Response:
+{
+  "status": "SUCCESS",
+  "message": "Account added successfully",
+  "account": {
+    "accountId": 1,
+    "accountNumber": "AU1234567890",
+    "balance": 10000.00,
+    "countryCode": "AU",
+    "isFrozen": false,
+    "currency": {
+      "currencyId": 1,
+      "currencyCode": "AUD",
+      "currencyName": "Australian Dollar"
+    }
+  }
+}
+
+=========================================================
+ ACCOUNT DETAILS
+=========================================================
+POST /account/details
+
+{
+  "accountNumber": "AU1234567890"
+}
+
+Alternative through existing router:
+
+{
+  "channelId": "ACCOUNT_DETAILS",
+  "data": {
+    "accountNumber": "AU1234567890"
+  }
+}
+
+=========================================================
+ FREEZE / UNFREEZE ACCOUNT
+=========================================================
+POST /account/freeze
+
+{
+  "accountNumber": "AU1234567890"
+}
+
+POST /account/unfreeze
+
+{
+  "accountNumber": "AU1234567890"
+}
+
+Alternative channel IDs:
+FREEZE_ACCOUNT and UNFREEZE_ACCOUNT
+
+=========================================================
+ LIST ACCOUNTS
+=========================================================
+POST /account/list
+
+{
+  "limit": 50,
+  "offset": 0
+}
+
+Alternative through existing router:
+
+{
+  "channelId": "LIST_ACCOUNTS",
+  "data": {
+    "limit": 50,
+    "offset": 0
+  }
+}
+
+=========================================================
  ISSUE NEW CARD
 =========================================================
 POST /transaction/initiate
@@ -254,6 +359,9 @@ ERR_INVALID_ENCRYPTED_PAN — Decryption failed (wrong key or corrupted data)
 ERR_INVALID_PIN           — PIN does not match (re-generate with correct PAN)
 ERR_CARD_INACTIVE         — Card status is BLOCKED
 ERR_ACCOUNT_NOT_FOUND     — Account number does not exist
+ERR_ACCOUNT_EXISTS        — Account number already exists
+ERR_CURRENCY_NOT_FOUND    — currencyId/currencyCode does not exist
+ERR_ACCOUNT_FROZEN        — Account is frozen
 ERR_INSUFFICIENT_FUNDS    — Balance too low
 ERR_RATE_LIMIT            — Too many requests (>200/min per IP)
 ERR_TIMEOUT               — Transaction took too long (>5-6 seconds)

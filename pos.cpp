@@ -20,6 +20,7 @@
 #include "panencrypted.h"
 #include "pin.h"
 #include "AccountLockManager.h"
+#include "TransactionLogger.h"
 
 #include <chrono>
 #include <functional>
@@ -72,9 +73,13 @@ struct POSContext {
 // ── PURCHASE
 // ──────────────────────────────────────────────────────────────────
 [[nodiscard]] static json purchase(const json &data, POSContext &ctx) {
+  TransactionLogger::ScopedFunctionTrace trace("purchase",
+                                               {{"transactionType", "PURCHASE"}});
   try {
-    if (!data.contains("card"))
+    if (!data.contains("card")) {
+      trace.fail("missing card object");
       return err("ERR_MISSING_CARD");
+    }
 
     const json &card = data["card"];
     std::string txnId = genTxnId();
@@ -85,10 +90,16 @@ struct POSContext {
     double amount = data.value("amount", 0.0);
     double fee = data.value("fee", 0.0);
 
-    if (amount <= 0)
+    if (amount <= 0) {
+      trace.fail("invalid purchase amount", {{"amount", std::to_string(amount)}});
       return err("ERR_INVALID_AMOUNT", "Amount must be > 0");
-    if (amount > POS_MAX_SINGLE)
+    }
+    if (amount > POS_MAX_SINGLE) {
+      trace.fail("POS single limit exceeded",
+                 {{"amount", std::to_string(amount)},
+                  {"limit", std::to_string(POS_MAX_SINGLE)}});
       return err("ERR_SINGLE_LIMIT", "Exceeds POS single limit");
+    }
 
     // Decrypt PAN (always decrypt — PAN is always sent encrypted)
     std::string pan, expiry = card.value("expiry", ""),
@@ -98,25 +109,31 @@ struct POSContext {
         pan = PANEncryptionService::getInstance().decryptPAN(
             card["pan"].get<std::string>());
       } catch (const std::exception &e) {
+        trace.fail("encrypted PAN decrypt failed", {{"error", e.what()}});
         return err("ERR_INVALID_ENCRYPTED_PAN", e.what());
       }
     } else {
+      trace.fail("missing PAN");
       return err("ERR_MISSING_PAN", "Card PAN is required");
     }
 
     // PIN verification (optional — tap payments may not have PIN)
     if (card.contains("pin")) {
       if (!PINService::getInstance().verifyPIN(pan,
-                                               card["pin"].get<std::string>()))
+                                               card["pin"].get<std::string>())) {
+        trace.fail("PIN verification failed");
         return err("ERR_INVALID_PIN", "PIN verification failed");
+      }
     }
 
     auto cardRes = ctx.cards.select("account_number", "scheme", "status", "expiry", "cvv")
                        .where("pan=:p")
                        .bind("p", pan)
                        .execute();
-    if (cardRes.count() == 0)
+    if (cardRes.count() == 0) {
+      trace.fail("card not found");
       return err("ERR_CARD_NOT_FOUND");
+    }
 
     Row r = cardRes.fetchOne();
     std::string accNo = r[0].get<std::string>();
@@ -125,21 +142,28 @@ struct POSContext {
     std::string dbCvv = r[4].isNull() ? "" : r[4].get<std::string>();
 
     if (!expiry.empty() && expiry != dbExpiry) {
+      trace.fail("invalid expiry");
       return err("ERR_INVALID_EXPIRY", "Wrong expiry date");
     }
     
     if (!cvv.empty() && cvv != dbCvv) {
+      trace.fail("invalid CVV");
       return err("ERR_INVALID_CVV", "Wrong CVV");
     }
 
-    if (r[2].get<std::string>() != "ACTIVE")
+    if (r[2].get<std::string>() != "ACTIVE") {
+      trace.fail("card inactive");
       return err("ERR_CARD_INACTIVE");
+    }
 
     // ── Falcon ────────────────────────────────────────────────────────
     Falcon falcon(*ctx.sess);
     std::string fraudReason;
-    if (falcon.checkFraud(accNo, amount, fraudReason, FalconChannel::POS)) {
-      falcon.logFraud(txnId, clientId, "", "", accNo, amount, fraudReason);
+    if (falcon.checkFraud(accNo, amount, fraudReason, FalconChannel::POS,
+                          &data)) {
+      falcon.logFraud(txnId, clientId, terminalId, "", accNo, amount,
+                      fraudReason);
+      trace.fail("fraud declined POS purchase", {{"reason", fraudReason}});
       return {{"status", "DECLINED"}, {"message", fraudReason}};
     }
 
@@ -152,8 +176,13 @@ struct POSContext {
                          .fetchOne()[0]
                          .get<double>();
 
-    if (balance < amount + fee)
+    if (balance < amount + fee) {
+      trace.fail("insufficient balance",
+                 {{"balance", std::to_string(balance)},
+                  {"amount", std::to_string(amount)},
+                  {"fee", std::to_string(fee)}});
       return err("ERR_INSUFFICIENT_FUNDS");
+    }
 
     ctx.sess->startTransaction();
     try {
@@ -189,16 +218,20 @@ struct POSContext {
       } catch (...) {
       }
 
+      trace.success({{"transactionId", txnId},
+                     {"accountNumber", accNo}});
       return {{"transactionId", txnId},
               {"status", "SUCCESS"},
               {"balanceAfter", balance - (amount + fee)},
               {"message", "POS purchase successful"}};
     } catch (...) {
       ctx.sess->rollback();
+      trace.fail("database failure during POS purchase");
       return err("ERR_DB_FAILURE");
     }
 
   } catch (const std::exception &e) {
+    trace.fail("POS purchase exception", {{"error", e.what()}});
     return err("ERR_EXCEPTION", e.what());
   }
 }
@@ -206,6 +239,8 @@ struct POSContext {
 // ── REFUND
 // ────────────────────────────────────────────────────────────────────
 [[nodiscard]] static json refund(const json &data, POSContext &ctx) {
+  TransactionLogger::ScopedFunctionTrace trace("refund",
+                                               {{"transactionType", "REFUND"}});
   try {
     std::string txnId = genTxnId();
     std::string clientId = data.value("clientTxnId", txnId);
@@ -215,8 +250,10 @@ struct POSContext {
     std::string terminalId = data.value("terminalId", "");
     std::string location = data.value("location", "");
 
-    if (origTxnId.empty())
+    if (origTxnId.empty()) {
+      trace.fail("missing original transaction id");
       return err("ERR_INVALID_ORIG_TXN", "origTransactionId required");
+    }
 
     auto pRes = ctx.posTbl
                     .select("id", "amount", "account_number", "card_pan",
@@ -224,8 +261,10 @@ struct POSContext {
                     .where("transaction_id=:tid")
                     .bind("tid", origTxnId)
                     .execute();
-    if (pRes.count() == 0)
+    if (pRes.count() == 0) {
+      trace.fail("original purchase not found", {{"origTransactionId", origTxnId}});
       return err("ERR_PURCHASE_NOT_FOUND");
+    }
 
     Row p = pRes.fetchOne();
     auto id = p[0].get<int64_t>();
@@ -235,12 +274,20 @@ struct POSContext {
     std::string flag = p[5].get<std::string>();
     std::string msg = p[6].get<std::string>();
 
-    if (msg != "POS purchase successful")
+    if (msg != "POS purchase successful") {
+      trace.fail("invalid refund source");
       return err("ERR_INVALID_REFUND_SOURCE");
-    if (flag != "N")
+    }
+    if (flag != "N") {
+      trace.fail("purchase already refunded", {{"flag", flag}});
       return err("ERR_ALREADY_REFUNDED");
-    if (amount <= 0 || amount > purchAmt)
+    }
+    if (amount <= 0 || amount > purchAmt) {
+      trace.fail("invalid refund amount",
+                 {{"amount", std::to_string(amount)},
+                  {"purchaseAmount", std::to_string(purchAmt)}});
       return err("ERR_INVALID_REFUND_AMOUNT");
+    }
 
     AccountLockManager::ScopedLock accLock(AccountLockManager::getInstance(), acc, TxnPriority::CREDIT);
 
@@ -257,8 +304,11 @@ struct POSContext {
                      .fetchOne();
     double fee = feeRow[0].isNull() ? 0.0 : feeRow[0].get<double>();
 
-    if (amount <= fee)
+    if (amount <= fee) {
+      trace.fail("refund amount less than fee",
+                 {{"amount", std::to_string(amount)}, {"fee", std::to_string(fee)}});
       return err("ERR_AMOUNT_LESS_THAN_FEE");
+    }
     double netRefund = amount - fee;
 
     ctx.sess->startTransaction();
@@ -293,6 +343,7 @@ struct POSContext {
           .execute();
 
       ctx.sess->commit();
+      trace.success({{"transactionId", txnId}, {"netRefund", std::to_string(netRefund)}});
       return {{"transactionId", txnId},
               {"status", "SUCCESS"},
               {"flag", newFlag},
@@ -300,10 +351,12 @@ struct POSContext {
               {"message", "POS refund successful"}};
     } catch (...) {
       ctx.sess->rollback();
+      trace.fail("database failure during POS refund");
       return err("ERR_DB_FAILURE");
     }
 
   } catch (const std::exception &e) {
+    trace.fail("POS refund exception", {{"error", e.what()}});
     return err("ERR_EXCEPTION", e.what());
   }
 }
@@ -319,24 +372,63 @@ static const std::unordered_map<std::string, POSHandler> POS_DISPATCH = {
 // ── Public entry point
 // ────────────────────────────────────────────────────────
 json processPOSTransaction(const json &data) {
+  TransactionLogger::ScopedFunctionTrace trace("processPOSTransaction",
+                                               {{"transactionType", data.value("transactionType", "")}});
   try {
+    std::string uuid = data.value("_correlationUuid", TransactionLogger::currentUuid());
+    TransactionLogger::ScopedContext scope(uuid, "POS");
+    TransactionLogger::instance().logCurrent(
+        "INFO", "channel_handler_scheduled",
+        "POS transaction handler scheduled",
+        {{"transactionType", data.value("transactionType", "")}});
+
     Database::ScopedConnection sc;
     POSContext ctx(sc.operator->());
 
     std::string txnType = data.value("transactionType", "");
     auto it = POS_DISPATCH.find(txnType);
-    if (it == POS_DISPATCH.end())
+    if (it == POS_DISPATCH.end()) {
+      trace.fail("unsupported POS transaction type", {{"transactionType", txnType}});
       return err("ERR_INVALID_TYPE", "Unsupported POS type: " + txnType);
+    }
 
     auto future = std::async(std::launch::async,
-                             [&]() -> json { return it->second(data, ctx); });
+                             [&, uuid]() -> json {
+                               TransactionLogger::ScopedContext asyncScope(uuid, "POS");
+                               TransactionLogger::instance().logCurrent(
+                                   "INFO", "channel_handler_started",
+                                   "POS transaction handler started",
+                                   {{"transactionType", data.value("transactionType", "")}});
+                               return it->second(data, ctx);
+                             });
 
     if (future.wait_for(std::chrono::seconds(POS_TIMEOUT_SEC)) ==
-        std::future_status::timeout)
+        std::future_status::timeout) {
+      TransactionLogger::instance().logCurrent(
+          "WARN", "channel_handler_timeout",
+          "POS transaction handler timeout",
+          {{"timeoutSeconds", std::to_string(POS_TIMEOUT_SEC)}});
+      trace.fail("POS transaction timeout");
       return {{"status", "DECLINED"}, {"errorCode", "ERR_TIMEOUT"}};
+    }
 
-    return future.get();
+    json result = future.get();
+    TransactionLogger::instance().logCurrent(
+        "INFO", "channel_handler_finished",
+        "POS transaction handler finished",
+        {{"transactionId", result.value("transactionId", "")},
+         {"status", result.value("status", "")},
+         {"errorCode", result.value("errorCode", "")}});
+    if (result.contains("errorCode")) {
+      trace.fail("POS transaction failed",
+                 {{"errorCode", result["errorCode"].get<std::string>()}});
+    } else {
+      trace.success({{"transactionId", result.value("transactionId", "")},
+                     {"status", result.value("status", "")}});
+    }
+    return result;
   } catch (const std::exception &e) {
+    trace.fail("POS fatal exception", {{"error", e.what()}});
     return err("ERR_FATAL", e.what());
   }
 }

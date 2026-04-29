@@ -22,6 +22,7 @@
 #include "issue.h"
 #include "Database.h"
 #include "panencrypted.h"
+#include "TransactionLogger.h"
 
 #include <algorithm>
 #include <chrono>
@@ -52,10 +53,13 @@ static std::mutex g_accountMapMutex;
 
 [[nodiscard]] static std::shared_ptr<std::mutex>
 getAccountMutex(const std::string &account) {
+  TransactionLogger::ScopedFunctionTrace trace("getAccountMutex",
+                                               {{"accountNumber", account}});
   std::lock_guard<std::mutex> mapLock(g_accountMapMutex);
   auto &ptr = g_accountMutexes[account];
   if (!ptr)
     ptr = std::make_shared<std::mutex>();
+  trace.success();
   return ptr;
 }
 
@@ -131,6 +135,7 @@ static const std::unordered_map<std::string, std::string> SCHEME_TO_BIN = {
 // ── Public entry point
 // ────────────────────────────────────────────────────────
 json processIssueCard(const json &data) {
+  TransactionLogger::ScopedFunctionTrace trace("processIssueCard");
   json response;
 
   // ── Early validation (no lock needed) ────────────────────────────────
@@ -138,6 +143,7 @@ json processIssueCard(const json &data) {
       !data.contains("scheme")) {
     response["errorCode"] = "ERR_INVALID_REQUEST";
     response["message"] = "Missing: accountNumber, cardholderName, scheme";
+    trace.fail("missing required card issue fields");
     return response;
   }
 
@@ -150,6 +156,7 @@ json processIssueCard(const json &data) {
   if (binIt == SCHEME_TO_BIN.end()) {
     response["errorCode"] = "ERR_INVALID_SCHEME";
     response["message"] = "Allowed: VISA, MASTERCARD, RUPAY, AMEX";
+    trace.fail("invalid card scheme", {{"scheme", scheme}});
     return response;
   }
 
@@ -176,6 +183,7 @@ json processIssueCard(const json &data) {
     if (accRes.count() == 0) {
       response["errorCode"] = "ERR_ACCOUNT_NOT_FOUND";
       response["message"] = "Account does not exist";
+      trace.fail("account not found", {{"accountNumber", account}});
       return response;
     }
 
@@ -190,6 +198,8 @@ json processIssueCard(const json &data) {
       response["errorCode"] = "ERR_MAX_CARD_LIMIT";
       response["message"] = "Maximum " + std::to_string(MAX_CARDS_PER_ACCOUNT) +
                             " cards allowed per account";
+      trace.fail("max card limit reached",
+                 {{"accountNumber", account}, {"cardCount", std::to_string(cardCount)}});
       return response;
     }
 
@@ -231,23 +241,30 @@ json processIssueCard(const json &data) {
         {"accountNumber", account}};
     response["_hint"] = "Use encryptedPan + expiry from this response directly "
                         "in transaction requests";
+    trace.success({{"accountNumber", account},
+                   {"scheme", scheme},
+                   {"priority", priority}});
 
   } catch (const mysqlx::Error &er) {
     response["errorCode"] = "ERR_DB";
     response["message"] = er.what();
+    trace.fail("database error while issuing card", {{"error", er.what()}});
   } catch (const std::exception &ex) {
     response["errorCode"] = "ERR_UNKNOWN";
     response["message"] = ex.what();
+    trace.fail("exception while issuing card", {{"error", ex.what()}});
   }
   return response;
 }
 
 json processGetCardDetails(const json& data) {
+    TransactionLogger::ScopedFunctionTrace trace("processGetCardDetails");
     json response;
     
     if (!data.contains("encryptedPan")) {
         response["errorCode"] = "ERR_MISSING_PAN";
         response["message"]   = "encryptedPan is required";
+        trace.fail("missing encrypted PAN");
         return response;
     }
     
@@ -259,6 +276,7 @@ json processGetCardDetails(const json& data) {
     } catch (const std::exception& e) {
         response["errorCode"] = "ERR_INVALID_ENCRYPTED_PAN";
         response["message"]   = e.what();
+        trace.fail("encrypted PAN decrypt failed", {{"error", e.what()}});
         return response;
     }
     
@@ -274,6 +292,7 @@ json processGetCardDetails(const json& data) {
         if (cardRes.count() == 0) {
             response["errorCode"] = "ERR_CARD_NOT_FOUND";
             response["message"]   = "Card not found";
+            trace.fail("card not found");
             return response;
         }
         
@@ -292,13 +311,16 @@ json processGetCardDetails(const json& data) {
             {"maskedPan", r[9].isNull() ? "" : r[9].get<std::string>()},
             {"encryptedPan", r[10].isNull() ? "" : r[10].get<std::string>()}
         };
+        trace.success({{"maskedPan", response["card"]["maskedPan"].get<std::string>()}});
         
     } catch (const mysqlx::Error &er) {
         response["errorCode"] = "ERR_DB";
         response["message"]   = er.what();
+        trace.fail("database error while reading card details", {{"error", er.what()}});
     } catch (const std::exception& ex) {
         response["errorCode"] = "ERR_EXCEPTION";
         response["message"]   = ex.what();
+        trace.fail("exception while reading card details", {{"error", ex.what()}});
     }
     
     return response;

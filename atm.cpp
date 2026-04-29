@@ -22,6 +22,7 @@
 #include "panencrypted.h"
 #include "falcon.h"
 #include "AccountLockManager.h"
+#include "TransactionLogger.h"
 
 #include <iostream>
 #include <sstream>
@@ -60,45 +61,69 @@ public:
 
     // Returns {account_number, status, scheme, expiry, cvv}
     [[nodiscard]] std::optional<Row> getCard(std::string_view pan) {
+        TransactionLogger::ScopedFunctionTrace trace("ATMRepository::getCard");
         auto res = db_.getTable("cards")
             .select("account_number","status","scheme","expiry","cvv")
             .where("pan = :p")
             .bind("p", std::string(pan))
             .execute();
-        if (res.count() == 0) return std::nullopt;
+        if (res.count() == 0) {
+            trace.fail("card not found");
+            return std::nullopt;
+        }
+        trace.success();
         return res.fetchOne();
     }
 
     [[nodiscard]] double getBalance(std::string_view acc) {
+        TransactionLogger::ScopedFunctionTrace trace("ATMRepository::getBalance",
+                                                     {{"accountNumber", std::string(acc)}});
         auto res = s_->sql(
             "SELECT balance FROM accounts WHERE account_number=? FOR UPDATE")
             .bind(std::string(acc)).execute();
-        if (res.count() == 0) throw std::runtime_error("Account not found");
-        return res.fetchOne()[0].get<double>();
+        if (res.count() == 0) {
+            trace.fail("account not found");
+            throw std::runtime_error("Account not found");
+        }
+        double balance = res.fetchOne()[0].get<double>();
+        trace.success({{"balance", std::to_string(balance)}});
+        return balance;
     }
 
     [[nodiscard]] double getTodayWithdrawalTotal(std::string_view acc) {
+        TransactionLogger::ScopedFunctionTrace trace("ATMRepository::getTodayWithdrawalTotal",
+                                                     {{"accountNumber", std::string(acc)}});
         auto res = s_->sql(
             "SELECT IFNULL(SUM(amount+fee),0) FROM transaction_atm"
             " WHERE account_number=? AND DATE(created_at)=CURDATE()"
             " AND status='SUCCESS' AND message LIKE '%WITHDRAWAL%'")
             .bind(std::string(acc)).execute();
-        return res.fetchOne()[0].get<double>();
+        double total = res.fetchOne()[0].get<double>();
+        trace.success({{"todayWithdrawalTotal", std::to_string(total)}});
+        return total;
     }
 
     [[nodiscard]] double getTodayDepositTotal(std::string_view acc) {
+        TransactionLogger::ScopedFunctionTrace trace("ATMRepository::getTodayDepositTotal",
+                                                     {{"accountNumber", std::string(acc)}});
         auto res = s_->sql(
             "SELECT IFNULL(SUM(amount),0) FROM transaction_atm"
             " WHERE account_number=? AND DATE(created_at)=CURDATE()"
             " AND status='SUCCESS' AND message LIKE '%DEPOSIT%'")
             .bind(std::string(acc)).execute();
-        return res.fetchOne()[0].get<double>();
+        double total = res.fetchOne()[0].get<double>();
+        trace.success({{"todayDepositTotal", std::to_string(total)}});
+        return total;
     }
 
     void updateBalance(std::string_view acc, double balance) {
+        TransactionLogger::ScopedFunctionTrace trace("ATMRepository::updateBalance",
+                                                     {{"accountNumber", std::string(acc)},
+                                                      {"newBalance", std::to_string(balance)}});
         db_.getTable("accounts").update()
             .set("balance", balance)
             .where("account_number = :a").bind("a", std::string(acc)).execute();
+        trace.success();
     }
 
     [[nodiscard]] long insertATMTransaction(
@@ -109,6 +134,10 @@ public:
         std::string_view pan, std::string_view scheme,
         std::string_view status, std::string_view msg)
     {
+        TransactionLogger::ScopedFunctionTrace trace("ATMRepository::insertATMTransaction",
+                                                     {{"txnId", std::string(txnId)},
+                                                      {"status", std::string(status)},
+                                                      {"amount", std::to_string(amount)}});
         auto res = db_.getTable("transaction_atm").insert(
             "transaction_id","client_txn_id","atm_id","terminal_id","location",
             "account_number","amount","fee","card_pan","card_scheme","status","message")
@@ -118,20 +147,29 @@ public:
                     std::string(pan),std::string(scheme),
                     std::string(status),std::string(msg))
             .execute();
-        return res.getAutoIncrementValue();
+        long refId = res.getAutoIncrementValue();
+        trace.success({{"referenceId", std::to_string(refId)}});
+        return refId;
     }
 
     void insertMasterTxn(long refId) {
+        TransactionLogger::ScopedFunctionTrace trace("ATMRepository::insertMasterTxn",
+                                                     {{"referenceId", std::to_string(refId)}});
         db_.getTable("transactions").insert("table_name","reference_id","status")
             .values("transaction_atm", refId, "SUCCESS").execute();
+        trace.success();
     }
 
     void touchCard(std::string_view pan) {
+        TransactionLogger::ScopedFunctionTrace trace("ATMRepository::touchCard");
         try {
             db_.getTable("cards").update()
                 .set("last_transaction_time", mysqlx::expr("NOW()"))
                 .where("pan = :p").bind("p", std::string(pan)).execute();
-        } catch (...) { /* best-effort */ }
+            trace.success();
+        } catch (...) {
+            trace.fail("best-effort card touch failed");
+        }
     }
 };
 
@@ -145,19 +183,30 @@ using ATMHandler = std::function<json(const json&, ATMRepository&, Session&,
 
 static json handleWithdrawal(const json& data, ATMRepository& repo, Session& sess,
                               std::string_view acc, std::string_view pan, std::string_view scheme) {
+    TransactionLogger::ScopedFunctionTrace trace("handleWithdrawal",
+                                                 {{"accountNumber", std::string(acc)}});
     AccountLockManager::ScopedLock accLock(AccountLockManager::getInstance(), std::string(acc), TxnPriority::DEBIT);
 
     double amount = data["amount"].get<double>();
     double fee    = data["fee"].get<double>();
 
     double todayW = repo.getTodayWithdrawalTotal(acc);
-    if (todayW + amount + fee > ATM_DAILY_WITHDRAWAL_LIMIT)
+    if (todayW + amount + fee > ATM_DAILY_WITHDRAWAL_LIMIT) {
+        trace.fail("ATM withdrawal daily limit exceeded",
+                   {{"amount", std::to_string(amount)},
+                    {"todayWithdrawalTotal", std::to_string(todayW)}});
         throw std::runtime_error("Daily ATM withdrawal limit of " +
                                  std::to_string(ATM_DAILY_WITHDRAWAL_LIMIT) + " exceeded");
+    }
 
     double balance = repo.getBalance(acc);
-    if (balance < amount + fee)
+    if (balance < amount + fee) {
+        trace.fail("insufficient balance",
+                   {{"balance", std::to_string(balance)},
+                    {"amount", std::to_string(amount)},
+                    {"fee", std::to_string(fee)}});
         throw std::runtime_error("Insufficient balance");
+    }
 
     repo.updateBalance(acc, balance - amount - fee);
 
@@ -170,6 +219,8 @@ static json handleWithdrawal(const json& data, ATMRepository& repo, Session& ses
     repo.insertMasterTxn(refId);
     repo.touchCard(pan);
 
+    trace.success({{"transactionId", txnId},
+                   {"balanceAfter", std::to_string(balance - amount - fee)}});
     return {
         {"transactionId", txnId},
         {"status",        "SUCCESS"},
@@ -180,14 +231,20 @@ static json handleWithdrawal(const json& data, ATMRepository& repo, Session& ses
 
 static json handleDeposit(const json& data, ATMRepository& repo, Session& sess,
                            std::string_view acc, std::string_view pan, std::string_view scheme) {
+    TransactionLogger::ScopedFunctionTrace trace("handleDeposit",
+                                                 {{"accountNumber", std::string(acc)}});
     AccountLockManager::ScopedLock accLock(AccountLockManager::getInstance(), std::string(acc), TxnPriority::CREDIT);
 
     double amount = data["amount"].get<double>();
 
     double todayD = repo.getTodayDepositTotal(acc);
-    if (todayD + amount > ATM_DAILY_DEPOSIT_LIMIT)
+    if (todayD + amount > ATM_DAILY_DEPOSIT_LIMIT) {
+        trace.fail("ATM deposit daily limit exceeded",
+                   {{"amount", std::to_string(amount)},
+                    {"todayDepositTotal", std::to_string(todayD)}});
         throw std::runtime_error("Daily ATM deposit limit of " +
                                  std::to_string(ATM_DAILY_DEPOSIT_LIMIT) + " exceeded");
+    }
 
     double balance = repo.getBalance(acc);
     repo.updateBalance(acc, balance + amount);
@@ -201,6 +258,8 @@ static json handleDeposit(const json& data, ATMRepository& repo, Session& sess,
     repo.insertMasterTxn(refId);
     repo.touchCard(pan);
 
+    trace.success({{"transactionId", txnId},
+                   {"balanceAfter", std::to_string(balance + amount)}});
     return {
         {"transactionId", txnId},
         {"status",        "SUCCESS"},
@@ -219,6 +278,8 @@ static const std::unordered_map<std::string, ATMHandler> ATM_DISPATCH = {
 //  CORE — each call gets its own DB session from the pool
 // ═══════════════════════════════════════════════════════════════════════════════
 [[nodiscard]] static json processATMCore(const json& data) {
+    TransactionLogger::ScopedFunctionTrace trace("processATMCore",
+                                                 {{"transactionType", data.value("transactionType", "")}});
     Database::ScopedConnection sc;
     Session& sess = *sc;
     ATMRepository repo(sc.operator->());
@@ -240,6 +301,7 @@ static const std::unordered_map<std::string, ATMHandler> ATM_DISPATCH = {
         // ── Card lookup ───────────────────────────────────────────────────
         auto cardOpt = repo.getCard(pan);
         if (!cardOpt) {
+            trace.fail("card not found");
             return {
                 {"status", "FAILED"},
                 {"errorCode", "ERR_CARD_NOT_FOUND"},
@@ -255,6 +317,7 @@ static const std::unordered_map<std::string, ATMHandler> ATM_DISPATCH = {
         std::string dbCvv    = cardRow[4].isNull() ? "" : cardRow[4].get<std::string>();
 
         if (expiry != dbExpiry) {
+            trace.fail("invalid expiry");
             return {
                 {"status", "FAILED"},
                 {"errorCode", "ERR_INVALID_EXPIRY"},
@@ -265,6 +328,7 @@ static const std::unordered_map<std::string, ATMHandler> ATM_DISPATCH = {
         if (data["card"].contains("cvv")) {
             std::string reqCvv = data["card"]["cvv"].get<std::string>();
             if (reqCvv != dbCvv) {
+                trace.fail("invalid CVV");
                 return {
                     {"status", "FAILED"},
                     {"errorCode", "ERR_INVALID_CVV"},
@@ -273,15 +337,21 @@ static const std::unordered_map<std::string, ATMHandler> ATM_DISPATCH = {
             }
         }
 
-        if (status != "ACTIVE") throw std::runtime_error("Card is not active");
+        if (status != "ACTIVE") {
+            trace.fail("card is not active", {{"cardStatus", status}});
+            throw std::runtime_error("Card is not active");
+        }
 
         // ── Falcon fraud check (NEW in v3) ────────────────────────────────
         Falcon falcon(sess);
         std::string fraudReason;
-        if (falcon.checkFraud(acc, data.value("amount",0.0), fraudReason, FalconChannel::ATM)) {
+        if (falcon.checkFraud(acc, data.value("amount",0.0), fraudReason,
+                              FalconChannel::ATM, &data)) {
             std::string txnId = makeTxnId();
             std::string clientId = data.value("clientTxnId", txnId);
-            falcon.logFraud(txnId, clientId, "", "", acc, data.value("amount",0.0), fraudReason);
+            falcon.logFraud(txnId, clientId, data.value("terminalId", ""), "",
+                            acc, data.value("amount",0.0), fraudReason);
+            trace.fail("fraud declined ATM transaction", {{"reason", fraudReason}});
             return {
                 {"transactionId", txnId},
                 {"status",        "DECLINED"},
@@ -292,21 +362,45 @@ static const std::unordered_map<std::string, ATMHandler> ATM_DISPATCH = {
 
         // ── Dispatch to handler via unordered_map ─────────────────────────
         auto it = ATM_DISPATCH.find(txnType);
-        if (it == ATM_DISPATCH.end())
+        if (it == ATM_DISPATCH.end()) {
+            trace.fail("unsupported ATM transaction type", {{"transactionType", txnType}});
             throw std::runtime_error("Unsupported ATM transaction type: " + txnType);
+        }
 
-        return it->second(data, repo, sess, acc, pan, scheme);
+        json response = it->second(data, repo, sess, acc, pan, scheme);
+        trace.success({{"transactionId", response.value("transactionId", "")},
+                       {"status", response.value("status", "")}});
+        return response;
 
     } catch (const std::exception& e) {
+        trace.fail("ATM core exception", {{"error", e.what()}});
         return {{"status","FAILED"},{"errorCode","ERR_ATM"},{"message", e.what()}};
     }
 }
 
 // ── Public entry point — 6-second async timeout ───────────────────────────────
 json processATMTransaction(const json& data) {
-    auto future = std::async(std::launch::async, processATMCore, data);
+    TransactionLogger::ScopedFunctionTrace trace("processATMTransaction",
+                                                 {{"transactionType", data.value("transactionType", "")}});
+    std::string uuid = data.value("_correlationUuid", TransactionLogger::currentUuid());
+    TransactionLogger::ScopedContext scope(uuid, "ATM");
+    TransactionLogger::instance().logCurrent(
+        "INFO", "channel_handler_scheduled", "ATM transaction handler scheduled",
+        {{"transactionType", data.value("transactionType", "")}});
+
+    auto future = std::async(std::launch::async, [data, uuid]() {
+        TransactionLogger::ScopedContext asyncScope(uuid, "ATM");
+        TransactionLogger::instance().logCurrent(
+            "INFO", "channel_handler_started", "ATM transaction handler started",
+            {{"transactionType", data.value("transactionType", "")}});
+        return processATMCore(data);
+    });
     if (future.wait_for(std::chrono::seconds(ATM_TIMEOUT_SECONDS)) ==
         std::future_status::timeout) {
+        TransactionLogger::instance().logCurrent(
+            "WARN", "channel_handler_timeout", "ATM transaction handler timeout",
+            {{"timeoutSeconds", std::to_string(ATM_TIMEOUT_SECONDS)}});
+        trace.fail("ATM transaction timeout");
         return {
             {"status",    "DECLINED"},
             {"errorCode", "ERR_TIMEOUT"},
@@ -314,5 +408,17 @@ json processATMTransaction(const json& data) {
                            std::to_string(ATM_TIMEOUT_SECONDS) + "s)"}
         };
     }
-    return future.get();
+    json result = future.get();
+    TransactionLogger::instance().logCurrent(
+        "INFO", "channel_handler_finished", "ATM transaction handler finished",
+        {{"transactionId", result.value("transactionId", "")},
+         {"status", result.value("status", "")},
+         {"errorCode", result.value("errorCode", "")}});
+    if (result.contains("errorCode")) {
+        trace.fail("ATM transaction failed",
+                   {{"errorCode", result["errorCode"].get<std::string>()}});
+    } else {
+        trace.success({{"transactionId", result.value("transactionId", "")}});
+    }
+    return result;
 }

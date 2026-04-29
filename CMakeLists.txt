@@ -42,6 +42,10 @@ add_executable(BankingAPIServer
         qrcode.cpp
         ringpay.cpp
         include/ringpay.h
+        include/TransactionLogger.h
+        TransactionLogger.cpp
+        include/account.h
+        account.cpp
         include/falcon.h
         falcon.cpp
         include/Database.h
