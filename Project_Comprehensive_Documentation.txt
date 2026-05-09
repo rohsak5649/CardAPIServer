@@ -1,0 +1,283 @@
+================================================================================
+CORE BANKING & PAYMENT SWITCHING ENGINE - COMPREHENSIVE DOCUMENTATION
+================================================================================
+
+--------------------------------------------------------------------------------
+PART 1: PROJECT INTRODUCTION & CORE THEORY
+--------------------------------------------------------------------------------
+
+This document serves as the master architectural and functional guide for the 
+C++20 Banking and Card Payment Switching Engine. The system is designed to route
+multiple digital payment channels through a single, unified HTTP API, providing 
+robust account management, sophisticated card issuance logic, fraud monitoring,
+and self-healing database connections.
+
+1.1 Core Components & Theoretical Overview
+The payment switch acts as the middleware between front-end channels (ATM, POS,
+Mobile App, E-Commerce platforms) and the core banking database. 
+
+- Unified HTTP Router: The core entry point `/transaction/initiate` intelligently 
+  routes requests based on a `channelId`.
+- Account Locking & Concurrency: To prevent race conditions when multiple concurrent
+  transactions hit the same account, an `AccountLockManager` ensures serialized 
+  updates, granting priority to credit transactions.
+- Security (PAN & PIN): 
+  - The PAN (Primary Account Number) is never passed in plain text. It uses an 
+    AES-256-GCM encryption service.
+  - The PIN is not stored in any database. It is derived via a deterministic 
+    HMAC-SHA256 based PIN generation system. Verification regenerates the expected 
+    PIN and compares it.
+- Falcon Fraud Engine: A local AI-style security scoring and rules engine that 
+  evaluates transactions before money movement. It checks for rapid multi-channel 
+  activity, amount spikes, and malicious device headers.
+- Reversal Engine: A critical system that handles timeouts. If an ATM dispenses 
+  money but network connectivity is lost, the transaction is reversed. A drop-file
+  offline queue handles reversals even when the core DB is temporarily down.
+
+--------------------------------------------------------------------------------
+PART 2: DETAILED FILE-BY-FILE BREAKDOWN (.cpp files)
+--------------------------------------------------------------------------------
+
+The project is structured into modular C++ files, each handling a specific 
+domain of the switching logic.
+
+1. parser&router.cpp
+   - The main HTTP server entry point using `cpp-httplib`.
+   - Handles IP rate limiting (200 requests per minute).
+   - Injects a UUID for each request (`_correlationUuid`).
+   - Acts as the central dispatcher routing traffic to ATM, Mobile, POS, ECOM, etc.
+   - Hosts health and metrics endpoints for monitoring.
+
+2. Database.cpp
+   - Manages the self-healing MySQL X DevAPI connection pool.
+   - Maintains 30 sessions, recycling stale or dead connections automatically.
+   - Provides RAII-based `ScopedConnection` wrappers for safe DB access across 
+     all worker threads.
+
+3. TransactionLogger.cpp
+   - Structured logging engine.
+   - Writes rich JSON-like or structured text logs.
+   - Automatically tracks thread IDs, function names, and correlation UUIDs to
+     make debugging easier. Retries log writes if the file system is temporarily 
+     unavailable.
+
+4. account.cpp
+   - Direct account API handler (`/account/add`, `/account/freeze`, `/account/list`).
+   - Validates initial account state, assigns country/currency codes, and safely 
+     inserts records into the `accounts` table.
+
+5. issue.cpp
+   - Card issuance engine.
+   - Generates mathematically valid PANs (using the Luhn algorithm).
+   - Generates expiration dates and CVVs.
+   - Integrates with the `PANEncryptionService` to securely store the encrypted PAN.
+   - Handles serialized issuance requests to ensure correct `PRIMARY`/`SECONDARY` 
+     priority marking.
+
+6. pin.cpp
+   - Cryptographic PIN handling without lookup tables.
+   - Utilizes HMAC-SHA256 to deterministically derive a PIN from the PAN and a 
+     highly secure master secret.
+   - `verifyPin(pan, inputPin)` ensures valid authentication.
+
+7. panencrypted.cpp
+   - Implementation of AES-256-GCM encryption.
+   - Responsible for encrypting clear PANs into transport-safe Base64 blobs.
+   - Handles the 32-byte key, 12-byte IV, and 16-byte authentication tags.
+
+8. falcon.cpp
+   - The fraud management layer.
+   - Implements hard rules (same-second duplicate, velocity limits per channel).
+   - Scores requests based on risk headers (`X-Device-Integrity`, `X-VPN-Detected`, 
+     `X-Malware-Detected`).
+   - If the score crosses 85, the transaction is aggressively declined, and a 
+     record is pushed to the `transaction_falcon` table.
+
+9. atm.cpp
+   - Channel handler for ATM `WITHDRAWAL` and `DEPOSIT`.
+   - Verifies the encrypted card PAN, PIN, and daily limits ($5000 max withdrawal).
+   - Interacts with Falcon before crediting/debiting the account balance.
+
+10. mobile.cpp
+    - Channel handler for `FUND_TRANSFER`.
+    - Handles account-to-account transfers, evaluating hourly ($2000) and daily 
+      limits. Requires debit account authentication (PAN+PIN).
+
+11. pos.cpp
+    - Channel handler for Point of Sale (merchant terminal) `PURCHASE` and `REFUND`.
+    - Ties transactions to `merchantId` and `terminalId`.
+    - Integrates closely with reversal systems for refund processing.
+
+12. ecom.cpp
+    - E-Commerce channel for online purchases.
+    - Handles domestic vs. international transaction scope flags and verifies CVVs.
+
+13. qrcode.cpp
+    - QR Code scanning channel. Parses QR raw data to extract merchant, terminal,
+      currency, and amount dynamically before processing the debit.
+
+14. ringpay.cpp
+    - Innovative contactless payment channel using wearable tokens.
+    - Checks device ID, token validity, and has built-in simulated network failure 
+      testing for auto-reversals.
+
+15. reversal.cpp
+    - The asynchronous Reversal Engine. 
+    - Triggered on timeouts or network errors. 
+    - Tries to credit the account back. If the DB is down, it writes the reversal 
+      request into the `reversal_drop_file` offline queue to be processed later.
+
+--------------------------------------------------------------------------------
+PART 3: DATABASE SCHEMA AND TOKENS
+--------------------------------------------------------------------------------
+
+The MySQL database relies on a highly relational structure linking every 
+transaction to a master table.
+
+- `accounts`: Stores `account_id`, `balance`, `is_frozen`.
+- `cards`: Stores `encrypted_pan`, `masked_pan`, `status`.
+- `currency`: Master table for supported currencies.
+- `ringpay_tokens`: Secure wearable payment tokens linked to accounts.
+- `transaction_*` tables (atm, pos, ecom, mobile, qrcode, ringpay): Channel 
+   specific ledgers.
+- `transaction_falcon`: Audit log for blocked/fraudulent transactions.
+- `transactions`: The Master Registry. Every channel insert pushes a reference row 
+   here, linking `table_name` and `reference_id`.
+- `transaction_reversal`: Stores the state of successfully reversed funds.
+- `reversal_drop_file`: The fallback queue for when the Database is offline during 
+   a reversal attempt.
+
+--------------------------------------------------------------------------------
+PART 4: TRANSACTION LIFECYCLE (THEORY)
+--------------------------------------------------------------------------------
+
+1. Client Initiation: A JSON payload is sent to `/transaction/initiate` via HTTP POST.
+2. Routing & Context: The router generates a unique UUID, extracts the `channelId`, 
+   and enforces rate limits.
+3. Decryption & PIN Check: If it's a card transaction, `panencrypted.cpp` decrypts 
+   the PAN, and `pin.cpp` validates the PIN.
+4. Fraud Analysis: `falcon.cpp` evaluates velocity, amount spikes, and headers.
+5. Lock Acquisition: `AccountLockManager` locks the account mutex to ensure balance
+   integrity.
+6. DB Transaction: 
+   - `BEGIN`
+   - Evaluate balance.
+   - Update `accounts` table.
+   - Insert to channel table (e.g., `transaction_atm`).
+   - Insert to master `transactions` table.
+   - `COMMIT`
+7. Response & Logging: JSON is returned, and `TransactionLogger` writes the trace.
+
+--------------------------------------------------------------------------------
+PART 5: POSITIVE SCENARIO FLOW (SUCCESSFUL ATM WITHDRAWAL)
+--------------------------------------------------------------------------------
+
+Scenario: A customer withdraws $100 from an ATM.
+
+1. The ATM sends a POST request to `/transaction/initiate` with `channelId: "ATM"`.
+   Payload includes encrypted PAN, PIN, amount (100), and terminal details.
+2. The HTTP Router assigns UUID `txn-12345` and passes it to `atm.cpp`.
+3. `atm.cpp` requests decryption of the PAN.
+4. `atm.cpp` hashes the clear PAN and PIN via HMAC-SHA256 to verify authentication.
+5. Falcon is invoked:
+   - Evaluates risk headers. (Score: 10, PASS)
+   - Checks if $100 exceeds the daily ATM limit. (PASS)
+   - Checks velocity against other recent transactions. (PASS)
+6. `AccountLockManager` locks Account `AU123456`.
+7. Database Connection Pool provides an active session.
+8. The query checks balance: `SELECT balance FROM accounts WHERE account_number = 'AU123456' FOR UPDATE`. 
+   Balance is $500.
+9. Database deducts $100. New balance: $400.
+10. A row is inserted into `transaction_atm` showing `SUCCESS`.
+11. A reference row is inserted into `transactions`.
+12. The DB transaction commits.
+13. `AccountLockManager` releases the lock.
+14. The HTTP Router returns `{ "status": "SUCCESS", "newBalance": 400 }` to the ATM.
+
+--------------------------------------------------------------------------------
+PART 6: NEGATIVE SCENARIO FLOW (REVERSAL DUE TO TIMEOUT)
+--------------------------------------------------------------------------------
+
+Scenario: ATM withdrawal succeeds internally, but the network drops before the 
+ATM receives the response. The switch must auto-reverse the $100 to prevent 
+customer loss.
+
+1. Transaction processes successfully up to step 12 above.
+2. The HTTP Router attempts to send the 200 OK JSON response to the ATM.
+3. The socket times out or drops. The channel handler catches this network error.
+4. The handler triggers `processReversal()` in `reversal.cpp` asynchronously.
+5. `reversal.cpp` attempts a DB Health Check (`SELECT 1`).
+
+Branch A: DB is ALIVE
+6A. `AccountLockManager` locks Account `AU123456` with high priority (`CREDIT`).
+7A. DB queries the balance (`FOR UPDATE`).
+8A. $100 is credited back to the account.
+9A. A row is inserted into `transaction_reversal` with reason `TIMEOUT`.
+10A. The original row in `transaction_atm` is updated to set `reversal_status = 'REVERSED'`.
+11A. Transaction commits, lock releases. Funds are safely restored.
+
+Branch B: DB is DOWN (Catastrophic Failure during Reversal)
+6B. The DB health check fails, or DB connection pool throws an exception.
+7B. `reversal.cpp` captures the entire reversal payload JSON.
+8B. It attempts to connect to the DB purely to write to `reversal_drop_file`.
+9B. If successful, the request sits in `reversal_drop_file` with status `PENDING`.
+10B. A background worker periodically checks this table. Once the DB is restored,
+     the worker picks up the `PENDING` request, credits the account, and marks the 
+     queue item as `REPLAYED`.
+
+--------------------------------------------------------------------------------
+PART 7: ADVANCED THEORY - ENCRYPTION AND PIN MANAGEMENT
+--------------------------------------------------------------------------------
+
+7.1 Tokenization and Encryption
+Transporting PANs (16-19 digit card numbers) in plaintext violates PCI-DSS. 
+Therefore:
+- The Issuer API (`issue.cpp`) generates the PAN but immediately passes it to the 
+  Encryption Service.
+- AES-256-GCM is used. GCM provides authenticated encryption, meaning any tampering 
+  with the encrypted payload will be detected during decryption.
+- Clients receive `encryptedPan` (Base64) and must use this in all subsequent 
+  requests.
+
+7.2 Deterministic PIN Derivation
+Storing PINs, even hashed, is an attack vector. This switch uses derivation:
+- The PIN is generated based on a combination of the PAN, card expiry, and a highly 
+  secure server-side Secret Key.
+- `HMAC-SHA256(PAN + Expiry, Secret_Key)` generates a massive hash.
+- The system extracts specific bytes, converts them to integers, and reduces them 
+  modulo 10 to generate a 4-digit PIN.
+- When an ATM sends a PIN, the server re-runs this algorithm. If the generated 
+  result matches the input, the user is authenticated. No database lookup required.
+
+--------------------------------------------------------------------------------
+PART 8: ADVANCED THEORY - FALCON FRAUD ENGINE
+--------------------------------------------------------------------------------
+
+Falcon acts as a gatekeeper. It is executed *before* account locking to maximize 
+throughput (declining bad actors quickly).
+
+Rules Evaluated:
+- Same-Second Duplicate: A simple caching mechanism checks if the exact same 
+  amount was requested on the same account within 1000ms.
+- Velocity Limits: The DB is queried for transaction counts in the last 60 seconds 
+  per channel.
+- Amount Spike: Calculates a 7-day rolling average. If the current transaction is 
+  > 3x the average, it flags for manual review or decline.
+- AI/Headers Check: Evaluates `X-Device-Integrity`, `X-Malware-Detected`, etc. 
+  Points are assigned (e.g., Malware = 100 pts, Rooted = 30 pts, VPN = 10 pts).
+  If Score > 85, Falcon halts the transaction and records a `transaction_falcon` row.
+
+--------------------------------------------------------------------------------
+PART 9: CONCLUSION & SYSTEM RESILIENCE
+--------------------------------------------------------------------------------
+
+The architecture of this payment switch ensures zero-loss integrity. 
+By utilizing C++20 standard concurrency, robust mutex locking (`AccountLockManager`), 
+health-checked connection pools (`Database.cpp`), and offline queues 
+(`reversal_drop_file`), the engine behaves exactly like an enterprise-grade banking 
+switch. Even in edge cases where both the network and the database fail simultaneously, 
+state is serialized and recovered.
+
+================================================================================
+END OF DOCUMENTATION
+================================================================================

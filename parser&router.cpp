@@ -45,6 +45,7 @@
 #include "qrcode.h"
 #include "ringpay.h"
 #include "account.h"
+#include "reversal.h"
 
 using json = nlohmann::json;
 
@@ -110,19 +111,20 @@ static void addCORS(httplib::Response& res) {
 // ── Channel dispatch — O(1) unordered_map (OCP: add channels here only) ───────
 using ChannelFn = std::function<json(const json&)>;
 static const std::unordered_map<std::string, ChannelFn> CHANNEL_DISPATCH = {
-    { "ATM",     processATMTransaction      },
-    { "MOBILE",  processMobileTransaction   },
-    { "POS",     processPOSTransaction      },
-    { "ISSUER",  processIssueCard           },
-    { "ECOM",    processECOMTransaction     },
-    { "QRCODE",  processQRCodePayment       },
-    { "RINGPAY", processRingPayTransaction  },
-    { "CARD_DETAILS", processGetCardDetails },
-    { "ADD_ACCOUNT", processAddAccount      },
-    { "ACCOUNT_DETAILS", processGetAccount  },
-    { "FREEZE_ACCOUNT", processFreezeAccount },
-    { "UNFREEZE_ACCOUNT", processUnfreezeAccount },
-    { "LIST_ACCOUNTS", processListAccounts  },
+    { "ATM",              processATMTransaction      },
+    { "MOBILE",           processMobileTransaction   },
+    { "POS",              processPOSTransaction      },
+    { "ISSUER",           processIssueCard           },
+    { "ECOM",             processECOMTransaction     },
+    { "QRCODE",           processQRCodePayment       },
+    { "RINGPAY",          processRingPayTransaction  },
+    { "CARD_DETAILS",     processGetCardDetails      },
+    { "ADD_ACCOUNT",      processAddAccount          },
+    { "ACCOUNT_DETAILS",  processGetAccount          },
+    { "FREEZE_ACCOUNT",   processFreezeAccount       },
+    { "UNFREEZE_ACCOUNT", processUnfreezeAccount     },
+    { "LIST_ACCOUNTS",    processListAccounts        },
+    { "REVERSAL",         processReversal            },  // timeout / network-loss auto-reversal
 };
 
 // ── Structured logger ─────────────────────────────────────────────────────────
@@ -423,6 +425,7 @@ int main() {
         addCORS(res); res.status = 204;
     };
     svr.Options("/transaction/initiate", optHandler);
+    svr.Options("/reversal/initiate",    optHandler);
     svr.Options("/account/add",           optHandler);
     svr.Options("/account/details",       optHandler);
     svr.Options("/account/freeze",        optHandler);
@@ -591,11 +594,16 @@ int main() {
     );
 
     // ── Account APIs ─────────────────────────────────────────────────────
-    registerJsonPost(svr, "/account/add", "ADD_ACCOUNT", processAddAccount);
-    registerJsonPost(svr, "/account/details", "ACCOUNT_DETAILS", processGetAccount);
-    registerJsonPost(svr, "/account/freeze", "FREEZE_ACCOUNT", processFreezeAccount);
-    registerJsonPost(svr, "/account/unfreeze", "UNFREEZE_ACCOUNT", processUnfreezeAccount);
-    registerJsonPost(svr, "/account/list", "LIST_ACCOUNTS", processListAccounts);
+    registerJsonPost(svr, "/account/add",       "ADD_ACCOUNT",      processAddAccount);
+    registerJsonPost(svr, "/account/details",   "ACCOUNT_DETAILS",  processGetAccount);
+    registerJsonPost(svr, "/account/freeze",    "FREEZE_ACCOUNT",   processFreezeAccount);
+    registerJsonPost(svr, "/account/unfreeze",  "UNFREEZE_ACCOUNT", processUnfreezeAccount);
+    registerJsonPost(svr, "/account/list",      "LIST_ACCOUNTS",    processListAccounts);
+
+    // ── Reversal API ──────────────────────────────────────────────────────
+    // Dedicated endpoint keeps reversal traffic separate from the main
+    // transaction pipeline so a flooded pool cannot block reversal requests.
+    registerJsonPost(svr, "/reversal/initiate", "REVERSAL",         processReversal);
 
     // ── Startup banner ────────────────────────────────────────────────────
     std::cout << "\n";
@@ -606,6 +614,7 @@ int main() {
     std::cout << "║  Thread pool : " << THREAD_POOL_SIZE
               << "   DB pool   : " << POOL_SIZE << "                     ║\n";
     std::cout << "║  POST /transaction/initiate   POST /account/*            ║\n";
+    std::cout << "║  POST /reversal/initiate  (auto-reversal on timeout)     ║\n";
     std::cout << "║  GET  /health  /status  /metrics                        ║\n";
     std::cout << "║  Rate limit: " << RATE_LIMIT_MAX << " req/min per IP                    ║\n";
     std::cout << "╚══════════════════════════════════════════════════════════╝\n\n";
