@@ -54,6 +54,8 @@ add_executable(BankingAPIServer
         pin.cpp
         include/panencrypted.h
         panencrypted.cpp
+        reversal.cpp
+        include/reversal.h
 )
 
 # ── Compiler flags ─────────────────────────────────────────────────────────────
@@ -69,4 +71,19 @@ target_link_libraries(BankingAPIServer
         Threads::Threads       # ← adds -pthread on Linux/macOS
 )
 
-set(CMAKE_BUILD_TYPE Release)   # use Release for production; Debug for development
+
+# ── Build type flags ───────────────────────────────────────────────────────────
+# Do NOT hardcode CMAKE_BUILD_TYPE here — let CLion's Debug/Release toolbar
+# control it so breakpoints and debug symbols work correctly in Debug mode.
+#
+# Debug   → -O0 -g3  (no optimisation, full DWARF symbols → breakpoints work)
+# Release → -O2      (optimised, no debug info → fast production binary)
+
+if(NOT CMAKE_BUILD_TYPE)
+    set(CMAKE_BUILD_TYPE Debug CACHE STRING "Build type" FORCE)
+endif()
+
+target_compile_options(BankingAPIServer PRIVATE
+    $<$<CONFIG:Debug>:   -O0 -g3 -DDEBUG>
+    $<$<CONFIG:Release>: -O2 -DNDEBUG>
+)

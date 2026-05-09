@@ -23,12 +23,14 @@
 #include "falcon.h"
 #include "AccountLockManager.h"
 #include "TransactionLogger.h"
+#include "reversal.h"
 
 #include <iostream>
 #include <sstream>
 #include <random>
 #include <chrono>
 #include <future>
+#include <thread>
 #include <unordered_map>
 #include <functional>
 #include <mysqlx/xdevapi.h>
@@ -395,19 +397,76 @@ json processATMTransaction(const json& data) {
             {{"transactionType", data.value("transactionType", "")}});
         return processATMCore(data);
     });
+
     if (future.wait_for(std::chrono::seconds(ATM_TIMEOUT_SECONDS)) ==
         std::future_status::timeout) {
+
         TransactionLogger::instance().logCurrent(
-            "WARN", "channel_handler_timeout", "ATM transaction handler timeout",
+            "WARN", "channel_handler_timeout", "ATM transaction handler timeout — initiating reversal",
             {{"timeoutSeconds", std::to_string(ATM_TIMEOUT_SECONDS)}});
         trace.fail("ATM transaction timeout");
-        return {
-            {"status",    "DECLINED"},
+
+        // ── Auto-reversal on timeout ──────────────────────────────────────────
+        // We cannot know for certain whether the debit was committed before the
+        // timeout fired.  We conservatively fire a reversal for every timeout
+        // that arrives on a debit-class transaction (WITHDRAWAL).
+        // The reversal engine is idempotent: if the debit never landed, the
+        // account balance will remain correct and the reversal row will still
+        // be written for audit purposes.
+        // ─────────────────────────────────────────────────────────────────────
+        std::string txnType = data.value("transactionType", "");
+        if (txnType == "WITHDRAWAL") {
+            json rev;
+            // originalTransactionId is unknown at timeout — use a placeholder
+            // so the drop-file / reversal record can be reconciled later.
+            rev["originalTransactionId"] = data.value("clientTxnId",
+                                           "atm-timeout-" + uuid);
+            rev["originalTableName"]     = "transaction_atm";
+            rev["originalReferenceId"]   = 0;          // unknown at timeout
+            rev["accountNumber"]         = "";          // filled below if available
+            rev["amount"]                = data.value("amount", 0.0);
+            rev["fee"]                   = data.value("fee",    0.0);
+            rev["channel"]               = "ATM";
+            rev["reason"]                = "TIMEOUT";
+            rev["clientTxnId"]           = data.value("clientTxnId", "");
+            rev["cardPan"]               = "";          // PAN already decrypted in core
+            rev["_correlationUuid"]      = uuid;
+
+            // Attempt to resolve account number from card info in data
+            // (best-effort — may be empty if card lookup also timed out)
+            if (data.contains("_resolvedAccountNumber")) {
+                rev["accountNumber"] = data["_resolvedAccountNumber"];
+            }
+
+            TransactionLogger::instance().logCurrent(
+                "WARN", "atm_timeout_reversal_triggered",
+                "Firing reversal due to ATM timeout",
+                {{"originalTxnId", rev["originalTransactionId"].get<std::string>()},
+                 {"amount",        std::to_string(data.value("amount", 0.0))}});
+
+            // Fire-and-forget reversal (non-blocking from caller perspective)
+            std::thread([rev, uuid]() {
+                TransactionLogger::ScopedContext revScope(uuid, "REVERSAL");
+                json reversalResult = processReversal(rev);
+                TransactionLogger::instance().logCurrent(
+                    reversalResult.value("status","") == "REVERSED" ? "INFO" : "WARN",
+                    "atm_timeout_reversal_result",
+                    "Reversal result after ATM timeout",
+                    {{"reversalId", reversalResult.value("reversalId", "")},
+                     {"status",     reversalResult.value("status",     "")},
+                     {"errorCode",  reversalResult.value("errorCode",  "")}});
+            }).detach();
+        }
+
+        return json{
+            {"status",    "TIMEOUT"},
             {"errorCode", "ERR_TIMEOUT"},
             {"message",   "ATM transaction timeout (>" +
-                           std::to_string(ATM_TIMEOUT_SECONDS) + "s)"}
+                           std::to_string(ATM_TIMEOUT_SECONDS) +
+                           "s) — reversal initiated if debit was committed"}
         };
     }
+
     json result = future.get();
     TransactionLogger::instance().logCurrent(
         "INFO", "channel_handler_finished", "ATM transaction handler finished",

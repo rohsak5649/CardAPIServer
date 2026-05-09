@@ -27,12 +27,27 @@
  * 5. Central Transaction Registry:
  *    • transactions → Master table linking all channel transactions
  *
+ * 6. Reversal Engine:
+ *    • transaction_reversal → Per-reversal detail rows written when DB is UP.
+ *                             Linked to the originating channel table via
+ *                             original_table_name + original_reference_id and
+ *                             to the master registry via transactions.
+ *    • reversal_drop_file  → Offline queue. Written when the DB is DOWN at
+ *                             reversal time. A background retry worker polls
+ *                             PENDING rows and replays them via processReversal()
+ *                             once the DB recovers.
+ *
+ * NOTE: channel tables that carry `reversal_status` column track whether a
+ *       particular debit row has been reversed.  See ALTER TABLE statements
+ *       at the bottom of this file.
+ *
  * Architecture ensures:
  * • Channel isolation
  * • Secure tokenization
  * • Fraud monitoring
  * • Transaction traceability
  * • Scalable payment processing
+ * • Automatic debit reversal with DB-down resilience
  */
 CREATE TABLE `accounts` (
                             `account_id` int NOT NULL AUTO_INCREMENT,
@@ -224,3 +239,107 @@ CREATE TABLE `transactions` (
                                 `created_at` timestamp NULL DEFAULT CURRENT_TIMESTAMP,
                                 PRIMARY KEY (`id`)
 ) ENGINE=InnoDB AUTO_INCREMENT=1 DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- 6. Reversal Tables
+--    • transaction_reversal  — per-reversal detail record (DB is UP path)
+--    • reversal_drop_file    — offline queue when DB is DOWN (retry later)
+-- ─────────────────────────────────────────────────────────────────────────────
+
+CREATE TABLE `transaction_reversal` (
+    `id`                       bigint        NOT NULL AUTO_INCREMENT,
+    `reversal_transaction_id`  varchar(60)   NOT NULL COMMENT 'Generated reversal TxnId (rev-…)',
+    `client_txn_id`            varchar(60)   DEFAULT NULL,
+    `original_transaction_id`  varchar(60)   NOT NULL COMMENT 'TxnId of the original debit',
+    `original_table_name`      varchar(50)   NOT NULL COMMENT 'Channel table of the original txn e.g. transaction_atm',
+    `original_reference_id`    bigint        NOT NULL COMMENT 'Auto-increment id in the original channel table',
+    `channel`                  varchar(20)   NOT NULL COMMENT 'Originating channel: ATM / POS / MOBILE / ECOM …',
+    `account_number`           varchar(30)   NOT NULL,
+    `amount`                   decimal(12,2) NOT NULL COMMENT 'Original deducted amount being reversed',
+    `fee`                      decimal(10,2) NOT NULL DEFAULT '0.00' COMMENT 'Original fee being reversed',
+    `card_pan`                 varchar(20)   DEFAULT NULL,
+    `card_scheme`              varchar(20)   DEFAULT NULL,
+    `reason`                   varchar(100)  NOT NULL DEFAULT 'TIMEOUT' COMMENT 'TIMEOUT / NETWORK_ERROR / MANUAL …',
+    `status`                   varchar(20)   NOT NULL DEFAULT 'REVERSED',
+    `message`                  varchar(255)  DEFAULT NULL,
+    `created_at`               timestamp     NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (`id`),
+    UNIQUE KEY `uq_reversal_txn_id` (`reversal_transaction_id`),
+    KEY `idx_rev_original_txn`      (`original_transaction_id`),
+    KEY `idx_rev_account`           (`account_number`),
+    KEY `idx_rev_original_ref`      (`original_table_name`, `original_reference_id`)
+) ENGINE=InnoDB AUTO_INCREMENT=1 DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci
+  COMMENT='Reversal records for transactions where money was deducted but response was not received';
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- reversal_drop_file — offline queue written when DB is unreachable at the
+-- time of reversal.  A background worker polls PENDING rows and replays them
+-- by calling processReversal() once the DB recovers.
+-- ─────────────────────────────────────────────────────────────────────────────
+
+CREATE TABLE `reversal_drop_file` (
+    `id`                       bigint        NOT NULL AUTO_INCREMENT,
+    `reversal_id`              varchar(60)   NOT NULL COMMENT 'Pre-generated reversal ID',
+    `original_transaction_id`  varchar(60)   NOT NULL,
+    `original_table_name`      varchar(50)   NOT NULL,
+    `original_reference_id`    bigint        NOT NULL,
+    `channel`                  varchar(20)   NOT NULL,
+    `account_number`           varchar(30)   NOT NULL,
+    `amount`                   decimal(12,2) NOT NULL,
+    `fee`                      decimal(10,2) NOT NULL DEFAULT '0.00',
+    `reason`                   varchar(100)  NOT NULL DEFAULT 'TIMEOUT',
+    `raw_payload`              mediumtext    DEFAULT NULL COMMENT 'Full JSON payload for replay',
+    `retry_status`             varchar(20)   NOT NULL DEFAULT 'PENDING'
+                                             COMMENT 'PENDING | RETRYING | REPLAYED | FAILED',
+    `retry_count`              int           NOT NULL DEFAULT '0',
+    `last_retry_at`            timestamp     NULL DEFAULT NULL,
+    `replayed_reversal_id`     varchar(60)   DEFAULT NULL COMMENT 'reversal_transaction_id after successful replay',
+    `created_at`               timestamp     NULL DEFAULT CURRENT_TIMESTAMP,
+    `updated_at`               timestamp     NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    PRIMARY KEY (`id`),
+    UNIQUE KEY `uq_drop_reversal_id`    (`reversal_id`),
+    KEY `idx_drop_retry_status`         (`retry_status`),
+    KEY `idx_drop_account`              (`account_number`),
+    KEY `idx_drop_original_txn`         (`original_transaction_id`)
+) ENGINE=InnoDB AUTO_INCREMENT=1 DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci
+  COMMENT='Offline queue for reversals that could not be committed when the DB was down';
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- ALTER existing channel tables to add reversal_status column.
+-- Uses a stored procedure + INFORMATION_SCHEMA check because
+-- "ADD COLUMN IF NOT EXISTS" requires MySQL 8.0.3+ and may not be available
+-- on all patch levels.  This approach is safe on any MySQL 8.0.x build.
+-- ─────────────────────────────────────────────────────────────────────────────
+
+DROP PROCEDURE IF EXISTS _add_reversal_status;
+
+DELIMITER $$
+CREATE PROCEDURE _add_reversal_status(IN tbl VARCHAR(64))
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1
+        FROM   INFORMATION_SCHEMA.COLUMNS
+        WHERE  TABLE_SCHEMA = DATABASE()
+          AND  TABLE_NAME   = tbl
+          AND  COLUMN_NAME  = 'reversal_status'
+    ) THEN
+        SET @sql = CONCAT(
+            'ALTER TABLE `', tbl, '` ',
+            'ADD COLUMN `reversal_status` varchar(20) NOT NULL DEFAULT ''NA'' ',
+            'COMMENT ''NA | REVERSED'' AFTER `message`'
+        );
+        PREPARE stmt FROM @sql;
+        EXECUTE stmt;
+        DEALLOCATE PREPARE stmt;
+    END IF;
+END$$
+DELIMITER ;
+
+-- transaction_ringpay already has reversal_status — excluded from list below.
+CALL _add_reversal_status('transaction_atm');
+CALL _add_reversal_status('transaction_pos');
+CALL _add_reversal_status('transaction_mobile');
+CALL _add_reversal_status('transaction_ecom');
+CALL _add_reversal_status('transaction_qrcode');
+
+DROP PROCEDURE IF EXISTS _add_reversal_status;
