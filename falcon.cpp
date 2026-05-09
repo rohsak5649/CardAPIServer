@@ -274,6 +274,44 @@ int Falcon::countRows_(const std::string& sql, const std::string& acc) {
 bool Falcon::sameSecond_(std::string_view acc, std::string_view table) {
     TransactionLogger::ScopedFunctionTrace trace("Falcon::sameSecond_",
                                                  {{"table", std::string(table)}});
+                                                 
+    // ── O(1) Time Complexity Check using LRU Cache (Linked List + STL Map) ─────
+    std::string cacheKey = std::string(acc) + "|" + std::string(table);
+    auto now = std::chrono::steady_clock::now();
+
+    {
+        std::lock_guard<std::mutex> lock(lruMutex_);
+        auto it = lruMap_.find(cacheKey);
+        if (it != lruMap_.end()) {
+            auto timeDiff = std::chrono::duration_cast<std::chrono::milliseconds>(now - it->second->timestamp).count();
+            if (timeDiff <= 1000) { // Within 1 second
+                // Duplicate found in O(1) time
+                if (policy_ == EvictionPolicy::LRU_POLICY) {
+                    lruList_.splice(lruList_.begin(), lruList_, it->second); // Move to front
+                }
+                trace.success({{"matched", "true"}, {"source", "cache_hit"}});
+                return true; 
+            } else {
+                // Expired, update timestamp and move to front
+                it->second->timestamp = now;
+                if (policy_ == EvictionPolicy::LRU_POLICY) {
+                    lruList_.splice(lruList_.begin(), lruList_, it->second);
+                }
+            }
+        } else {
+            // Not found, insert new entry at the front
+            lruList_.push_front({cacheKey, now});
+            lruMap_[cacheKey] = lruList_.begin();
+
+            if (lruMap_.size() > MAX_CACHE_SIZE) {
+                auto last = std::prev(lruList_.end());
+                lruMap_.erase(last->cacheKey);
+                lruList_.pop_back(); // Evict Least Recently Used (O(1) deletion)
+            }
+        }
+    }
+
+    // ── Fallback to Database Query (Existing Logic Preserved) ─────────────────
     std::string sql =
         "SELECT 1 FROM " + std::string(table) +
         " WHERE account_number = ?"
@@ -281,7 +319,7 @@ bool Falcon::sameSecond_(std::string_view acc, std::string_view table) {
     try {
         auto res = sess_.sql(sql).bind(std::string(acc)).execute();
         bool matched = res.count() > 0;
-        trace.success({{"matched", matched ? "true" : "false"}});
+        trace.success({{"matched", matched ? "true" : "false"}, {"source", "db"}});
         return matched;
     } catch (...) {
         trace.fail("same-second fraud query failed");
