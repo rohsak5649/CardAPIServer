@@ -21,6 +21,8 @@
 #include "pin.h"
 #include "AccountLockManager.h"
 #include "TransactionLogger.h"
+#include "accounting.h"
+#include "currency_converter.h"
 
 #include <chrono>
 #include <functional>
@@ -167,6 +169,25 @@ struct POSContext {
       return {{"status", "DECLINED"}, {"message", fraudReason}};
     }
 
+    // DCC Support
+    std::string reqCurrency = data.value("currency", "AUD");
+    double fxMarkup = 0.0;
+    double fxRate = 1.0;
+    std::string accCurrency = ctx.accounts.select("currency")
+                              .where("account_number=:a")
+                              .bind("a", accNo)
+                              .execute()
+                              .fetchOne()[0]
+                              .get<std::string>();
+
+    if (accCurrency != reqCurrency) {
+        auto fxRes = CurrencyConverter::convertToBase(reqCurrency, amount, *ctx.sess);
+        amount = fxRes.convertedAmount;
+        fxMarkup = fxRes.bankMarkupAmount;
+        fxRate = fxRes.fxRate;
+        trace.success({{"convertedAmount", std::to_string(amount)}, {"fxRate", std::to_string(fxRate)}});
+    }
+
     AccountLockManager::ScopedLock accLock(AccountLockManager::getInstance(), accNo, TxnPriority::DEBIT);
 
     double balance = ctx.accounts.select("balance")
@@ -206,6 +227,8 @@ struct POSContext {
       ctx.master.insert("table_name", "reference_id", "status")
           .values("transaction_pos", ins.getAutoIncrementValue(), "SUCCESS")
           .execute();
+
+      Accounting::processPurchaseLedger(txnId, accNo, merchantId, amount, fee, fxMarkup, "POS Purchase", *ctx.sess);
 
       ctx.sess->commit();
 
@@ -271,6 +294,7 @@ struct POSContext {
     double purchAmt = p[1].get<double>();
     std::string acc = p[2].get<std::string>();
     std::string pan = p[3].get<std::string>();
+    double refAmt = p[4].isNull() ? 0.0 : p[4].get<double>();
     std::string flag = p[5].get<std::string>();
     std::string msg = p[6].get<std::string>();
 
@@ -278,13 +302,14 @@ struct POSContext {
       trace.fail("invalid refund source");
       return err("ERR_INVALID_REFUND_SOURCE");
     }
-    if (flag != "N") {
-      trace.fail("purchase already refunded", {{"flag", flag}});
+    if (flag == "RF") {
+      trace.fail("purchase already fully refunded", {{"flag", flag}});
       return err("ERR_ALREADY_REFUNDED");
     }
-    if (amount <= 0 || amount > purchAmt) {
+    if (amount <= 0 || amount + refAmt > purchAmt) {
       trace.fail("invalid refund amount",
                  {{"amount", std::to_string(amount)},
+                  {"refundedAmount", std::to_string(refAmt)},
                   {"purchaseAmount", std::to_string(purchAmt)}});
       return err("ERR_INVALID_REFUND_AMOUNT");
     }
@@ -319,11 +344,11 @@ struct POSContext {
           .bind("a", acc)
           .execute();
 
-      std::string newFlag = (amount == purchAmt) ? "RF" : "PR";
+      std::string newFlag = (amount + refAmt == purchAmt) ? "RF" : "PR";
       ctx.sess
           ->sql(
               "UPDATE transaction_pos SET refunded_amount=?,flag=? WHERE id=?")
-          .bind(amount)
+          .bind(amount + refAmt)
           .bind(newFlag)
           .bind(id)
           .execute();
@@ -341,6 +366,8 @@ struct POSContext {
       ctx.master.insert("table_name", "reference_id", "status")
           .values("transaction_pos", ins.getAutoIncrementValue(), "SUCCESS")
           .execute();
+
+      Accounting::processRefundLedger(txnId, acc, merchantId, netRefund, "POS Refund", *ctx.sess);
 
       ctx.sess->commit();
       trace.success({{"transactionId", txnId}, {"netRefund", std::to_string(netRefund)}});

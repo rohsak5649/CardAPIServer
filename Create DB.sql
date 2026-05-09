@@ -343,3 +343,72 @@ CALL _add_reversal_status('transaction_ecom');
 CALL _add_reversal_status('transaction_qrcode');
 
 DROP PROCEDURE IF EXISTS _add_reversal_status;
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- 8. Idempotency Keys (Prevent Double Charging)
+-- ─────────────────────────────────────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS `idempotency_keys` (
+    `idempotency_key` varchar(100) NOT NULL,
+    `request_path` varchar(100) NOT NULL,
+    `status` varchar(20) NOT NULL COMMENT 'IN_PROGRESS, COMPLETED, FAILED',
+    `response_code` int DEFAULT NULL,
+    `response_body` json DEFAULT NULL,
+    `created_at` timestamp NULL DEFAULT CURRENT_TIMESTAMP,
+    `updated_at` timestamp NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    PRIMARY KEY (`idempotency_key`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- 9. Double Entry Ledger System
+-- ─────────────────────────────────────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS `ledger_accounts` (
+    `ledger_id` int NOT NULL AUTO_INCREMENT,
+    `account_number` varchar(30) DEFAULT NULL,
+    `account_name` varchar(100) NOT NULL,
+    `account_type` varchar(20) NOT NULL,
+    `balance` decimal(15,2) DEFAULT '0.00',
+    `currency` char(3) NOT NULL DEFAULT 'AUD',
+    `created_at` timestamp NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (`ledger_id`),
+    UNIQUE KEY `uq_ledger_account` (`account_number`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
+
+CREATE TABLE IF NOT EXISTS `ledger_entries` (
+    `entry_id` bigint NOT NULL AUTO_INCREMENT,
+    `transaction_id` varchar(64) NOT NULL,
+    `ledger_id` int NOT NULL,
+    `amount` decimal(15,2) NOT NULL COMMENT 'Positive for Credit, Negative for Debit',
+    `entry_type` varchar(10) NOT NULL COMMENT 'DEBIT or CREDIT',
+    `description` varchar(255) DEFAULT NULL,
+    `created_at` timestamp NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (`entry_id`),
+    KEY `idx_ledger_txn` (`transaction_id`),
+    KEY `idx_ledger_acc` (`ledger_id`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- 10. Dynamic Currency Conversion (FX Rates)
+-- ─────────────────────────────────────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS `exchange_rates` (
+    `base_currency` char(3) NOT NULL,
+    `target_currency` char(3) NOT NULL,
+    `rate` decimal(10,6) NOT NULL,
+    `updated_at` timestamp NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    PRIMARY KEY (`base_currency`, `target_currency`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
+
+-- Insert Mock Exchange Rates (Base Currency to AUD)
+INSERT IGNORE INTO exchange_rates (base_currency, target_currency, rate) VALUES 
+('USD', 'AUD', 1.520000),
+('EUR', 'AUD', 1.650000),
+('GBP', 'AUD', 1.900000),
+('JPY', 'AUD', 0.010000),
+('NZD', 'AUD', 0.920000),
+('INR', 'AUD', 0.018000),
+('AUD', 'USD', 0.657894);
+
+-- Insert Internal Bank Ledger Accounts
+INSERT IGNORE INTO ledger_accounts (account_number, account_name, account_type, currency) VALUES 
+('BANK_FEE_REV', 'Bank Fee Revenue', 'REVENUE', 'AUD'),
+('BANK_FX_REV', 'Bank FX Revenue', 'REVENUE', 'AUD'),
+('BANK_MERCHANT_SETT', 'Merchant Settlement Suspense', 'LIABILITY', 'AUD');

@@ -56,6 +56,18 @@ add_executable(BankingAPIServer
         panencrypted.cpp
         reversal.cpp
         include/reversal.h
+        idempotency.cpp
+        include/idempotency.h
+        currency_converter.cpp
+        include/currency_converter.h
+        accounting.cpp
+        include/accounting.h
+        auth.cpp
+        include/auth.h
+        card_mgmt.cpp
+        include/card_mgmt.h
+        tds.cpp
+        include/tds.h
 )
 
 # ── Compiler flags ─────────────────────────────────────────────────────────────

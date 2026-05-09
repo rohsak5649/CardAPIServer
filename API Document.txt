@@ -1,5 +1,5 @@
 =========================================================
- PAYMENT SWITCHING ENGINE  v3.1  — API DOCUMENT
+ PAYMENT SWITCHING ENGINE  v3.2  — API DOCUMENT
 =========================================================
 
 ⚠️  IMPORTANT WORKFLOW — READ FIRST
@@ -11,24 +11,62 @@
    with the plain PAN (shown in DB), then use that PIN string
 
 DO NOT hardcode expiry — it is generated dynamically
-(current cards = 04/31). Using a wrong expiry = CARD NOT FOUND.
+(current cards = 05/31). Using a wrong expiry = CARD NOT FOUND.
+
+⚠️  AUTHENTICATION — REQUIRED ON ALL REQUESTS
+---------------------------------------------------------
+All endpoints require ONE of the following headers:
+
+  Option A (API Key — direct DB lookup):
+    X-API-Key: sk_admin_ROHAN_MASTER_9649
+
+  Option B (JWT Bearer — stateless, 1-hour expiry):
+    Authorization: Bearer <token from POST /auth/token>
+
+Available API Keys (seed data):
+  sk_admin_ROHAN_MASTER_9649   → ADMIN       (all channels)
+  sk_merchant_POS_MCH001       → MERCHANT    (POS, ECOM, QRCODE, RINGPAY, 3DS)
+  sk_terminal_ATM_4455         → TERMINAL    (ATM, POS only)
+  sk_issuer_BANK_CORE          → ISSUER_ROLE (ISSUER, CARD_*, account mgmt)
+  sk_mobile_APP_USER1          → MOBILE_USER (MOBILE, CARD_RESET_PIN)
+
+=========================================================
+ AUTH — EXCHANGE API KEY FOR JWT TOKEN
+=========================================================
+POST /auth/token
+X-API-Key: sk_admin_ROHAN_MASTER_9649
+
+(No request body required)
+
+Response:
+{
+  "token":     "<JWT to use in Authorization header>",
+  "role":      "ADMIN",
+  "owner":     "Rohan Sakhare - Admin",
+  "expiresIn": 3600,
+  "tokenType": "Bearer"
+}
+
+Use the token as:   Authorization: Bearer <token>
 
 =========================================================
  ADD NEW ACCOUNT
 =========================================================
 POST /account/add
+X-API-Key: sk_issuer_BANK_CORE
 
 {
   "accountNumber": "AU1234567890",
   "balance": 10000.00,
   "countryCode": "AU",
-  "currencyId": 1,
+  "currencyCode": "AUD",
   "isFrozen": false
 }
 
-Alternative through existing router:
+Alternative through transaction router:
 
 POST /transaction/initiate
+X-API-Key: sk_issuer_BANK_CORE
 
 {
   "channelId": "ADD_ACCOUNT",
@@ -41,87 +79,21 @@ POST /transaction/initiate
   }
 }
 
-Required:
-accountNumber and either currencyId or currencyCode.
-
-Response:
-{
-  "status": "SUCCESS",
-  "message": "Account added successfully",
-  "account": {
-    "accountId": 1,
-    "accountNumber": "AU1234567890",
-    "balance": 10000.00,
-    "countryCode": "AU",
-    "isFrozen": false,
-    "currency": {
-      "currencyId": 1,
-      "currencyCode": "AUD",
-      "currencyName": "Australian Dollar"
-    }
-  }
-}
-
 =========================================================
- ACCOUNT DETAILS
+ ACCOUNT DETAILS / FREEZE / UNFREEZE / LIST
 =========================================================
-POST /account/details
+POST /account/details       { "accountNumber": "AU1234567890" }
+POST /account/freeze        { "accountNumber": "AU1234567890" }
+POST /account/unfreeze      { "accountNumber": "AU1234567890" }
+POST /account/list          { "limit": 50, "offset": 0 }
 
-{
-  "accountNumber": "AU1234567890"
-}
-
-Alternative through existing router:
-
-{
-  "channelId": "ACCOUNT_DETAILS",
-  "data": {
-    "accountNumber": "AU1234567890"
-  }
-}
-
-=========================================================
- FREEZE / UNFREEZE ACCOUNT
-=========================================================
-POST /account/freeze
-
-{
-  "accountNumber": "AU1234567890"
-}
-
-POST /account/unfreeze
-
-{
-  "accountNumber": "AU1234567890"
-}
-
-Alternative channel IDs:
-FREEZE_ACCOUNT and UNFREEZE_ACCOUNT
-
-=========================================================
- LIST ACCOUNTS
-=========================================================
-POST /account/list
-
-{
-  "limit": 50,
-  "offset": 0
-}
-
-Alternative through existing router:
-
-{
-  "channelId": "LIST_ACCOUNTS",
-  "data": {
-    "limit": 50,
-    "offset": 0
-  }
-}
+All require:  X-API-Key: sk_issuer_BANK_CORE  (or ADMIN)
 
 =========================================================
  ISSUE NEW CARD
 =========================================================
 POST /transaction/initiate
+X-API-Key: sk_issuer_BANK_CORE
 
 {
   "channelId": "ISSUER",
@@ -138,10 +110,10 @@ Response (use these values in all transaction requests):
   "priorityAssigned": "PRIMARY",
   "card": {
     "maskedPan":    "550000XXXXXXXXXX",
-    "encryptedPan": "<copy this into pan field of transaction requests>",
+    "encryptedPan": "<copy this into pan field>",
     "scheme":       "MASTERCARD",
     "cardType":     "INTERNATIONAL",
-    "expiry":       "04/31",   ← copy this exact value
+    "expiry":       "05/31",
     "cvv":          "xxx",
     "cardholderName": "Dada Sakhare",
     "accountNumber":  "AU1234567890"
@@ -150,8 +122,93 @@ Response (use these values in all transaction requests):
 }
 
 =========================================================
- POS — PURCHASE
+ CARD LIFECYCLE — ACTIVATE
 =========================================================
+POST /card/activate
+X-API-Key: sk_issuer_BANK_CORE
+
+{
+  "encryptedPan": "<encryptedPan from issue response>"
+}
+
+Response:
+{
+  "status": "SUCCESS",
+  "message": "Card activated successfully"
+}
+
+Note: PERMANENTLY blocked cards cannot be re-activated.
+
+=========================================================
+ CARD LIFECYCLE — BLOCK
+=========================================================
+POST /card/block
+X-API-Key: sk_issuer_BANK_CORE
+
+{
+  "encryptedPan": "<encryptedPan from issue response>",
+  "blockType":    "TEMPORARY"   // or "PERMANENT"
+}
+
+blockType:
+  TEMPORARY  — card can be re-activated later via /card/activate
+  PERMANENT  — irreversible block (lost/stolen)
+
+Response:
+{
+  "status":    "SUCCESS",
+  "message":   "Card blocked successfully",
+  "blockType": "TEMPORARY"
+}
+
+=========================================================
+ CARD LIFECYCLE — SET SPENDING LIMITS
+=========================================================
+POST /card/set_limit
+X-API-Key: sk_issuer_BANK_CORE
+
+{
+  "encryptedPan":  "<encryptedPan from issue response>",
+  "dailyLimit":    5000.00,
+  "monthlyLimit":  50000.00
+}
+
+Both fields are optional — send only what you want to update.
+
+Response:
+{
+  "status":       "SUCCESS",
+  "message":      "Card limits updated successfully",
+  "dailyLimit":   5000.00,
+  "monthlyLimit": 50000.00
+}
+
+=========================================================
+ CARD LIFECYCLE — RESET PIN
+=========================================================
+POST /card/reset_pin
+X-API-Key: sk_mobile_APP_USER1
+
+{
+  "encryptedPan": "<encryptedPan from issue response>",
+  "expiry":       "05/31",
+  "newPin":       "<generated PIN from offline tool>"
+}
+
+Note: PIN is PAN-derived using HMAC. The offline tool generates
+      the correct PIN. This endpoint verifies it matches the PAN.
+
+Response:
+{
+  "status":  "SUCCESS",
+  "message": "PIN reset verified — your new PIN is now active"
+}
+
+=========================================================
+ POS — PURCHASE (WITH DCC SUPPORT)
+=========================================================
+POST /transaction/initiate
+X-API-Key: sk_merchant_POS_MCH001
 
 {
   "channelId": "POS",
@@ -162,20 +219,25 @@ Response (use these values in all transaction requests):
     "terminalId": "TERM-7788",
     "location": "Sydney Mall",
     "amount": 100.00,
-    "fee": 20.00,
-    "currency": "AUD",
+    "fee": 10.00,
+    "currency": "USD",
     "card": {
       "pan":    "<encryptedPan from issue response>",
       "pin":    "<generated PIN from offline tool>",
-      "expiry": "04/31",
+      "expiry": "05/31",
       "cvv":    "617"
     }
   }
 }
 
+DCC: If currency != account currency, the engine auto-converts
+     using the exchange_rates table and applies a 2% FX markup.
+
 =========================================================
- POS — REFUND
+ POS — REFUND (PARTIAL OR FULL)
 =========================================================
+POST /transaction/initiate
+X-API-Key: sk_merchant_POS_MCH001
 
 {
   "channelId": "POS",
@@ -185,18 +247,24 @@ Response (use these values in all transaction requests):
     "origTransactionId": "<transactionId from purchase response>",
     "merchantId": "MCH-POS-001",
     "terminalId": "TERM-7788",
-    "amount": 100.00,
+    "amount": 20.00,
     "card": {
       "pan":    "<encryptedPan from issue response>",
       "pin":    "<generated PIN from offline tool>",
-      "expiry": "04/31"
+      "expiry": "05/31"
     }
   }
 }
 
+Partial Refund: Set amount < original. flag becomes "PR".
+Full Refund:    Set amount = original. flag becomes "RF".
+Re-refunding a fully refunded (RF) txn returns ERR_ALREADY_REFUNDED.
+
 =========================================================
- ECOM — PURCHASE
+ ECOM — PURCHASE (WITH DCC SUPPORT)
 =========================================================
+POST /transaction/initiate
+X-API-Key: sk_merchant_POS_MCH001
 
 {
   "channelId": "ECOM",
@@ -207,19 +275,21 @@ Response (use these values in all transaction requests):
     "orderId": "ORD-SECURE-3001",
     "amount": 100.99,
     "fee": 0.50,
-    "currency": "AUD",
+    "currency": "EUR",
     "card": {
       "pan":    "<encryptedPan from issue response>",
       "pin":    "<generated PIN from offline tool>",
-      "expiry": "04/31",
+      "expiry": "05/31",
       "cvv":    "905"
     }
   }
 }
 
 =========================================================
- ECOM — REFUND
+ ECOM — REFUND (PARTIAL OR FULL)
 =========================================================
+POST /transaction/initiate
+X-API-Key: sk_merchant_POS_MCH001
 
 {
   "channelId": "ECOM",
@@ -227,19 +297,79 @@ Response (use these values in all transaction requests):
     "clientTxnId": "ecom-ref-3002",
     "transactionType": "REFUND",
     "origClientTxnId": "<clientTxnId of the original purchase>",
-    "amount": 100.99,
+    "amount": 50.00,
     "currency": "AUD",
     "card": {
       "pan":    "<encryptedPan from issue response>",
       "pin":    "<generated PIN from offline tool>",
-      "expiry": "04/31"
+      "expiry": "05/31"
     }
   }
 }
 
 =========================================================
+ 3D SECURE — STEP 1: INITIATE CHALLENGE
+=========================================================
+POST /transaction/initiate
+X-API-Key: sk_merchant_POS_MCH001
+
+{
+  "channelId": "3DS_INITIATE",
+  "data": {
+    "clientTxnId": "ecom-3ds-5001",
+    "merchantId":  "MCH-ECOM-55",
+    "amount": 250.00,
+    "fee": 0.00,
+    "currency": "AUD",
+    "card": {
+      "pan":    "<encryptedPan from issue response>",
+      "expiry": "05/31",
+      "cvv":    "905"
+    }
+  }
+}
+
+Response:
+{
+  "status":           "CHALLENGE_REQUIRED",
+  "challengeId":      "3DS-1746801234-56789",
+  "otpHint":          "492817",    ← In production goes via SMS. Shown here for testing.
+  "redirectUrl":      "http://localhost:8080/3ds/verify",
+  "expiresInSeconds": 600,
+  "message":          "OTP sent to registered mobile. Submit to /3ds/verify."
+}
+
+=========================================================
+ 3D SECURE — STEP 2: VERIFY OTP & COMPLETE PAYMENT
+=========================================================
+POST /3ds/verify
+X-API-Key: sk_merchant_POS_MCH001
+
+{
+  "challengeId": "3DS-1746801234-56789",
+  "otp":         "492817"
+}
+
+Response (same as ECOM purchase response):
+{
+  "transactionId":  "ecom-txn-...",
+  "status":         "SUCCESS",
+  "balanceAfter":   9749.00,
+  "threeDSStatus":  "AUTHENTICATED",
+  "challengeId":    "3DS-1746801234-56789"
+}
+
+OTP errors:
+  ERR_CHALLENGE_NOT_FOUND — bad challengeId
+  ERR_CHALLENGE_USED      — already verified or expired
+  ERR_OTP_EXPIRED         — 10-minute window passed
+  ERR_INVALID_OTP         — wrong OTP
+
+=========================================================
  MOBILE BANKING — FUND TRANSFER
 =========================================================
+POST /transaction/initiate
+X-API-Key: sk_mobile_APP_USER1
 
 {
   "channelId": "MOBILE",
@@ -261,6 +391,8 @@ Response (use these values in all transaction requests):
 =========================================================
  ATM — WITHDRAWAL
 =========================================================
+POST /transaction/initiate
+X-API-Key: sk_terminal_ATM_4455
 
 {
   "channelId": "ATM",
@@ -272,7 +404,7 @@ Response (use these values in all transaction requests):
     "location": "Mumbai-Andheri",
     "card": {
       "pan":    "<encryptedPan from issue response>",
-      "expiry": "04/31"
+      "expiry": "05/31"
     },
     "pin":    "<generated PIN from offline tool>",
     "amount": 500.00,
@@ -283,6 +415,8 @@ Response (use these values in all transaction requests):
 =========================================================
  ATM — DEPOSIT
 =========================================================
+POST /transaction/initiate
+X-API-Key: sk_terminal_ATM_4455
 
 {
   "channelId": "ATM",
@@ -294,7 +428,7 @@ Response (use these values in all transaction requests):
     "location": "Mumbai-Andheri",
     "card": {
       "pan":    "<encryptedPan from issue response>",
-      "expiry": "04/31"
+      "expiry": "05/31"
     },
     "pin":    "<generated PIN from offline tool>",
     "amount": 3000.00,
@@ -305,12 +439,14 @@ Response (use these values in all transaction requests):
 =========================================================
  RINGPAY — CONTACTLESS PAYMENT
 =========================================================
+POST /transaction/initiate
+X-API-Key: sk_merchant_POS_MCH001
 
 {
   "channelId": "RINGPAY",
   "data": {
     "pan":       "<encryptedPan from issue response>",
-    "expiry":    "04/31",
+    "expiry":    "05/31",
     "amount":    500.00,
     "fee":       5.00,
     "deviceId":  "RING-DEVICE-001",
@@ -322,6 +458,8 @@ Response (use these values in all transaction requests):
 =========================================================
  GET CARD DETAILS
 =========================================================
+POST /transaction/initiate
+X-API-Key: sk_issuer_BANK_CORE
 
 {
   "channelId": "CARD_DETAILS",
@@ -337,32 +475,91 @@ Response:
     "pan": "550000XXXXXXXXXX",
     "scheme": "MASTERCARD",
     "cardType": "INTERNATIONAL",
-    "expiry": "04/31",
+    "expiry": "05/31",
     "cvv": "xxx",
     "cardholderName": "Dada Sakhare",
     "accountNumber": "AU1234567890",
     "cardStatus": "ACTIVE",
     "cardPriority": "PRIMARY",
     "maskedPan": "550000********1234",
-    "encryptedPan": "<encryptedPan>"
+    "encryptedPan": "<encryptedPan>",
+    "dailyLimit": 10000.00,
+    "monthlyLimit": 100000.00
   }
 }
+
+=========================================================
+ RBAC — ROLE PERMISSION MATRIX
+=========================================================
+
+Channel              ADMIN  MERCHANT  TERMINAL  ISSUER_ROLE  MOBILE_USER
+-------------------  -----  --------  --------  -----------  -----------
+ATM                    ✅      ❌        ✅          ❌           ❌
+POS                    ✅      ✅        ✅          ❌           ❌
+ECOM                   ✅      ✅        ❌          ❌           ❌
+MOBILE                 ✅      ❌        ❌          ❌           ✅
+QRCODE                 ✅      ✅        ❌          ❌           ❌
+RINGPAY                ✅      ✅        ❌          ❌           ❌
+REVERSAL               ✅      ✅        ❌          ❌           ❌
+ISSUER                 ✅      ❌        ❌          ✅           ❌
+CARD_DETAILS           ✅      ❌        ❌          ✅           ❌
+CARD_ACTIVATE          ✅      ❌        ❌          ✅           ❌
+CARD_BLOCK             ✅      ❌        ❌          ✅           ❌
+CARD_SET_LIMIT         ✅      ❌        ❌          ✅           ❌
+CARD_RESET_PIN         ✅      ❌        ❌          ❌           ✅
+3DS_INITIATE           ✅      ✅        ❌          ❌           ❌
+ADD_ACCOUNT            ✅      ❌        ❌          ✅           ❌
+ACCOUNT_DETAILS        ✅      ✅        ❌          ✅           ✅
+FREEZE/UNFREEZE        ✅      ❌        ❌          ✅           ❌
+LIST_ACCOUNTS          ✅      ✅        ❌          ✅           ❌
 
 =========================================================
  ERROR CODES REFERENCE
 =========================================================
 
+--- Auth Errors ---
+ERR_UNAUTHORIZED          — Missing or invalid X-API-Key / Bearer token
+ERR_FORBIDDEN             — Role not permitted to access this channel
+
+--- Card Errors ---
 ERR_CARD_NOT_FOUND        — Wrong PAN
 ERR_INVALID_EXPIRY        — Wrong expiry date
 ERR_INVALID_CVV           — Wrong CVV
 ERR_INVALID_ENCRYPTED_PAN — Decryption failed (wrong key or corrupted data)
-ERR_INVALID_PIN           — PIN does not match (re-generate with correct PAN)
-ERR_CARD_INACTIVE         — Card status is BLOCKED
+ERR_INVALID_PIN           — PIN does not match
+ERR_CARD_INACTIVE         — Card is BLOCKED
+ERR_CARD_PERMANENTLY_BLOCKED — Cannot re-activate a permanently blocked card
+ERR_CARD_BLOCKED          — Cannot reset PIN of a blocked card
+ERR_NOTHING_TO_UPDATE     — No fields provided for update
+ERR_INVALID_LIMIT         — Limit must be > 0
+ERR_INVALID_BLOCK_TYPE    — blockType must be TEMPORARY or PERMANENT
+
+--- Account Errors ---
 ERR_ACCOUNT_NOT_FOUND     — Account number does not exist
 ERR_ACCOUNT_EXISTS        — Account number already exists
 ERR_CURRENCY_NOT_FOUND    — currencyId/currencyCode does not exist
 ERR_ACCOUNT_FROZEN        — Account is frozen
 ERR_INSUFFICIENT_FUNDS    — Balance too low
+
+--- Transaction Errors ---
 ERR_RATE_LIMIT            — Too many requests (>200/min per IP)
 ERR_TIMEOUT               — Transaction took too long (>5-6 seconds)
 ERR_FRAUD                 — Falcon fraud engine blocked the transaction
+ERR_ALREADY_REFUNDED      — Purchase already fully refunded (flag=RF)
+ERR_REFUND_EXCEEDS        — Refund amount + prior refunds exceed original
+ERR_ORIGINAL_NOT_FOUND    — origClientTxnId / origTransactionId not found
+
+--- 3DS Errors ---
+ERR_CHALLENGE_NOT_FOUND   — Invalid challengeId
+ERR_CHALLENGE_USED        — OTP already verified or challenge expired
+ERR_OTP_EXPIRED           — 10-minute OTP window has passed
+ERR_INVALID_OTP           — Wrong OTP submitted
+
+--- FX Errors ---
+ERR_FX_RATE_NOT_FOUND     — No exchange rate for the requested currency pair
+
+--- General ---
+ERR_MISSING_PAN           — encryptedPan field missing
+ERR_MISSING_PIN           — pin field missing
+ERR_SERVER                — Internal server exception
+ERR_UNKNOWN               — Unhandled error

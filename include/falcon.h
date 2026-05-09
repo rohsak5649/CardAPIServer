@@ -23,6 +23,10 @@
 #include <string_view>
 #include <functional>
 #include <vector>
+#include <list>
+#include <unordered_map>
+#include <mutex>
+#include <chrono>
 #include <mysqlx/xdevapi.h>
 
 using namespace mysqlx;
@@ -36,6 +40,12 @@ inline constexpr int    FALCON_AI_DECLINE_SCORE = 85;    // local AI risk score
 // ── Channel tag used for cross-channel queries ────────────────────────────────
 enum class FalconChannel {
     ATM, MOBILE, POS, ECOM, QRCODE, RINGPAY, ALL
+};
+
+// ── Cache Eviction Policy ─────────────────────────────────────────────────────
+enum class EvictionPolicy {
+    LRU_POLICY,
+    FIFO_POLICY
 };
 
 class Falcon {
@@ -81,4 +91,15 @@ private:
 
     // ── Helper: count rows with parameterised query ───────────────────────
     int countRows_(const std::string& sql, const std::string& acc);
+
+    // ── In-Memory LRU Cache for O(1) time complexity optimization ─────────
+    struct CacheNode {
+        std::string cacheKey;
+        std::chrono::steady_clock::time_point timestamp;
+    };
+    std::list<CacheNode> lruList_; // Doubly Linked List
+    std::unordered_map<std::string, std::list<CacheNode>::iterator> lruMap_; // STL Hash Map
+    std::mutex lruMutex_;
+    static constexpr size_t MAX_CACHE_SIZE = 10000;
+    EvictionPolicy policy_ = EvictionPolicy::LRU_POLICY;
 };
