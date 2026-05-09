@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8"/>
 <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
-<title>CardAPI — Payment Switching Engine v3.1</title>
+<title>CardAPI — Payment Switching Engine v3.2</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Geist+Mono:wght@300;400;500;600;700&family=Outfit:wght@300;400;500;600;700;800&display=swap" rel="stylesheet">
 <style>
@@ -520,7 +520,7 @@ html,body{height:100%;overflow:hidden;background:var(--bg);color:var(--text);fon
   </div>
 
   <div class="sp-wordmark">Card<span>API</span></div>
-  <div class="sp-sub">Payment Switching Engine v3.1</div>
+  <div class="sp-sub">Payment Switching Engine v3.2</div>
 
   <div class="sp-steps" id="spSteps"></div>
 
@@ -543,7 +543,7 @@ html,body{height:100%;overflow:hidden;background:var(--bg);color:var(--text);fon
       </svg>
     </div>
     <span class="logo-text">Card<span>API</span></span>
-    <span class="logo-badge">v3.1</span>
+    <span class="logo-badge">v3.2</span>
   </div>
   <div class="tb-div"></div>
   <div class="engine-pill" onclick="pingHealth()" title="Click to re-ping">
@@ -595,6 +595,18 @@ html,body{height:100%;overflow:hidden;background:var(--bg);color:var(--text);fon
       <div class="sb-item" id="si_CARD_DETAILS" onclick="goSingle('CARD_DETAILS')">
         <span class="sb-dot" style="background:#9b59fc"></span><span class="sb-lbl">Card Details</span><span class="mpost sb-method">POST</span>
       </div>
+      <div class="sb-item" id="si_CARD_ACTIVATE" onclick="goSingle('CARD_ACTIVATE')">
+        <span class="sb-dot" style="background:#10b981"></span><span class="sb-lbl">Activate Card</span><span class="mpost sb-method">POST</span>
+      </div>
+      <div class="sb-item" id="si_CARD_BLOCK" onclick="goSingle('CARD_BLOCK')">
+        <span class="sb-dot" style="background:#ef4444"></span><span class="sb-lbl">Block Card</span><span class="mpost sb-method">POST</span>
+      </div>
+      <div class="sb-item" id="si_CARD_SET_LIMIT" onclick="goSingle('CARD_SET_LIMIT')">
+        <span class="sb-dot" style="background:#f59e0b"></span><span class="sb-lbl">Set Card Limit</span><span class="mpost sb-method">POST</span>
+      </div>
+      <div class="sb-item" id="si_CARD_RESET_PIN" onclick="goSingle('CARD_RESET_PIN')">
+        <span class="sb-dot" style="background:#8b5cf6"></span><span class="sb-lbl">Reset PIN</span><span class="mpost sb-method">POST</span>
+      </div>
 
       <div class="sb-sec">Accounts</div>
       <div class="sb-item" id="si_accounts" onclick="switchMode('accounts')">
@@ -624,6 +636,12 @@ html,body{height:100%;overflow:hidden;background:var(--bg);color:var(--text);fon
       <div class="sb-item" id="si_ECOM_REFUND" onclick="goSingle('ECOM_REFUND')">
         <span class="sb-dot" style="background:#3b82f6"></span><span class="sb-lbl">ECOM Refund</span><span class="mpost sb-method">POST</span>
       </div>
+      <div class="sb-item" id="si_TDS_INITIATE" onclick="goSingle('TDS_INITIATE')">
+        <span class="sb-dot" style="background:#06b6d4"></span><span class="sb-lbl">3DS Initiate</span><span class="mpost sb-method">POST</span>
+      </div>
+      <div class="sb-item" id="si_TDS_VERIFY" onclick="goSingle('TDS_VERIFY')">
+        <span class="sb-dot" style="background:#06b6d4"></span><span class="sb-lbl">3DS Verify OTP</span><span class="mpost sb-method">POST</span>
+      </div>
 
       <div class="sb-sec">Mobile</div>
       <div class="sb-item" id="si_MOBILE" onclick="goSingle('MOBILE')">
@@ -636,6 +654,9 @@ html,body{height:100%;overflow:hidden;background:var(--bg);color:var(--text);fon
       </div>
 
       <div class="sb-sec">System</div>
+      <div class="sb-item" id="si_AUTH_TOKEN" onclick="goSingle('AUTH_TOKEN')">
+        <span class="sb-dot" style="background:#a855f7"></span><span class="sb-lbl">Get JWT Token</span><span class="mpost sb-method">POST</span>
+      </div>
       <div class="sb-item" id="si_health" onclick="goRaw('/health','GET','')">
         <span class="sb-dot" style="background:#10b981"></span><span class="sb-lbl">GET /health</span><span class="mget sb-method">GET</span>
       </div>
@@ -757,7 +778,7 @@ html,body{height:100%;overflow:hidden;background:var(--bg);color:var(--text);fon
     <div id="mErrors" style="flex:1;display:none;flex-direction:column;overflow:hidden">
       <div class="err-hd">
         <span style="font-size:13px;font-weight:700;color:var(--text)">⚠ Error Codes Reference</span>
-        <span style="font-size:10px;color:var(--text3);font-family:var(--mono)">Payment Switching Engine v3.1</span>
+        <span style="font-size:10px;color:var(--text3);font-family:var(--mono)">Payment Switching Engine v3.2</span>
       </div>
       <div class="err-grid" id="errGrid"></div>
     </div>
@@ -819,40 +840,97 @@ let firing = false;
 
 const CH_LABELS = {
   ISSUER:'Issue Card', CARD_DETAILS:'Card Details',
+  CARD_ACTIVATE:'Card Activate', CARD_BLOCK:'Card Block',
+  CARD_SET_LIMIT:'Set Card Limit', CARD_RESET_PIN:'Reset Card PIN',
   ATM_WITHDRAWAL:'ATM Withdrawal', ATM_DEPOSIT:'ATM Deposit',
   POS_PURCHASE:'POS Purchase', POS_REFUND:'POS Refund',
   ECOM_PURCHASE:'ECOM Purchase', ECOM_REFUND:'ECOM Refund',
-  MOBILE:'Fund Transfer', RINGPAY:'RingPay'
+  TDS_INITIATE:'3DS Initiate', TDS_VERIFY:'3DS Verify OTP',
+  MOBILE:'Fund Transfer', RINGPAY:'RingPay',
+  AUTH_TOKEN:'Get JWT Token'
 };
-const CH_COLORS = {ISSUER:'#ec4899',CARD_DETAILS:'#9b59fc',ATM_WITHDRAWAL:'#f59e0b',ATM_DEPOSIT:'#f59e0b',POS_PURCHASE:'#22c55e',POS_REFUND:'#22c55e',ECOM_PURCHASE:'#3b82f6',ECOM_REFUND:'#3b82f6',MOBILE:'#8b5cf6',RINGPAY:'#f97316'};
-const CH_LIST = ['ISSUER','CARD_DETAILS','ATM_WITHDRAWAL','ATM_DEPOSIT','POS_PURCHASE','POS_REFUND','ECOM_PURCHASE','ECOM_REFUND','MOBILE','RINGPAY'];
+const CH_COLORS = {
+  ISSUER:'#ec4899',CARD_DETAILS:'#9b59fc',
+  CARD_ACTIVATE:'#10b981',CARD_BLOCK:'#ef4444',CARD_SET_LIMIT:'#f59e0b',CARD_RESET_PIN:'#8b5cf6',
+  ATM_WITHDRAWAL:'#f59e0b',ATM_DEPOSIT:'#f59e0b',
+  POS_PURCHASE:'#22c55e',POS_REFUND:'#22c55e',
+  ECOM_PURCHASE:'#3b82f6',ECOM_REFUND:'#3b82f6',
+  TDS_INITIATE:'#06b6d4',TDS_VERIFY:'#06b6d4',
+  MOBILE:'#8b5cf6',RINGPAY:'#f97316',AUTH_TOKEN:'#a855f7'
+};
+const CH_LIST = ['ISSUER','CARD_DETAILS','CARD_ACTIVATE','CARD_BLOCK','CARD_SET_LIMIT','CARD_RESET_PIN','ATM_WITHDRAWAL','ATM_DEPOSIT','POS_PURCHASE','POS_REFUND','ECOM_PURCHASE','ECOM_REFUND','TDS_INITIATE','TDS_VERIFY','MOBILE','RINGPAY','AUTH_TOKEN'];
+
+// Default API key per channel role
+const CH_APIKEYS = {
+  ISSUER:'sk_issuer_BANK_CORE', CARD_DETAILS:'sk_issuer_BANK_CORE',
+  CARD_ACTIVATE:'sk_issuer_BANK_CORE', CARD_BLOCK:'sk_issuer_BANK_CORE',
+  CARD_SET_LIMIT:'sk_issuer_BANK_CORE', CARD_RESET_PIN:'sk_mobile_APP_USER1',
+  ATM_WITHDRAWAL:'sk_terminal_ATM_4455', ATM_DEPOSIT:'sk_terminal_ATM_4455',
+  POS_PURCHASE:'sk_merchant_POS_MCH001', POS_REFUND:'sk_merchant_POS_MCH001',
+  ECOM_PURCHASE:'sk_merchant_POS_MCH001', ECOM_REFUND:'sk_merchant_POS_MCH001',
+  TDS_INITIATE:'sk_merchant_POS_MCH001', TDS_VERIFY:'sk_merchant_POS_MCH001',
+  MOBILE:'sk_mobile_APP_USER1', RINGPAY:'sk_merchant_POS_MCH001',
+  AUTH_TOKEN:'sk_admin_ROHAN_MASTER_9649'
+};
+
+// Endpoint URLs per channel (those with dedicated routes)
+const CH_URLS = {
+  TDS_VERIFY:'/3ds/verify',
+  AUTH_TOKEN:'/auth/token',
+  CARD_ACTIVATE:'/card/activate',
+  CARD_BLOCK:'/card/block',
+  CARD_SET_LIMIT:'/card/set_limit',
+  CARD_RESET_PIN:'/card/reset_pin'
+};
 
 const PAYLOADS = {
   ISSUER:{channelId:"ISSUER",data:{accountNumber:"AU1234567890",cardholderName:"Dada Sakhare",scheme:"MASTERCARD"}},
   CARD_DETAILS:{channelId:"CARD_DETAILS",data:{encryptedPan:"<encryptedPan from issue response>"}},
-  ATM_WITHDRAWAL:{channelId:"ATM",data:{clientTxnId:"atm-1001",transactionType:"WITHDRAWAL",atmId:"ATM-4455",terminalId:"TERM-8899",location:"Mumbai-Andheri",card:{pan:"<encryptedPan from issue response>",expiry:"04/31"},pin:"<generated PIN from offline tool>",amount:500.00,fee:10.00}},
-  ATM_DEPOSIT:{channelId:"ATM",data:{clientTxnId:"atm-1002",transactionType:"DEPOSIT",atmId:"ATM-4455",terminalId:"TERM-8899",location:"Mumbai-Andheri",card:{pan:"<encryptedPan from issue response>",expiry:"04/31"},pin:"<generated PIN from offline tool>",amount:3000.00,fee:0.00}},
-  POS_PURCHASE:{channelId:"POS",data:{clientTxnId:"pos-1001",transactionType:"PURCHASE",merchantId:"MCH-POS-001",terminalId:"TERM-7788",location:"Sydney Mall",amount:100.00,fee:20.00,currency:"AUD",card:{pan:"<encryptedPan from issue response>",pin:"<generated PIN from offline tool>",expiry:"04/31",cvv:"617"}}},
-  POS_REFUND:{channelId:"POS",data:{clientTxnId:"pos-ref-1001",transactionType:"REFUND",origTransactionId:"<transactionId from purchase response>",merchantId:"MCH-POS-001",terminalId:"TERM-7788",amount:100.00,card:{pan:"<encryptedPan from issue response>",pin:"<generated PIN from offline tool>",expiry:"04/31"}}},
-  ECOM_PURCHASE:{channelId:"ECOM",data:{clientTxnId:"ecom-pur-3002",transactionType:"PURCHASE",merchantId:"MCH-ECOM-55",orderId:"ORD-SECURE-3001",amount:100.99,fee:0.50,currency:"AUD",card:{pan:"<encryptedPan from issue response>",pin:"<generated PIN from offline tool>",expiry:"04/31",cvv:"905"}}},
-  ECOM_REFUND:{channelId:"ECOM",data:{clientTxnId:"ecom-ref-3002",transactionType:"REFUND",origClientTxnId:"<clientTxnId of the original purchase>",amount:100.99,currency:"AUD",card:{pan:"<encryptedPan from issue response>",pin:"<generated PIN from offline tool>",expiry:"04/31"}}},
+  CARD_ACTIVATE:{encryptedPan:"<encryptedPan from issue response>"},
+  CARD_BLOCK:{encryptedPan:"<encryptedPan from issue response>",blockType:"TEMPORARY"},
+  CARD_SET_LIMIT:{encryptedPan:"<encryptedPan from issue response>",dailyLimit:5000.00,monthlyLimit:50000.00},
+  CARD_RESET_PIN:{encryptedPan:"<encryptedPan from issue response>",expiry:"05/31",newPin:"<generated PIN from offline tool>"},
+  ATM_WITHDRAWAL:{channelId:"ATM",data:{clientTxnId:"atm-1001",transactionType:"WITHDRAWAL",atmId:"ATM-4455",terminalId:"TERM-8899",location:"Mumbai-Andheri",card:{pan:"<encryptedPan from issue response>",expiry:"05/31"},pin:"<generated PIN from offline tool>",amount:500.00,fee:10.00}},
+  ATM_DEPOSIT:{channelId:"ATM",data:{clientTxnId:"atm-1002",transactionType:"DEPOSIT",atmId:"ATM-4455",terminalId:"TERM-8899",location:"Mumbai-Andheri",card:{pan:"<encryptedPan from issue response>",expiry:"05/31"},pin:"<generated PIN from offline tool>",amount:3000.00,fee:0.00}},
+  POS_PURCHASE:{channelId:"POS",data:{clientTxnId:"pos-1001",transactionType:"PURCHASE",merchantId:"MCH-POS-001",terminalId:"TERM-7788",location:"Sydney Mall",amount:100.00,fee:10.00,currency:"USD",card:{pan:"<encryptedPan from issue response>",pin:"<generated PIN from offline tool>",expiry:"05/31",cvv:"617"}}},
+  POS_REFUND:{channelId:"POS",data:{clientTxnId:"pos-ref-1001",transactionType:"REFUND",origTransactionId:"<transactionId from purchase response>",merchantId:"MCH-POS-001",terminalId:"TERM-7788",amount:20.00,card:{pan:"<encryptedPan from issue response>",pin:"<generated PIN from offline tool>",expiry:"05/31"}}},
+  ECOM_PURCHASE:{channelId:"ECOM",data:{clientTxnId:"ecom-pur-3002",transactionType:"PURCHASE",merchantId:"MCH-ECOM-55",orderId:"ORD-SECURE-3001",amount:100.99,fee:0.50,currency:"EUR",card:{pan:"<encryptedPan from issue response>",pin:"<generated PIN from offline tool>",expiry:"05/31",cvv:"905"}}},
+  ECOM_REFUND:{channelId:"ECOM",data:{clientTxnId:"ecom-ref-3002",transactionType:"REFUND",origClientTxnId:"<clientTxnId of the original purchase>",amount:50.00,currency:"AUD",card:{pan:"<encryptedPan from issue response>",pin:"<generated PIN from offline tool>",expiry:"05/31"}}},
+  TDS_INITIATE:{channelId:"3DS_INITIATE",data:{clientTxnId:"ecom-3ds-5001",merchantId:"MCH-ECOM-55",amount:250.00,fee:0.00,currency:"AUD",card:{pan:"<encryptedPan from issue response>",expiry:"05/31",cvv:"905"}}},
+  TDS_VERIFY:{challengeId:"<challengeId from 3DS_INITIATE response>",otp:"<otpHint from 3DS_INITIATE response>"},
   MOBILE:{channelId:"MOBILE",data:{clientTxnId:"mob-2001",transactionType:"FUND_TRANSFER",pan:"<encryptedPan from issue response>",pin:"<generated PIN from offline tool>",creditAccount:{accountNumber:"INR9876543210"},amount:200.00,fee:0.00,deviceId:"DEVICE-8899",mobileNumber:"9876543210"}},
-  RINGPAY:{channelId:"RINGPAY",data:{pan:"<encryptedPan from issue response>",expiry:"04/31",amount:500.00,fee:5.00,deviceId:"RING-DEVICE-001",terminalId:"TERM-RING-99",ipAddress:"192.168.1.1"}}
+  RINGPAY:{channelId:"RINGPAY",data:{pan:"<encryptedPan from issue response>",expiry:"05/31",amount:500.00,fee:5.00,deviceId:"RING-DEVICE-001",terminalId:"TERM-RING-99",ipAddress:"192.168.1.1"}},
+  AUTH_TOKEN:{}
 };
 
 const ERROR_CODES=[
+  {code:'ERR_UNAUTHORIZED',desc:'Missing or invalid X-API-Key / Bearer token',sev:'HIGH'},
+  {code:'ERR_FORBIDDEN',desc:'Role not permitted to access this channel',sev:'HIGH'},
   {code:'ERR_CARD_NOT_FOUND',desc:'Wrong PAN — card not found in system',sev:'HIGH'},
   {code:'ERR_INVALID_EXPIRY',desc:'Wrong expiry date — copy exact value from issue response',sev:'HIGH'},
   {code:'ERR_INVALID_CVV',desc:'Wrong CVV value provided',sev:'HIGH'},
   {code:'ERR_INVALID_ENCRYPTED_PAN',desc:'Decryption failed — wrong key or corrupted data',sev:'HIGH'},
   {code:'ERR_INVALID_PIN',desc:'PIN does not match — re-generate with correct plain PAN',sev:'HIGH'},
   {code:'ERR_FRAUD',desc:'Falcon fraud engine blocked the transaction',sev:'HIGH'},
+  {code:'ERR_CARD_PERMANENTLY_BLOCKED',desc:'Cannot re-activate a permanently blocked card',sev:'HIGH'},
+  {code:'ERR_INVALID_OTP',desc:'Wrong OTP submitted for 3DS verification',sev:'HIGH'},
+  {code:'ERR_OTP_EXPIRED',desc:'10-minute 3DS OTP window has passed — initiate new payment',sev:'HIGH'},
   {code:'ERR_CARD_INACTIVE',desc:'Card status is BLOCKED — cannot transact',sev:'MED'},
+  {code:'ERR_CARD_BLOCKED',desc:'Cannot reset PIN of a blocked card',sev:'MED'},
+  {code:'ERR_ALREADY_REFUNDED',desc:'Purchase is fully refunded (flag=RF) — no further refunds',sev:'MED'},
+  {code:'ERR_REFUND_EXCEEDS',desc:'Refund amount + prior refunds exceed original purchase amount',sev:'MED'},
+  {code:'ERR_ORIGINAL_NOT_FOUND',desc:'origClientTxnId or origTransactionId not found',sev:'MED'},
+  {code:'ERR_CHALLENGE_NOT_FOUND',desc:'Invalid 3DS challengeId',sev:'MED'},
+  {code:'ERR_CHALLENGE_USED',desc:'3DS OTP already verified or challenge expired',sev:'MED'},
   {code:'ERR_ACCOUNT_NOT_FOUND',desc:'Account number does not exist in system',sev:'MED'},
   {code:'ERR_CURRENCY_NOT_FOUND',desc:'currencyId or currencyCode does not exist',sev:'MED'},
   {code:'ERR_ACCOUNT_FROZEN',desc:'Account is frozen — unfreeze before transacting',sev:'MED'},
   {code:'ERR_INSUFFICIENT_FUNDS',desc:'Account balance too low for this transaction',sev:'MED'},
+  {code:'ERR_INVALID_LIMIT',desc:'Limit must be greater than 0',sev:'MED'},
+  {code:'ERR_INVALID_BLOCK_TYPE',desc:'blockType must be TEMPORARY or PERMANENT',sev:'MED'},
+  {code:'ERR_FX_RATE_NOT_FOUND',desc:'No exchange rate found for the requested currency pair',sev:'MED'},
   {code:'ERR_ACCOUNT_EXISTS',desc:'Account number already exists — use a different number',sev:'LOW'},
+  {code:'ERR_NOTHING_TO_UPDATE',desc:'No fields provided for card limit update',sev:'LOW'},
   {code:'ERR_RATE_LIMIT',desc:'Too many requests — limit is 200/min per IP',sev:'LOW'},
   {code:'ERR_TIMEOUT',desc:'Transaction took too long (>5–6 seconds)',sev:'LOW'},
 ];
@@ -984,10 +1062,12 @@ function goSingle(ch){
   curCh=ch;
   document.querySelectorAll('.sb-item').forEach(b=>b.classList.remove('act'));
   g('si_'+ch,el=>el.classList.add('act'));
-  g('methodSel',el=>el.value='POST'); onMethodChg();
-  g('urlInp',el=>el.value=ENV[env]+'/transaction/initiate');
+  g('methodSel',el=>{el.value='POST';}); onMethodChg();
+  // Set correct URL for dedicated endpoints
+  const url = CH_URLS[ch] ? ENV[env]+CH_URLS[ch] : ENV[env]+'/transaction/initiate';
+  g('urlInp',el=>el.value=url);
   g('bodyEd',el=>{el.value=JSON.stringify(PAYLOADS[ch]||{},null,2);updateChars();});
-  const txnChs=['ATM_WITHDRAWAL','ATM_DEPOSIT','POS_PURCHASE','POS_REFUND','ECOM_PURCHASE','ECOM_REFUND','MOBILE','RINGPAY'];
+  const txnChs=['ATM_WITHDRAWAL','ATM_DEPOSIT','POS_PURCHASE','POS_REFUND','ECOM_PURCHASE','ECOM_REFUND','MOBILE','RINGPAY','TDS_INITIATE','TDS_VERIFY','CARD_ACTIVATE','CARD_BLOCK','CARD_SET_LIMIT','CARD_RESET_PIN'];
   g('hintBox',el=>el.classList.toggle('show',txnChs.includes(ch)));
 }
 function goRaw(path,method,body){
@@ -1020,7 +1100,8 @@ async function sendSingle(){
   g('respMs',e=>e.textContent='');
   const t0=performance.now();
   try{
-    const opts={method,headers:{'Content-Type':'application/json'}};
+    const apiKey = CH_APIKEYS[curCh] || 'sk_admin_ROHAN_MASTER_9649';
+    const opts={method,headers:{'Content-Type':'application/json','X-API-Key':apiKey}};
     if(method!=='GET'&&body) opts.body=body;
     const resp=await fetch(url,opts);
     const ms=Math.round(performance.now()-t0);

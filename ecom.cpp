@@ -4,6 +4,8 @@
 #include "panencrypted.h"
 #include "pin.h"
 #include "TransactionLogger.h"
+#include "accounting.h"
+#include "currency_converter.h"
 
 #include <chrono>
 #include <future>
@@ -141,6 +143,9 @@ json processECOMTransactionCore(const json &data) {
     Table ecomTable = db.getTable("transaction_ecom");
     Table master = db.getTable("transactions");
 
+    std::string merchantId = data.value("merchantId", "ECOM_MERCHANT");
+    double fee = data.value("fee", 0.0);
+
     auto accRes = accounts.select("balance", "currency")
                       .where("account_number=:a")
                       .bind("a", accountNumber)
@@ -158,6 +163,18 @@ json processECOMTransactionCore(const json &data) {
     std::string txnId = genECOMTxnId();
     std::string scope =
         (accCurrency == currency) ? "DOMESTIC" : "INTERNATIONAL";
+
+    double origReqAmount = amount;
+    double fxMarkup = 0.0;
+    double fxRate = 1.0;
+    
+    if (accCurrency != currency) {
+        auto fxRes = CurrencyConverter::convertToBase(currency, amount, sess);
+        amount = fxRes.convertedAmount;
+        fxMarkup = fxRes.bankMarkupAmount;
+        fxRate = fxRes.fxRate;
+        trace.success({{"convertedAmount", std::to_string(amount)}, {"fxRate", std::to_string(fxRate)}});
+    }
 
     // ── FRAUD CHECK ───────────────────────────────
     Falcon falcon(sess);
@@ -182,31 +199,41 @@ json processECOMTransactionCore(const json &data) {
         return err("ERR_INSUFFICIENT_FUNDS");
       }
 
-      double newBal = balance - amount;
+      double newBal = balance - amount - fee;
 
-      accounts.update()
-          .set("balance", newBal)
-          .where("account_number=:a")
-          .bind("a", accountNumber)
-          .execute();
+      sess.startTransaction();
+      try {
+        accounts.update()
+            .set("balance", newBal)
+            .where("account_number=:a")
+            .bind("a", accountNumber)
+            .execute();
 
-      auto ins =
-          ecomTable
-              .insert("transaction_id", "client_txn_id", "account_number",
-                      "amount", "currency", "status", "message",
-                      "transaction_scope")
-              .values(txnId, clientTxnId, accountNumber, amount, currency,
-                      "SUCCESS", "ECOM purchase success", scope)
-              .execute();
+        auto ins =
+            ecomTable
+                .insert("transaction_id", "client_txn_id", "account_number",
+                        "amount", "currency", "status", "message",
+                        "transaction_scope", "merchant_id", "fee", "card_pan", "card_scheme")
+                .values(txnId, clientTxnId, accountNumber, amount, currency,
+                        "SUCCESS", "ECOM purchase success", scope, merchantId, fee, cardPan, cardScheme)
+                .execute();
 
-      master.insert("table_name", "reference_id", "status")
-          .values("transaction_ecom", ins.getAutoIncrementValue(), "SUCCESS")
-          .execute();
+        master.insert("table_name", "reference_id", "status")
+            .values("transaction_ecom", ins.getAutoIncrementValue(), "SUCCESS")
+            .execute();
+
+        Accounting::processPurchaseLedger(txnId, accountNumber, merchantId, amount, fee, fxMarkup, "ECOM Purchase", sess);
+        sess.commit();
+      } catch (...) {
+        sess.rollback();
+        throw;
+      }
 
       trace.success({{"transactionId", txnId}, {"scope", scope}});
       return {{"transactionId", txnId},
               {"status", "SUCCESS"},
               {"balanceAfter", newBal},
+              {"amountCharged", amount},
               {"scope", scope}};
     }
 
@@ -221,7 +248,7 @@ json processECOMTransactionCore(const json &data) {
       std::string orig = data["origClientTxnId"].get<std::string>();
 
       auto pRes =
-          ecomTable.select("id", "amount")
+          ecomTable.select("id", "amount", "refunded_amount", "flag")
               .where("client_txn_id=:c AND message='ECOM purchase success'")
               .bind("c", orig)
               .execute();
@@ -234,37 +261,63 @@ json processECOMTransactionCore(const json &data) {
       Row pRow = pRes.fetchOne();
       int64_t refId = pRow[0].get<int64_t>();
       double origAmt = pRow[1].get<double>();
+      double refAmt = pRow[2].isNull() ? 0.0 : pRow[2].get<double>();
+      std::string flag = pRow[3].isNull() ? "N" : pRow[3].get<std::string>();
 
-      if (amount > origAmt) {
+      if (flag == "RF") {
+        trace.fail("already fully refunded");
+        return err("ERR_ALREADY_REFUNDED");
+      }
+
+      if (amount + refAmt > origAmt) {
         trace.fail("refund exceeds original amount",
                    {{"amount", std::to_string(amount)},
+                    {"refundedAmount", std::to_string(refAmt)},
                     {"originalAmount", std::to_string(origAmt)}});
         return err("ERR_REFUND_EXCEEDS");
       }
 
       double newBal = balance + amount;
+      std::string newFlag = (amount + refAmt == origAmt) ? "RF" : "PR";
 
-      accounts.update()
-          .set("balance", newBal)
-          .where("account_number=:a")
-          .bind("a", accountNumber)
-          .execute();
-
-      auto ins =
-          ecomTable
-              .insert("transaction_id", "client_txn_id", "account_number",
-                      "amount", "currency", "status", "message", "orig_ref_id")
-              .values(txnId, clientTxnId, accountNumber, amount, currency,
-                      "SUCCESS", "ECOM refund success", refId)
+      sess.startTransaction();
+      try {
+          accounts.update()
+              .set("balance", newBal)
+              .where("account_number=:a")
+              .bind("a", accountNumber)
+              .execute();
+              
+          ecomTable.update()
+              .set("refunded_amount", amount + refAmt)
+              .set("flag", newFlag)
+              .where("id=:id")
+              .bind("id", refId)
               .execute();
 
-      master.insert("table_name", "reference_id", "status")
-          .values("transaction_ecom", ins.getAutoIncrementValue(), "SUCCESS")
-          .execute();
+          auto ins =
+              ecomTable
+                  .insert("transaction_id", "client_txn_id", "account_number",
+                          "amount", "currency", "status", "message", "reference_txn_id")
+                  .values(txnId, clientTxnId, accountNumber, amount, currency,
+                          "SUCCESS", "ECOM refund success", orig)
+                  .execute();
+
+          master.insert("table_name", "reference_id", "status")
+              .values("transaction_ecom", ins.getAutoIncrementValue(), "SUCCESS")
+              .execute();
+              
+          Accounting::processRefundLedger(txnId, accountNumber, merchantId, amount, "ECOM Refund", sess);
+          sess.commit();
+      } catch (...) {
+          sess.rollback();
+          throw;
+      }
 
       trace.success({{"transactionId", txnId}, {"refundAmount", std::to_string(amount)}});
       return {{"transactionId", txnId},
               {"status", "SUCCESS"},
+              {"flag", newFlag},
               {"balanceAfter", newBal}};
     }
 
