@@ -169,16 +169,18 @@ struct POSContext {
       return {{"status", "DECLINED"}, {"message", fraudReason}};
     }
 
-    // DCC Support
+    // DCC Support: get account currency via JOIN (accounts has currency_id FK, not currency column)
     std::string reqCurrency = data.value("currency", "AUD");
     double fxMarkup = 0.0;
     double fxRate = 1.0;
-    std::string accCurrency = ctx.accounts.select("currency")
-                              .where("account_number=:a")
-                              .bind("a", accNo)
-                              .execute()
-                              .fetchOne()[0]
-                              .get<std::string>();
+    auto currRow = ctx.sess->sql(
+        "SELECT c.currency_code FROM accounts a "
+        "JOIN currency c ON c.currency_id = a.currency_id "
+        "WHERE a.account_number = ?")
+        .bind(accNo)
+        .execute()
+        .fetchOne();
+    std::string accCurrency = (currRow && !currRow[0].isNull()) ? currRow[0].get<std::string>() : "AUD";
 
     if (accCurrency != reqCurrency) {
         auto fxRes = CurrencyConverter::convertToBase(reqCurrency, amount, *ctx.sess);

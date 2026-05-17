@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <sstream>
 #include <iomanip>
+#include <iostream>
 
 using json = nlohmann::json;
 
@@ -81,11 +82,12 @@ AuthContext AuthService::validateApiKey(const std::string& apiKey, mysqlx::Sessi
         auto res = sess.sql("SELECT role, owner_name, is_active FROM api_keys WHERE api_key = ?")
                        .bind(apiKey)
                        .execute();
-        if (res.count() == 0) return {};
         auto row = res.fetchOne();
-        if ((int)row[2] == 0) return {}; // inactive
+        if (!row)             return {}; // key not found
+        if ((int)row[2] == 0) return {}; // key inactive
         return {row[0].get<std::string>(), row[1].get<std::string>(), true};
-    } catch (...) {
+    } catch (const std::exception& e) {
+        TransactionLogger::instance().logCurrent("WARN", "auth_db_error", "DB error during API key lookup", {{"error", e.what()}});
         return {};
     }
 }
