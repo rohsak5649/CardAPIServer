@@ -39,7 +39,7 @@ Session* Database::createSession_() {
     std::string host = env("DB_HOST", "localhost");
     int         port = std::atoi(env("DB_PORT", "33060").c_str());
     std::string user = env("DB_USER", "root");
-    std::string pass = env("DB_PASS", "Rohan@5649");   // ⚠ move to vault in prod
+    std::string pass = env("DB_PASS", "");   // ⚠ move to vault in prod
     std::string name = env("DB_NAME", "bankingdb");
 
     Session* s = new Session(host, port, user, pass);
