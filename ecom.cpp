@@ -146,19 +146,22 @@ json processECOMTransactionCore(const json &data) {
     std::string merchantId = data.value("merchantId", "ECOM_MERCHANT");
     double fee = data.value("fee", 0.0);
 
-    auto accRes = accounts.select("balance", "currency")
-                      .where("account_number=:a")
-                      .bind("a", accountNumber)
-                      .execute();
+    // accounts table has currency_id (FK), not currency column — must JOIN
+    auto accRes = sess.sql(
+        "SELECT a.balance, c.currency_code FROM accounts a "
+        "JOIN currency c ON c.currency_id = a.currency_id "
+        "WHERE a.account_number = ?")
+        .bind(accountNumber)
+        .execute();
 
-    if (accRes.count() == 0) {
+    if (!accRes.count()) {
       trace.fail("account not found", {{"accountNumber", accountNumber}});
       return err("ERR_ACCOUNT_NOT_FOUND");
     }
 
     Row accRow = accRes.fetchOne();
     double balance = accRow[0].get<double>();
-    std::string accCurrency = accRow[1].get<std::string>();
+    std::string accCurrency = accRow[1].isNull() ? "AUD" : accRow[1].get<std::string>();
 
     std::string txnId = genECOMTxnId();
     std::string scope =

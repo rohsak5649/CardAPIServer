@@ -155,9 +155,8 @@ static AuthContext resolveAuth(const httplib::Request& req, mysqlx::Session& ses
 
     // Priority 2: Authorization: Bearer <JWT> (stateless)
     std::string authHeader = req.get_header_value("Authorization");
-    if (authHeader.substr(0, 7) == "Bearer ") {
-        std::string token = authHeader.substr(7);
-        return AuthService::instance().validateJWT(token);
+    if (authHeader.length() >= 7 && authHeader.substr(0, 7) == "Bearer ") {
+        return AuthService::instance().validateJWT(authHeader.substr(7));
     }
     return {}; // unauthenticated
 }

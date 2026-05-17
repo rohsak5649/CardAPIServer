@@ -110,9 +110,14 @@ json processQRCodePayment(const json& data) {
         Table qrTable  = db.getTable("transaction_qrcode");
         Table master   = db.getTable("transactions");
 
-        RowResult accRes = accounts.select("currency","balance")
-            .where("account_number = :a").bind("a",accountNumber).execute();
-        if (accRes.count() == 0) {
+        // accounts table has currency_id (FK), not currency column — must JOIN
+        auto accRes = sess.sql(
+            "SELECT a.balance, c.currency_code FROM accounts a "
+            "JOIN currency c ON c.currency_id = a.currency_id "
+            "WHERE a.account_number = ?")
+            .bind(accountNumber)
+            .execute();
+        if (!accRes.count()) {
             res["errorCode"] = "ERR_ACCOUNT_NOT_FOUND";
             res["message"]   = "Debit account not found.";
             trace.fail("account not found", {{"accountNumber", accountNumber}});
@@ -120,8 +125,8 @@ json processQRCodePayment(const json& data) {
         }
 
         Row accRow = accRes.fetchOne();
-        std::string accCurrency = accRow[0].get<std::string>();
-        double balance = accRow[1].get<double>();
+        double balance = accRow[0].get<double>();
+        std::string accCurrency = accRow[1].isNull() ? "AUD" : accRow[1].get<std::string>();
         std::string txnId = genQRTxnId();
         std::string scope = (accCurrency == currency) ? "DOMESTIC" : "INTERNATIONAL";
 
