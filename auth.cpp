@@ -96,14 +96,14 @@ AuthContext AuthService::validateApiKey(const std::string& apiKey, mysqlx::Sessi
 bool AuthService::checkPermission(const std::string& role, const std::string& channel) const {
     if (role == "ADMIN") return true;
 
-    // MERCHANT: POS, ECOM, QR, RING, REVERSAL, account reads, 3DS
+    // MERCHANT: POS, ECOM, QR, RING, REVERSAL, account reads, 3DS, ICCW
     static const std::unordered_set<std::string> merchantChannels = {
         "POS", "ECOM", "QRCODE", "RINGPAY", "REVERSAL",
-        "ACCOUNT_DETAILS", "LIST_ACCOUNTS", "3DS_VERIFY", "3DS_INITIATE"
+        "ACCOUNT_DETAILS", "LIST_ACCOUNTS", "3DS_VERIFY", "3DS_INITIATE", "ICCW"
     };
-    // TERMINAL: ATM, POS only
+    // TERMINAL: ATM, POS, ICCW
     static const std::unordered_set<std::string> terminalChannels = {
-        "ATM", "POS"
+        "ATM", "POS", "ICCW"
     };
     // ISSUER_ROLE: card issuance + card management
     static const std::unordered_set<std::string> issuerChannels = {

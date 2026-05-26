@@ -193,6 +193,27 @@ CREATE TABLE `transaction_pos` (
                                    PRIMARY KEY (`id`)
 ) ENGINE=InnoDB AUTO_INCREMENT=1 DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci
 
+CREATE TABLE `transaction_iccw` (
+                                   `id` bigint NOT NULL AUTO_INCREMENT,
+                                   `transaction_id` varchar(50) DEFAULT NULL,
+                                   `client_txn_id` varchar(50) DEFAULT NULL,
+                                   `original_purchase_id` bigint DEFAULT NULL,
+                                   `merchant_id` varchar(50) DEFAULT NULL,
+                                   `terminal_id` varchar(50) DEFAULT NULL,
+                                   `location` varchar(100) DEFAULT NULL,
+                                   `account_number` varchar(30) DEFAULT NULL,
+                                   `amount` decimal(12,2) DEFAULT NULL,
+                                   `fee` decimal(10,2) DEFAULT NULL,
+                                   `card_pan` varchar(20) DEFAULT NULL,
+                                   `card_scheme` varchar(20) DEFAULT NULL,
+                                   `status` enum('SUCCESS','FAILED') DEFAULT NULL,
+                                   `message` varchar(255) DEFAULT NULL,
+                                   `created_at` timestamp NULL DEFAULT CURRENT_TIMESTAMP,
+                                   `refunded_amount` double DEFAULT '0',
+                                   `flag` varchar(2) DEFAULT 'N',
+                                   PRIMARY KEY (`id`)
+) ENGINE=InnoDB AUTO_INCREMENT=1 DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci
+
 CREATE TABLE `transaction_qrcode` (
                                       `id` bigint NOT NULL AUTO_INCREMENT,
                                       `transaction_id` varchar(50) DEFAULT NULL,
@@ -341,6 +362,7 @@ CALL _add_reversal_status('transaction_pos');
 CALL _add_reversal_status('transaction_mobile');
 CALL _add_reversal_status('transaction_ecom');
 CALL _add_reversal_status('transaction_qrcode');
+CALL _add_reversal_status('transaction_iccw');
 
 DROP PROCEDURE IF EXISTS _add_reversal_status;
 

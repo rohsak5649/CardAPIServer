@@ -37,6 +37,7 @@ const char* channelName(FalconChannel channel) {
         case FalconChannel::ECOM: return "ECOM";
         case FalconChannel::QRCODE: return "QRCODE";
         case FalconChannel::RINGPAY: return "RINGPAY";
+        case FalconChannel::ICCW: return "ICCW";
         case FalconChannel::ALL: return "ALL";
     }
     return "UNKNOWN";
@@ -359,12 +360,14 @@ bool Falcon::crossChannelVelocity_(std::string_view acc) {
         "  SELECT id FROM transaction_qrcode WHERE account_number=? AND created_at >= NOW()-INTERVAL 60 SECOND"
         "  UNION ALL"
         "  SELECT id FROM transaction_ringpay WHERE account_number=? AND created_at >= NOW()-INTERVAL 60 SECOND"
+        "  UNION ALL"
+        "  SELECT id FROM transaction_iccw WHERE account_number=? AND created_at >= NOW()-INTERVAL 60 SECOND"
         ") AS combined";
 
     try {
         std::string a = std::string(acc);
         auto res = sess_.sql(sql)
-            .bind(a).bind(a).bind(a).bind(a).bind(a).bind(a)
+            .bind(a).bind(a).bind(a).bind(a).bind(a).bind(a).bind(a)
             .execute();
         auto row = res.fetchOne();
         if (!row.isNull() && !row[0].isNull()) {
@@ -400,12 +403,14 @@ bool Falcon::amountSpike_(std::string_view acc, double amount) {
         "  SELECT amount FROM transaction_qrcode WHERE account_number=? AND created_at >= NOW()-INTERVAL 7 DAY AND status='SUCCESS'"
         "  UNION ALL"
         "  SELECT amount FROM transaction_ringpay WHERE account_number=? AND created_at >= NOW()-INTERVAL 7 DAY AND status='SUCCESS'"
+        "  UNION ALL"
+        "  SELECT amount FROM transaction_iccw WHERE account_number=? AND created_at >= NOW()-INTERVAL 7 DAY AND status='SUCCESS'"
         ") AS history";
 
     try {
         std::string a = std::string(acc);
         auto res = sess_.sql(sql)
-            .bind(a).bind(a).bind(a).bind(a).bind(a).bind(a)
+            .bind(a).bind(a).bind(a).bind(a).bind(a).bind(a).bind(a)
             .execute();
         auto row = res.fetchOne();
         if (!row.isNull() && !row[0].isNull()) {
@@ -596,6 +601,7 @@ bool Falcon::checkFraud(std::string_view     accountNumber,
         { FalconChannel::ECOM,    "transaction_ecom"    },
         { FalconChannel::QRCODE,  "transaction_qrcode"  },
         { FalconChannel::RINGPAY, "transaction_ringpay" },
+        { FalconChannel::ICCW,    "transaction_iccw"    },
     };
 
     // ── Rule 1: Same-second on any channel ───────────────────────────────

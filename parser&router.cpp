@@ -44,6 +44,7 @@
 #include "json.hpp"
 #include "mobile.h"
 #include "pos.h"
+#include "iccw.h"
 #include "qrcode.h"
 #include "reversal.h"
 #include "ringpay.h"
@@ -128,6 +129,7 @@ static const std::unordered_map<std::string, ChannelFn> CHANNEL_DISPATCH = {
     {"ATM",              processATMTransaction},
     {"MOBILE",           processMobileTransaction},
     {"POS",              processPOSTransaction},
+    {"ICCW",             processICCWTransaction},
     {"ISSUER",           processIssueCard},
     {"ECOM",             processECOMTransaction},
     {"3DS_INITIATE",     processECOM3DSInitiate},

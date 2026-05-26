@@ -261,6 +261,82 @@ Full Refund:    Set amount = original. flag becomes "RF".
 Re-refunding a fully refunded (RF) txn returns ERR_ALREADY_REFUNDED.
 
 =========================================================
+ ICCW — CARDLESS CASH WITHDRAWAL (PURCHASE)
+=========================================================
+POST /transaction/initiate
+X-API-Key: sk_merchant_POS_MCH001   (MERCHANT or TERMINAL role)
+
+ICCW = Interoperable Cardless Cash Withdrawal.
+The cardholder presents a QR / token at a cash-out point;
+no physical card swipe is required. The engine treats this
+channel identically to POS purchase for auth, fraud, and DCC.
+
+Rules (enforced by the engine):
+  • transactionType must be "CASH_WITHDRAWAL"  (aliases: "WITHDRAWAL", "PURCHASE")
+  • amount must be a multiple of 100  (e.g. 100, 200, 3500)
+  • amount must be ≤ 4,000 per single transaction
+
+{
+  "channelId": "ICCW",
+  "data": {
+    "clientTxnId":     "iccw-1001",
+    "transactionType": "CASH_WITHDRAWAL",
+    "merchantId":      "MCH-ICCW-001",
+    "terminalId":      "TERM-ICCW-01",
+    "location":        "Mumbai-CST Branch",
+    "amount":          2000.00,
+    "fee":             10.00,
+    "currency":        "AUD",
+    "card": {
+      "pan":    "<encryptedPan from issue response>",
+      "pin":    "<generated PIN from offline tool>",
+      "expiry": "05/31",
+      "cvv":    "617"
+    }
+  }
+}
+
+DCC: If currency != account currency, the engine auto-converts
+     using the exchange_rates table and applies a 2% FX markup.
+
+Success Response:
+{
+  "transactionId": "iccw-txn-xxxxxxxx",
+  "status":        "SUCCESS",
+  "channel":       "ICCW",
+  "amount":        2000.00,
+  "fee":           10.00,
+  "balanceAfter":  7990.00
+}
+
+=========================================================
+ ICCW — REFUND (PARTIAL OR FULL)
+=========================================================
+POST /transaction/initiate
+X-API-Key: sk_merchant_POS_MCH001
+
+{
+  "channelId": "ICCW",
+  "data": {
+    "clientTxnId":      "iccw-ref-1001",
+    "transactionType":  "REFUND",
+    "origTransactionId": "<transactionId from ICCW purchase response>",
+    "merchantId":       "MCH-ICCW-001",
+    "terminalId":       "TERM-ICCW-01",
+    "amount":           1000.00,
+    "card": {
+      "pan":    "<encryptedPan from issue response>",
+      "pin":    "<generated PIN from offline tool>",
+      "expiry": "05/31"
+    }
+  }
+}
+
+Partial Refund: Set amount < original. flag becomes "PR".
+Full Refund:    Set amount = original. flag becomes "RF".
+Re-refunding a fully refunded (RF) txn returns ERR_ALREADY_REFUNDED.
+
+=========================================================
  ECOM — PURCHASE (WITH DCC SUPPORT)
 =========================================================
 POST /transaction/initiate
@@ -512,6 +588,7 @@ ADD_ACCOUNT            ✅      ❌        ❌          ✅           ❌
 ACCOUNT_DETAILS        ✅      ✅        ❌          ✅           ✅
 FREEZE/UNFREEZE        ✅      ❌        ❌          ✅           ❌
 LIST_ACCOUNTS          ✅      ✅        ❌          ✅           ❌
+ICCW                   ✅      ✅        ✅          ❌           ❌
 
 =========================================================
  ERROR CODES REFERENCE
@@ -546,6 +623,7 @@ ERR_RATE_LIMIT            — Too many requests (>200/min per IP)
 ERR_TIMEOUT               — Transaction took too long (>5-6 seconds)
 ERR_FRAUD                 — Falcon fraud engine blocked the transaction
 ERR_ALREADY_REFUNDED      — Purchase already fully refunded (flag=RF)
+ERR_ICCW_AMOUNT_INVALID   — ICCW amount is not a multiple of 100, or exceeds 4,000
 ERR_REFUND_EXCEEDS        — Refund amount + prior refunds exceed original
 ERR_ORIGINAL_NOT_FOUND    — origClientTxnId / origTransactionId not found
 
