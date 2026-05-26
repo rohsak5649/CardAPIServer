@@ -629,6 +629,11 @@ html,body{height:100%;overflow:hidden;background:var(--bg);color:var(--text);fon
         <span class="sb-dot" style="background:#22c55e"></span><span class="sb-lbl">POS Refund</span><span class="mpost sb-method">POST</span>
       </div>
 
+      <div class="sb-sec">ICCW</div>
+      <div class="sb-item" id="si_ICCW_WITHDRAWAL" onclick="goSingle('ICCW_WITHDRAWAL')">
+        <span class="sb-dot" style="background:#38bdf8"></span><span class="sb-lbl">ICCW Withdrawal</span><span class="mpost sb-method">POST</span>
+      </div>
+
       <div class="sb-sec">ECOM</div>
       <div class="sb-item" id="si_ECOM_PURCHASE" onclick="goSingle('ECOM_PURCHASE')">
         <span class="sb-dot" style="background:#3b82f6"></span><span class="sb-lbl">ECOM Purchase</span><span class="mpost sb-method">POST</span>
@@ -843,6 +848,7 @@ const CH_LABELS = {
   CARD_ACTIVATE:'Card Activate', CARD_BLOCK:'Card Block',
   CARD_SET_LIMIT:'Set Card Limit', CARD_RESET_PIN:'Reset Card PIN',
   ATM_WITHDRAWAL:'ATM Withdrawal', ATM_DEPOSIT:'ATM Deposit',
+  ICCW_WITHDRAWAL:'ICCW Withdrawal',
   POS_PURCHASE:'POS Purchase', POS_REFUND:'POS Refund',
   ECOM_PURCHASE:'ECOM Purchase', ECOM_REFUND:'ECOM Refund',
   TDS_INITIATE:'3DS Initiate', TDS_VERIFY:'3DS Verify OTP',
@@ -853,12 +859,13 @@ const CH_COLORS = {
   ISSUER:'#ec4899',CARD_DETAILS:'#9b59fc',
   CARD_ACTIVATE:'#10b981',CARD_BLOCK:'#ef4444',CARD_SET_LIMIT:'#f59e0b',CARD_RESET_PIN:'#8b5cf6',
   ATM_WITHDRAWAL:'#f59e0b',ATM_DEPOSIT:'#f59e0b',
+  ICCW_WITHDRAWAL:'#38bdf8',
   POS_PURCHASE:'#22c55e',POS_REFUND:'#22c55e',
   ECOM_PURCHASE:'#3b82f6',ECOM_REFUND:'#3b82f6',
   TDS_INITIATE:'#06b6d4',TDS_VERIFY:'#06b6d4',
   MOBILE:'#8b5cf6',RINGPAY:'#f97316',AUTH_TOKEN:'#a855f7'
 };
-const CH_LIST = ['ISSUER','CARD_DETAILS','CARD_ACTIVATE','CARD_BLOCK','CARD_SET_LIMIT','CARD_RESET_PIN','ATM_WITHDRAWAL','ATM_DEPOSIT','POS_PURCHASE','POS_REFUND','ECOM_PURCHASE','ECOM_REFUND','TDS_INITIATE','TDS_VERIFY','MOBILE','RINGPAY','AUTH_TOKEN'];
+const CH_LIST = ['ISSUER','CARD_DETAILS','CARD_ACTIVATE','CARD_BLOCK','CARD_SET_LIMIT','CARD_RESET_PIN','ATM_WITHDRAWAL','ATM_DEPOSIT','ICCW_WITHDRAWAL','POS_PURCHASE','POS_REFUND','ECOM_PURCHASE','ECOM_REFUND','TDS_INITIATE','TDS_VERIFY','MOBILE','RINGPAY','AUTH_TOKEN'];
 
 // Default API key per channel role
 const CH_APIKEYS = {
@@ -866,6 +873,7 @@ const CH_APIKEYS = {
   CARD_ACTIVATE:'sk_issuer_BANK_CORE', CARD_BLOCK:'sk_issuer_BANK_CORE',
   CARD_SET_LIMIT:'sk_issuer_BANK_CORE', CARD_RESET_PIN:'sk_mobile_APP_USER1',
   ATM_WITHDRAWAL:'sk_terminal_ATM_4455', ATM_DEPOSIT:'sk_terminal_ATM_4455',
+  ICCW_WITHDRAWAL:'sk_terminal_ATM_4455',
   POS_PURCHASE:'sk_merchant_POS_MCH001', POS_REFUND:'sk_merchant_POS_MCH001',
   ECOM_PURCHASE:'sk_merchant_POS_MCH001', ECOM_REFUND:'sk_merchant_POS_MCH001',
   TDS_INITIATE:'sk_merchant_POS_MCH001', TDS_VERIFY:'sk_merchant_POS_MCH001',
@@ -892,6 +900,7 @@ const PAYLOADS = {
   CARD_RESET_PIN:{encryptedPan:"<encryptedPan from issue response>",expiry:"05/31",newPin:"<generated PIN from offline tool>"},
   ATM_WITHDRAWAL:{channelId:"ATM",data:{clientTxnId:"atm-1001",transactionType:"WITHDRAWAL",atmId:"ATM-4455",terminalId:"TERM-8899",location:"Mumbai-Andheri",card:{pan:"<encryptedPan from issue response>",expiry:"05/31"},pin:"<generated PIN from offline tool>",amount:500.00,fee:10.00}},
   ATM_DEPOSIT:{channelId:"ATM",data:{clientTxnId:"atm-1002",transactionType:"DEPOSIT",atmId:"ATM-4455",terminalId:"TERM-8899",location:"Mumbai-Andheri",card:{pan:"<encryptedPan from issue response>",expiry:"05/31"},pin:"<generated PIN from offline tool>",amount:3000.00,fee:0.00}},
+  ICCW_WITHDRAWAL:{channelId:"ICCW",data:{clientTxnId:"iccw-1001",transactionType:"WITHDRAWAL",merchantId:"MCH-ICCW-001",terminalId:"TERM-7788",location:"Sydney Mall",amount:500.00,fee:10.00,currency:"AUD",card:{pan:"<encryptedPan from issue response>",pin:"<generated PIN from offline tool>",expiry:"05/31",cvv:"617"}}},
   POS_PURCHASE:{channelId:"POS",data:{clientTxnId:"pos-1001",transactionType:"PURCHASE",merchantId:"MCH-POS-001",terminalId:"TERM-7788",location:"Sydney Mall",amount:100.00,fee:10.00,currency:"USD",card:{pan:"<encryptedPan from issue response>",pin:"<generated PIN from offline tool>",expiry:"05/31",cvv:"617"}}},
   POS_REFUND:{channelId:"POS",data:{clientTxnId:"pos-ref-1001",transactionType:"REFUND",origTransactionId:"<transactionId from purchase response>",merchantId:"MCH-POS-001",terminalId:"TERM-7788",amount:20.00,card:{pan:"<encryptedPan from issue response>",pin:"<generated PIN from offline tool>",expiry:"05/31"}}},
   ECOM_PURCHASE:{channelId:"ECOM",data:{clientTxnId:"ecom-pur-3002",transactionType:"PURCHASE",merchantId:"MCH-ECOM-55",orderId:"ORD-SECURE-3001",amount:100.99,fee:0.50,currency:"EUR",card:{pan:"<encryptedPan from issue response>",pin:"<generated PIN from offline tool>",expiry:"05/31",cvv:"905"}}},

@@ -39,7 +39,7 @@ inline constexpr int    FALCON_AI_DECLINE_SCORE = 85;    // local AI risk score
 
 // ── Channel tag used for cross-channel queries ────────────────────────────────
 enum class FalconChannel {
-    ATM, MOBILE, POS, ECOM, QRCODE, RINGPAY, ALL
+    ATM, MOBILE, POS, ECOM, QRCODE, RINGPAY, ICCW, ALL
 };
 
 // ── Cache Eviction Policy ─────────────────────────────────────────────────────

@@ -34,6 +34,8 @@ add_executable(BankingAPIServer
         include/mobile.h
         pos.cpp
         include/pos.h
+        iccw.cpp
+        include/iccw.h
         issue.cpp
         include/issue.h
         include/ecom.h
