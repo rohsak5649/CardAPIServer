@@ -7,6 +7,7 @@
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Geist+Mono:wght@300;400;500;600;700&family=Outfit:wght@300;400;500;600;700;800&display=swap" rel="stylesheet">
 <style>
+
 /* ══════════════════════════ TOKENS ══════════════════════════ */
 :root{
   --p50:#faf5ff; --p100:#f3e8ff; --p200:#e9d5ff; --p300:#d8b4fe;
