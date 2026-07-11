@@ -1,4 +1,5 @@
 #include "currency_converter.h"
+#include "DatabaseQueries.h"
 #include <stdexcept>
 #include <iostream>
 #include <cmath>
@@ -19,16 +20,11 @@ CurrencyConverter::ConversionResult CurrencyConverter::convertToBase(const std::
     }
 
     // Lookup FX rate
-    RowResult rateResult = sess.sql("SELECT rate FROM exchange_rates WHERE base_currency = ? AND target_currency = 'AUD'")
-        .bind(sourceCurrency)
-        .execute();
-
-    if (rateResult.count() == 0) {
+    auto rateOpt = DatabaseQueries::getExchangeRate(sess, sourceCurrency);
+    if (!rateOpt) {
         throw std::runtime_error("ERR_FX_RATE_NOT_FOUND");
     }
-
-    Row row = rateResult.fetchOne();
-    double rate = (double)row[0];
+    double rate = *rateOpt;
 
     double convertedRaw = amount * rate;
     double markup = convertedRaw * (BANK_FX_MARKUP_PERCENT / 100.0);

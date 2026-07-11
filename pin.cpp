@@ -126,6 +126,8 @@
 #include <openssl/hmac.h>
 #include <vector>
 #include <stdexcept>
+#include <cstring>
+#include <cstdlib>
 
 /* ===================== SINGLETON ACCESS ===================== */
 
@@ -136,8 +138,14 @@ PINService& PINService::getInstance() {
 
 /* ===================== CONSTRUCTOR ===================== */
 
-PINService::PINService()
-    : secretKey("ULTRA_SECRET_KEY_2026_!@#") {}
+PINService::PINService() {
+    // Read secret key from environment variable for production security.
+    // NEVER hardcode HMAC keys in source — use a vault or env var.
+    const char* envKey = std::getenv("PIN_SECRET_KEY");
+    secretKey = (envKey && std::strlen(envKey) > 0)
+                ? std::string(envKey)
+                : "ULTRA_SECRET_KEY_2026_!@#";  // fallback for local dev only
+}
 
 
 /* ===================== BIT MIX ===================== */
@@ -239,8 +247,8 @@ std::string PINService::generatePIN(const std::string& pan, size_t length) const
         if (pan.size() != 16)
             throw std::invalid_argument("PAN must be 16 digits");
 
-        if (length == 0)
-            throw std::invalid_argument("PIN length cannot be zero");
+        if (length < 4)
+            throw std::invalid_argument("PIN length must be at least 4");
 
         auto blocks = derive(pan);
 

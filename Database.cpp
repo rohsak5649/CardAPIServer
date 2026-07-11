@@ -17,8 +17,10 @@
 #include "TransactionLogger.h"
 #include <iostream>
 #include <cstdlib>
+#include <thread>
 
 // ── Static member definitions ─────────────────────────────────────────────────
+int                     Database::poolSizeRuntime_ = POOL_SIZE_DEFAULT;
 std::vector<Session*>   Database::allConnections_;
 std::queue<Session*>    Database::freeConnections_;
 std::mutex              Database::poolMutex_;
@@ -84,45 +86,81 @@ Session* Database::healSession_(Session* old) {
 
 // ── initPool() ────────────────────────────────────────────────────────────────
 void Database::initPool() {
+    int size = POOL_SIZE_DEFAULT;
+    if (const char* envVal = std::getenv("DB_POOL_SIZE")) {
+        try {
+            size = std::stoi(envVal);
+        } catch (...) {
+            // Ignore parse errors, fall back to default
+        }
+    }
+    if (size < 1) size = 1;
+    if (size > POOL_SIZE_MAX) size = POOL_SIZE_MAX;
+    poolSizeRuntime_ = size;
+
     TransactionLogger::ScopedFunctionTrace trace("Database::initPool",
-                                                 {{"poolSize", std::to_string(POOL_SIZE)}});
+                                                 {{"poolSize", std::to_string(poolSizeRuntime_)}});
     std::lock_guard<std::mutex> lk(poolMutex_);
     if (poolReady_) {
         trace.success({{"status", "already_ready"}});
         return;
     }
 
-    std::cout << "[DB] Initialising connection pool (" << POOL_SIZE << " sessions)…\n";
-    allConnections_.reserve(POOL_SIZE);
+    std::cout << "[DB] Initialising connection pool (" << poolSizeRuntime_ << " sessions)…\n";
+    allConnections_.reserve(poolSizeRuntime_);
 
-    for (int i = 0; i < POOL_SIZE; ++i) {
-        try {
-            Session* s = createSession_();
+    int createdCount = 0;
+    for (int i = 0; i < poolSizeRuntime_; ++i) {
+        Session* s = nullptr;
+        for (int attempt = 0; attempt < POOL_CONNECT_RETRIES; ++attempt) {
+            try {
+                s = createSession_();
+                break;
+            } catch (const std::exception& ex) {
+                std::cerr << "[DB] Failed to create connection " << i << " (attempt " << (attempt + 1) << "): " << ex.what() << "\n";
+                if (attempt + 1 < POOL_CONNECT_RETRIES) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(POOL_CONNECT_DELAY_MS));
+                }
+            }
+        }
+        if (s) {
             allConnections_.push_back(s);
             freeConnections_.push(s);
-        } catch (const std::exception& ex) {
-            std::cerr << "[DB] Failed to create connection " << i << ": " << ex.what() << "\n";
-            trace.fail("failed to create database connection",
-                       {{"connectionIndex", std::to_string(i)}, {"error", ex.what()}});
-            throw;
+            createdCount++;
+        } else {
+            std::cerr << "[DB] Permanent failure creating connection slot " << i << " after " << POOL_CONNECT_RETRIES << " attempts.\n";
         }
     }
 
+    if (createdCount == 0) {
+        trace.fail("failed to initialize any database connections in pool");
+        throw std::runtime_error("[DB] Failed to initialize any database connections in pool");
+    }
+
+    if (createdCount < poolSizeRuntime_) {
+        std::cerr << "[DB] Warning: Only initialized " << createdCount << " out of " << poolSizeRuntime_ << " connections.\n";
+    }
+
     poolReady_ = true;
-    std::cout << "[DB] Pool ready — " << POOL_SIZE << " connections available.\n";
-    trace.success({{"connections", std::to_string(POOL_SIZE)}});
+    std::cout << "[DB] Pool ready — " << createdCount << " connections available.\n";
+    trace.success({{"connections", std::to_string(createdCount)}});
 }
 
 // ── destroyPool() ────────────────────────────────────────────────────────────
 void Database::destroyPool() {
     TransactionLogger::ScopedFunctionTrace trace("Database::destroyPool");
     std::lock_guard<std::mutex> lk(poolMutex_);
+
+    // Drain freeConnections_ queue in O(1) via swap (avoids N pop() calls)
+    { std::queue<Session*> empty; std::swap(freeConnections_, empty); }
+
+    // Close and delete all sessions owned by the pool
     for (Session* s : allConnections_) {
+        if (!s) continue;  // skip nullptr slots from heal-failure
         try { s->close(); } catch (...) {}
         delete s;
     }
     allConnections_.clear();
-    while (!freeConnections_.empty()) freeConnections_.pop();
     poolReady_ = false;
     std::cout << "[DB] Pool destroyed. Total stale reconnects: "
               << staleReconnects_.load() << "\n";
@@ -155,13 +193,32 @@ Session* Database::acquire() {
         std::cerr << "[DB] Stale session detected, reconnecting…\n";
         trace.checkpoint("stale_session", "Stale database session detected");
         Session* stale = s;
-        Session* healed = healSession_(stale);
+        Session* healed = nullptr;
+        try {
+            healed = healSession_(stale);
+        } catch (...) {
+            // Heal failed — remove the dead pointer from allConnections_
+            // so the pool doesn't hold a dangling reference.
+            {
+                std::lock_guard<std::mutex> lk2(poolMutex_);
+                for (auto& ptr : allConnections_) {
+                    if (ptr == stale) {
+                        ptr = nullptr;
+                        break;
+                    }
+                }
+            }
+            trace.fail("session heal failed — connection slot nulled");
+            throw; // propagate so caller gets a clean error
+        }
 
-        std::lock_guard<std::mutex> lk2(poolMutex_);
-        for (auto& ptr : allConnections_) {
-            if (ptr == stale) {
-                ptr = healed;
-                break;
+        {
+            std::lock_guard<std::mutex> lk2(poolMutex_);
+            for (auto& ptr : allConnections_) {
+                if (ptr == stale) {
+                    ptr = healed;
+                    break;
+                }
             }
         }
         s = healed;
@@ -188,7 +245,10 @@ std::optional<Session*> Database::tryAcquire() {
 void Database::release(Session* session) {
     TransactionLogger::ScopedFunctionTrace trace("Database::release");
     if (!session) {
-        trace.fail("null database session release requested");
+        // This can happen if healSession_ failed and nulled the slot.
+        // Do NOT push nullptr back into freeConnections_ — that would crash
+        // the next caller who acquires it.
+        trace.fail("null database session release requested — slot dropped");
         return;
     }
     {
@@ -244,9 +304,17 @@ Database::ScopedConnection& Database::ScopedConnection::operator=(ScopedConnecti
 }
 
 // ── Legacy shim ───────────────────────────────────────────────────────────────
+// NOTE: legacySession_ is intentionally NOT part of the pool. It is kept for
+// backward-compatibility only. It is thread-safe via the pool mutex below.
 Session& Database::getSession() {
     TransactionLogger::ScopedFunctionTrace trace("Database::getSession");
-    if (!legacySession_) legacySession_ = createSession_();
+    // Double-checked locking to avoid races on the legacy singleton session.
+    if (!legacySession_) {
+        std::lock_guard<std::mutex> lk(poolMutex_);
+        if (!legacySession_) {
+            legacySession_ = createSession_();
+        }
+    }
     trace.success();
     return *legacySession_;
 }

@@ -70,6 +70,9 @@ add_executable(BankingAPIServer
         include/card_mgmt.h
         tds.cpp
         include/tds.h
+        include/global_contant.h
+        DatabaseQueries.cpp
+        include/DatabaseQueries.h
 )
 
 # ── Compiler flags ─────────────────────────────────────────────────────────────

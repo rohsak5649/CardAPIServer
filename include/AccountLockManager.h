@@ -113,9 +113,12 @@ public:
         // CREDIT in the waiters queue, and CREDIT has higher priority than
         // DEBIT.
         state.waiters.pop();
+        // isLocked remains true — we are handing the lock directly to the
+        // next waiter without releasing it to the general pool.
         nextNode->ready = true;
         nextNode->cv.notify_one();
       } else {
+        // No waiters — actually release the lock.
         state.isLocked = false;
         if (state.activeCredits == 0 && state.activeDebits == 0) {
           states_.erase(it);

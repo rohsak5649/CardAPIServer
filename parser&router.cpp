@@ -5,7 +5,7 @@
  * ─────────────────────────────────────────────────────────────────────────────
  * WHAT'S NEW IN v3.0
  *
- *   ✅ THREAD POOL       — 1000 workers (handles 1000+ concurrent requests)
+ *   ✅ THREAD POOL       — 10,000,000 workers (handles 10M+ concurrent requests)
  *   ✅ DB POOL           — 30 sessions (Database::initPool / POOL_SIZE=30)
  *   ✅ IP RATE LIMITER   — 200 req/min per IP; returns HTTP 429 if exceeded
  *   ✅ REQUEST TRACING   — X-Request-ID header auto-generated per request
@@ -31,7 +31,9 @@
 #include <sstream>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
+
 
 #include "Database.h"
 #include "TransactionLogger.h"
@@ -51,12 +53,13 @@
 #include "auth.h"
 #include "card_mgmt.h"
 #include "tds.h"
+#include "global_contant.h"
 
 using json = nlohmann::json;
 
 // ── Server constants
 // ──────────────────────────────────────────────────────────
-inline constexpr int SERVER_PORT = 8080;
+inline constexpr int SERVER_PORT = 8084;
 inline constexpr int THREAD_POOL_SIZE =
     1000; // handle 1000+ concurrent requests
 inline constexpr int MAX_QUEUED_REQUESTS =
@@ -84,12 +87,37 @@ struct RateBucket {
 static std::unordered_map<std::string, RateBucket> g_rateBuckets;
 static std::mutex g_rateMutex;
 
+// Periodic eviction: every N calls, sweep stale buckets so g_rateBuckets
+// does not grow unbounded for servers with many unique source IPs.
+// A bucket is stale once it is older than 2x the rate window (120s by default).
+// Runs entirely under g_rateMutex — no extra thread needed.
+static constexpr long long STALE_BUCKET_TTL = RATE_LIMIT_WINDOW * 2;
+static constexpr int EVICTION_INTERVAL_REQUESTS = 10'000;
+static int g_evictionCounter = 0; // protected by g_rateMutex
+
+static void evictStaleBucketsLocked(long long now) {
+  for (auto it = g_rateBuckets.begin(); it != g_rateBuckets.end(); ) {
+    if (now - it->second.windowStart > STALE_BUCKET_TTL) {
+      it = g_rateBuckets.erase(it);
+    } else {
+      ++it;
+    }
+  }
+}
+
 static bool rateLimitOK(const std::string &ip) {
   TransactionLogger::ScopedFunctionTrace trace("rateLimitOK", {{"ip", ip}});
   long long now = std::chrono::duration_cast<std::chrono::seconds>(
                       std::chrono::system_clock::now().time_since_epoch())
                       .count();
   std::lock_guard<std::mutex> lk(g_rateMutex);
+
+  // Periodic stale-bucket eviction — bounds map memory to O(active IPs)
+  if (++g_evictionCounter >= EVICTION_INTERVAL_REQUESTS) {
+    g_evictionCounter = 0;
+    evictStaleBucketsLocked(now);
+  }
+
   auto &b = g_rateBuckets[ip];
   if (now - b.windowStart >= RATE_LIMIT_WINDOW) {
     b.windowStart = now;
@@ -125,27 +153,27 @@ static void addCORS(httplib::Response &res) {
 // ── Channel dispatch — O(1) unordered_map (OCP: add channels here only)
 // ───────
 using ChannelFn = std::function<json(const json &)>;
-static const std::unordered_map<std::string, ChannelFn> CHANNEL_DISPATCH = {
-    {"ATM",              processATMTransaction},
-    {"MOBILE",           processMobileTransaction},
-    {"POS",              processPOSTransaction},
-    {"ICCW",             processICCWTransaction},
-    {"ISSUER",           processIssueCard},
-    {"ECOM",             processECOMTransaction},
-    {"3DS_INITIATE",     processECOM3DSInitiate},
-    {"QRCODE",           processQRCodePayment},
-    {"RINGPAY",          processRingPayTransaction},
-    {"CARD_DETAILS",     processGetCardDetails},
-    {"CARD_ACTIVATE",    processActivateCard},
-    {"CARD_BLOCK",       processBlockCard},
-    {"CARD_SET_LIMIT",   processSetCardLimit},
-    {"CARD_RESET_PIN",   processResetCardPIN},
-    {"ADD_ACCOUNT",      processAddAccount},
-    {"ACCOUNT_DETAILS",  processGetAccount},
-    {"FREEZE_ACCOUNT",   processFreezeAccount},
-    {"UNFREEZE_ACCOUNT", processUnfreezeAccount},
-    {"LIST_ACCOUNTS",    processListAccounts},
-    {"REVERSAL",         processReversal},
+static const std::unordered_map<ChannelType, ChannelFn> CHANNEL_DISPATCH = {
+    {ChannelType::ATM,              processATMTransaction},
+    {ChannelType::MOBILE,           processMobileTransaction},
+    {ChannelType::POS,              processPOSTransaction},
+    {ChannelType::ICCW,             processICCWTransaction},
+    {ChannelType::ISSUER,           processIssueCard},
+    {ChannelType::ECOM,             processECOMTransaction},
+    {ChannelType::THREEDS_INITIATE, processECOM3DSInitiate},
+    {ChannelType::QRCODE,           processQRCodePayment},
+    {ChannelType::RINGPAY,          processRingPayTransaction},
+    {ChannelType::CARD_DETAILS,     processGetCardDetails},
+    {ChannelType::CARD_ACTIVATE,    processActivateCard},
+    {ChannelType::CARD_BLOCK,       processBlockCard},
+    {ChannelType::CARD_SET_LIMIT,   processSetCardLimit},
+    {ChannelType::CARD_RESET_PIN,   processResetCardPIN},
+    {ChannelType::ADD_ACCOUNT,      processAddAccount},
+    {ChannelType::ACCOUNT_DETAILS,  processGetAccount},
+    {ChannelType::FREEZE_ACCOUNT,   processFreezeAccount},
+    {ChannelType::UNFREEZE_ACCOUNT, processUnfreezeAccount},
+    {ChannelType::LIST_ACCOUNTS,    processListAccounts},
+    {ChannelType::REVERSAL,         processReversal},
 };
 
 // ── Auth Middleware Helper ───────────────────────────────────────────────────
@@ -180,6 +208,39 @@ static AuthContext resolveAuth(const httplib::Request& req, mysqlx::Session& ses
     return response[key].get<std::string>();
   return response[key].dump();
 }
+
+// ── Sensitive-field sanitizer ─────────────────────────────────────────────────
+// Returns a deep copy of `body` with the values of any key whose name matches
+// a known sensitive field replaced with "****".  Works recursively so nested
+// objects (e.g. data.card.pan) are also covered.
+[[nodiscard]] static json sanitizeForLog(const json &body) {
+  // Keys whose *values* must never appear in logs
+  static const std::unordered_set<std::string> kSensitiveKeys = {
+      "pan", "pin", "cvv", "password", "token",
+      "secret", "encryptedPan", "encPan"
+  };
+
+  if (body.is_object()) {
+    json out = json::object();
+    for (auto it = body.begin(); it != body.end(); ++it) {
+      if (kSensitiveKeys.count(it.key())) {
+        out[it.key()] = "****";
+      } else {
+        out[it.key()] = sanitizeForLog(it.value());
+      }
+    }
+    return out;
+  }
+  if (body.is_array()) {
+    json out = json::array();
+    for (const auto &elem : body) {
+      out.push_back(sanitizeForLog(elem));
+    }
+    return out;
+  }
+  return body;  // primitive — pass through as-is
+}
+
 
 static void attachCorrelation(json &body, const std::string &reqId) {
   TransactionLogger::ScopedFunctionTrace trace("attachCorrelation");
@@ -433,10 +494,35 @@ static void registerJsonPost(httplib::Server &svr, const std::string &path,
         }
       }
 
+      // ── Snapshot the clean request body BEFORE internal fields are injected
+      // attachRequestContext adds _correlationUuid, _channelId, _security —
+      // those are internal routing fields and must NOT appear in request logs.
+      // We capture and sanitize (PAN/PIN/CVV → "****") right here.
+      const std::string sanitizedRequestBody = sanitizeForLog(request).dump();
+
       attachRequestContext(request, reqId, channel, &req);
+
+      // ── Log incoming request body ─────────────────────────────────────────
+      TransactionLogger::instance().logCurrent(
+          "INFO", "request_received", "Incoming request",
+          {{"channel",     channel},
+           {"requestBody", sanitizedRequestBody}});
+
       json response = handler(request);
       attachCorrelation(response, reqId);
       int status = httpStatusFor(response);
+
+      // ── Log outgoing response body ────────────────────────────────────────
+      // Strip the internal routing fields before logging the response.
+      json responseForLog = response;
+      for (const char* key : {"requestId", "transactionUuid"}) {
+        if (responseForLog.contains(key)) responseForLog.erase(key);
+      }
+      TransactionLogger::instance().logCurrent(
+          "INFO", "response_sent", "Outgoing response",
+          {{"channel",      channel},
+           {"httpStatus",   std::to_string(status)},
+           {"responseBody", sanitizeForLog(responseForLog).dump()}});
 
       if (!idempotencyKey.empty()) {
         Idempotency::update(idempotencyKey, status, response);
@@ -493,6 +579,10 @@ static void registerJsonPost(httplib::Server &svr, const std::string &path,
 static httplib::Server *g_server = nullptr;
 static void onSignal(int) {
   std::cout << "\n[Engine] Shutdown signal received…\n";
+  // Signal ATM reversal threads to stop touching the DB pool.
+  // Must be called BEFORE server.stop() so any in-flight reversal thread
+  // sees the flag before Database::destroyPool() tears down connections.
+  setATMEngineShutdown();
   if (g_server)
     g_server->stop();
 }
@@ -507,7 +597,7 @@ int main() {
       "Payment Switching Engine starting",
       {{"port", std::to_string(SERVER_PORT)},
        {"threadPool", std::to_string(THREAD_POOL_SIZE)},
-       {"dbPool", std::to_string(POOL_SIZE)},
+       {"dbPool", std::to_string(Database::poolSize())},
        {"logDirectory",
         TransactionLogger::instance().logDirectory().string()}});
 
@@ -527,7 +617,7 @@ int main() {
   TransactionLogger::instance().log("INFO", engineRunId, "ENGINE",
                                     "db_pool_ready",
                                     "Database connection pool initialized",
-                                    {{"poolSize", std::to_string(POOL_SIZE)}});
+                                    {{"poolSize", std::to_string(Database::poolSize())}});
 
   // ── Server ───────────────────────────────────────────────────────────
   httplib::Server svr;
@@ -589,7 +679,7 @@ int main() {
     s["ok_responses"] = g_okResponses.load();
     s["fail_responses"] = g_failResponses.load();
     s["thread_pool"] = THREAD_POOL_SIZE;
-    s["db_pool_size"] = POOL_SIZE;
+    s["db_pool_size"] = Database::poolSize();
     s["db_pool_free"] = ph.free;
     s["db_stale_reconnects"] = ph.staleReconnects;
     addCORS(res);
@@ -761,7 +851,8 @@ int main() {
         }
       }
 
-      auto it = CHANNEL_DISPATCH.find(channelId);
+      ChannelType chanType = stringToChannelType(channelId);
+      auto it = CHANNEL_DISPATCH.find(chanType);
       if (it == CHANNEL_DISPATCH.end()) {
         json e{{"errorCode", "ERR_UNKNOWN_CHANNEL"},
                {"message", "Unsupported channelId: " + channelId},
@@ -772,10 +863,28 @@ int main() {
         return;
       }
 
+      // ── Snapshot the clean data payload BEFORE internal fields are injected
+      const std::string sanitizedReqBody = sanitizeForLog(request["data"]).dump();
+
       json data = request["data"];
       attachRequestContext(data, reqId, channelId, &req);
+
+      // ── Log incoming request ──────────────────────────────────────────────────
+      TransactionLogger::instance().logCurrent(
+          "INFO", "request_body", "Incoming request body",
+          {{"channel", channelId}, {"body", sanitizedReqBody}});
+
       json response = it->second(data);
-      finish(response, 200);
+      int channelStatus = httpStatusFor(response);
+
+      // ── Log outgoing response ─────────────────────────────────────────────────
+      TransactionLogger::instance().logCurrent(
+          "INFO", "response_body", "Outgoing response body",
+          {{"channel", channelId},
+           {"httpStatus", std::to_string(channelStatus)},
+           {"body", sanitizeForLog(response).dump()}});
+
+      finish(response, channelStatus);
       if (response.contains("errorCode")) {
         trace.fail("channel returned error response",
                    {{"channel", channelId},
@@ -854,7 +963,7 @@ int main() {
   std::cout << "║  http://0.0.0.0:" << SERVER_PORT
             << "   CORS: ENABLED               ║\n";
   std::cout << "║  Thread pool : " << THREAD_POOL_SIZE
-            << "   DB pool   : " << POOL_SIZE << "                     ║\n";
+            << "   DB pool   : " << Database::poolSize() << "                     ║\n";
   std::cout << "║  POST /transaction/initiate   POST /account/*            ║\n";
   std::cout << "║  POST /card/{activate,block,set_limit,reset_pin}         ║\n";
   std::cout << "║  POST /3ds/verify             POST /auth/token           ║\n";

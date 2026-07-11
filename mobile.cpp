@@ -18,10 +18,12 @@
 #include "mobile.h"
 #include "AccountLockManager.h"
 #include "Database.h"
+#include "DatabaseQueries.h"
 #include "falcon.h"
 #include "panencrypted.h"
 #include "pin.h"
 #include "TransactionLogger.h"
+#include "global_contant.h"
 
 #include <chrono>
 #include <future>
@@ -44,14 +46,6 @@ inline constexpr int MOB_TIMEOUT_SEC = 6;
 
 // ── TxnId
 // ─────────────────────────────────────────────────────────────────────
-[[nodiscard]] static std::string makeTxnId() {
-  auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                std::chrono::system_clock::now().time_since_epoch())
-                .count();
-  std::mt19937 gen{std::random_device{}()};
-  return "mobile-txn-" + std::to_string(ms) + "-" +
-         std::to_string(std::uniform_int_distribution<>(1000, 9999)(gen));
-}
 
 // ── Error helper
 // ──────────────────────────────────────────────────────────────
@@ -70,8 +64,8 @@ inline constexpr int MOB_TIMEOUT_SEC = 6;
   Schema db = sess.getSchema("bankingdb");
 
   try {
-    std::string clientTxnId = data.value("clientTxnId", makeTxnId());
-    std::string txnType = data.value("transactionType", "");
+    std::string clientTxnId = data.value("clientTxnId", TransactionLogger::currentUuid());
+    TransactionType txnType = stringToTransactionType(data.value("transactionType", ""));
     std::string deviceId = data.value("deviceId", "");
     std::string mobileNo = data.value("mobileNumber", "");
     double amount = data.value("amount", 0.0);
@@ -97,20 +91,20 @@ inline constexpr int MOB_TIMEOUT_SEC = 6;
       try {
         pan = PANEncryptionService::getInstance().decryptPAN(encPan);
       } catch (const std::exception &e) {
-        sess.rollback();
+        // No transaction open yet — no rollback needed
         trace.fail("encrypted PAN decrypt failed", {{"error", e.what()}});
         return err("ERR_INVALID_ENCRYPTED_PAN", e.what());
       }
 
       if (pan.length() != 16) {
-        sess.rollback();
+        // No transaction open yet — no rollback needed
         trace.fail("invalid PAN length");
         return err("ERR_INVALID_PAN", "PAN must be 16 digits");
       }
 
       // PIN verify (logic unchanged per client requirement)
       if (!PINService::getInstance().verifyPIN(pan, pin)) {
-        sess.rollback();
+        // No transaction open yet — no rollback needed
         trace.fail("PIN verification failed");
         return err("ERR_INVALID_PIN", "PIN verification failed");
       }
@@ -120,7 +114,7 @@ inline constexpr int MOB_TIMEOUT_SEC = 6;
                         .bind("p", pan)
                         .execute();
       if (accRes.count() == 0) {
-        sess.rollback();
+        // No transaction open yet — no rollback needed
         trace.fail("primary card not found for PAN");
         return err("ERR_CARD_NOT_FOUND", "No PRIMARY card for PAN");
       }
@@ -131,7 +125,7 @@ inline constexpr int MOB_TIMEOUT_SEC = 6;
     }
 
     if (!debitAccOpt) {
-      sess.rollback();
+      // No transaction open yet — no rollback needed
       trace.fail("debit account could not be determined");
       return err("ERR_DEBIT_ACCOUNT_REQUIRED",
                  "Could not determine debit account");
@@ -143,7 +137,8 @@ inline constexpr int MOB_TIMEOUT_SEC = 6;
     std::string fraudReason;
     if (falcon.checkFraud(debitAcc, amount, fraudReason,
                           FalconChannel::MOBILE, &data)) {
-      std::string txnId = makeTxnId();
+      // Use the correlation UUID so the fraud-decline record ties back to the request log.
+      std::string txnId = data.value("_correlationUuid", TransactionLogger::currentUuid());
       falcon.logFraud(txnId, clientTxnId, deviceId, mobileNo, debitAcc, amount,
                       fraudReason);
       sess.commit();
@@ -154,15 +149,15 @@ inline constexpr int MOB_TIMEOUT_SEC = 6;
     }
 
     // ── Transaction type validation ───────────────────────────────────
-    if (txnType != "FUND_TRANSFER") {
-      sess.rollback();
-      trace.fail("unsupported mobile transaction type", {{"transactionType", txnType}});
+    if (txnType != TransactionType::FUND_TRANSFER) {
+      // No transaction open yet — no rollback needed
+      trace.fail("unsupported mobile transaction type", {{"transactionType", transactionTypeToString(txnType)}});
       return err("ERR_INVALID_TYPE", "Only FUND_TRANSFER supported for MOBILE");
     }
 
     // ── Single-transaction limit ──────────────────────────────────────
     if (amount > MOB_SINGLE_LIMIT) {
-      sess.rollback();
+      // No transaction open yet — no rollback needed
       trace.fail("single transaction limit exceeded",
                  {{"amount", std::to_string(amount)},
                   {"limit", std::to_string(MOB_SINGLE_LIMIT)}});
@@ -189,14 +184,56 @@ inline constexpr int MOB_TIMEOUT_SEC = 6;
 
     sess.startTransaction();
 
+    double debitBal = 0.0;
+    double creditBal = 0.0;
+
+    try {
+      // Lock accounts in database in deterministic alphabetical order to prevent database deadlocks
+      if (debitAcc < creditAcc) {
+        auto r1 = DatabaseQueries::getAccountBalance(sess, debitAcc, true);
+        if (!r1) {
+          sess.rollback();
+          return err("ERR_DEBIT_NOT_FOUND", "Debit account not found");
+        }
+        debitBal = *r1;
+
+        auto r2 = DatabaseQueries::getAccountBalance(sess, creditAcc, true);
+        if (!r2) {
+          sess.rollback();
+          return err("ERR_CREDIT_NOT_FOUND", "Credit account not found");
+        }
+        creditBal = *r2;
+      } else if (creditAcc < debitAcc) {
+        auto r2 = DatabaseQueries::getAccountBalance(sess, creditAcc, true);
+        if (!r2) {
+          sess.rollback();
+          return err("ERR_CREDIT_NOT_FOUND", "Credit account not found");
+        }
+        creditBal = *r2;
+
+        auto r1 = DatabaseQueries::getAccountBalance(sess, debitAcc, true);
+        if (!r1) {
+          sess.rollback();
+          return err("ERR_DEBIT_NOT_FOUND", "Debit account not found");
+        }
+        debitBal = *r1;
+      } else {
+        auto r1 = DatabaseQueries::getAccountBalance(sess, debitAcc, true);
+        if (!r1) {
+          sess.rollback();
+          return err("ERR_DEBIT_NOT_FOUND", "Debit account not found");
+        }
+        debitBal = *r1;
+        creditBal = debitBal;
+      }
+    } catch (const std::exception& e) {
+      sess.rollback();
+      trace.fail("failed to lock accounts", {{"error", e.what()}});
+      return err("ERR_DB_FAILURE", e.what());
+    }
+
     // ── Hourly limit ──────────────────────────────────────────────────
-    auto hourlyRes =
-        sess.sql("SELECT IFNULL(SUM(amount),0) FROM transaction_mobile"
-                 " WHERE account_number=? AND status='SUCCESS'"
-                 " AND created_at >= NOW() - INTERVAL 1 HOUR")
-            .bind(debitAcc)
-            .execute();
-    double hourlyTotal = hourlyRes.fetchOne()[0].get<double>();
+    double hourlyTotal = DatabaseQueries::getMobileHourlySpent(sess, debitAcc);
     if (hourlyTotal + amount > MOB_HOURLY_LIMIT) {
       sess.rollback();
       trace.fail("hourly limit exceeded",
@@ -208,13 +245,7 @@ inline constexpr int MOB_TIMEOUT_SEC = 6;
     }
 
     // ── Daily limit ───────────────────────────────────────────────────
-    double dailyTotal = mobileTable.select("IFNULL(SUM(amount),0)")
-                            .where("account_number=:acc AND status='SUCCESS' "
-                                   "AND DATE(created_at)=CURDATE()")
-                            .bind("acc", debitAcc)
-                            .execute()
-                            .fetchOne()[0]
-                            .get<double>();
+    double dailyTotal = DatabaseQueries::getMobileDailySpent(sess, debitAcc);
     if (dailyTotal + amount > MOB_DAILY_LIMIT) {
       sess.rollback();
       trace.fail("daily limit exceeded",
@@ -224,29 +255,6 @@ inline constexpr int MOB_TIMEOUT_SEC = 6;
                                         std::to_string(MOB_DAILY_LIMIT) +
                                         " exceeded");
     }
-
-    // ── Balance check ─────────────────────────────────────────────────
-    auto debitRow = accounts.select("balance")
-                        .where("account_number=:a")
-                        .bind("a", debitAcc)
-                        .execute();
-    if (debitRow.count() == 0) {
-      sess.rollback();
-      trace.fail("debit account not found", {{"accountNumber", debitAcc}});
-      return err("ERR_DEBIT_NOT_FOUND", "Debit account not found");
-    }
-    double debitBal = debitRow.fetchOne()[0].get<double>();
-
-    auto creditRow = accounts.select("balance")
-                         .where("account_number=:a")
-                         .bind("a", creditAcc)
-                         .execute();
-    if (creditRow.count() == 0) {
-      sess.rollback();
-      trace.fail("credit account not found", {{"accountNumber", creditAcc}});
-      return err("ERR_CREDIT_NOT_FOUND", "Credit account not found");
-    }
-    double creditBal = creditRow.fetchOne()[0].get<double>();
 
     if (debitBal < amount + fee) {
       sess.rollback();
@@ -258,18 +266,12 @@ inline constexpr int MOB_TIMEOUT_SEC = 6;
     }
 
     // ── Apply transfer ────────────────────────────────────────────────
-    accounts.update()
-        .set("balance", debitBal - amount - fee)
-        .where("account_number=:a")
-        .bind("a", debitAcc)
-        .execute();
-    accounts.update()
-        .set("balance", creditBal + amount)
-        .where("account_number=:a")
-        .bind("a", creditAcc)
-        .execute();
+    DatabaseQueries::updateAccountBalance(sess, debitAcc, debitBal - amount - fee);
+    DatabaseQueries::updateAccountBalance(sess, creditAcc, creditBal + amount);
 
-    std::string txnId = makeTxnId();
+    // Use the correlation UUID as the DB transaction_id — one ID for everything.
+    std::string txnId = data.value("_correlationUuid", TransactionLogger::currentUuid());
+
     auto ins =
         mobileTable
             .insert("transaction_id", "client_txn_id", "device_id",

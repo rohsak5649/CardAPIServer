@@ -1,6 +1,7 @@
 #include "account.h"
 #include "AccountLockManager.h"
 #include "Database.h"
+#include "DatabaseQueries.h"
 #include "TransactionLogger.h"
 
 #include <algorithm>
@@ -223,21 +224,14 @@ resolveCurrency(Session &sess, const json &data, json &errorResponse) {
     try {
       sess.startTransaction();
 
-      auto exists = sess
-                        .sql("SELECT account_id FROM accounts "
-                             "WHERE account_number=? FOR UPDATE")
-                        .bind(*accountNumber)
-                        .execute();
-      if (exists.count() == 0) {
+      if (!DatabaseQueries::checkAccountExistsForUpdate(sess, *accountNumber)) {
         sess.rollback();
         trace.fail("account not found during freeze update",
                    {{"accountNumber", *accountNumber}});
         return err("ERR_ACCOUNT_NOT_FOUND", "Account number does not exist");
       }
 
-      sess.sql("UPDATE accounts SET is_frozen=? WHERE account_number=?")
-          .bind(frozen ? 1 : 0, *accountNumber)
-          .execute();
+      DatabaseQueries::updateFreezeStatus(sess, *accountNumber, frozen);
       sess.commit();
     } catch (...) {
       try {

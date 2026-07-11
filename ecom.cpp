@@ -1,8 +1,11 @@
 #include "ecom.h"
+#include "global_contant.h"
+#include "DatabaseQueries.h"
 #include "Database.h"
 #include "falcon.h"
 #include "panencrypted.h"
 #include "pin.h"
+#include "AccountLockManager.h"
 #include "TransactionLogger.h"
 #include "accounting.h"
 #include "currency_converter.h"
@@ -20,14 +23,6 @@ using json = nlohmann::json;
 inline constexpr int ECOM_TIMEOUT_SEC = 5;
 
 // ── TXN ID ─────────────────────────────────────────────
-static std::string genECOMTxnId() {
-  auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                std::chrono::system_clock::now().time_since_epoch())
-                .count();
-  std::mt19937 g{std::random_device{}()};
-  return "ecom-txn-" + std::to_string(ms) + "-" +
-         std::to_string(std::uniform_int_distribution<>(1000, 9999)(g));
-}
 
 // ── ERROR HELPER ───────────────────────────────────────
 static json err(const std::string &code, const std::string &msg = "") {
@@ -42,17 +37,17 @@ static json err(const std::string &code, const std::string &msg = "") {
 // ═══════════════════════════════════════════════════════
 json processECOMTransactionCore(const json &data) {
   TransactionLogger::ScopedFunctionTrace trace("processECOMTransactionCore",
-                                               {{"transactionType", data.value("transactionType", "PURCHASE")}});
+                                               {{"transactionType", data.value("transactionType", transactionTypeToString(TransactionType::PURCHASE))}});
 
   Database::ScopedConnection sc;
   Session &sess = *sc;
   Schema db = sess.getSchema("bankingdb");
 
   try {
-    std::string txnType = data.value("transactionType", "PURCHASE");
+    TransactionType txnType = stringToTransactionType(data.value("transactionType", transactionTypeToString(TransactionType::PURCHASE)));
     double amount = data.value("amount", 0.0);
     std::string currency = data.value("currency", "INR");
-    std::string clientTxnId = data.value("clientTxnId", genECOMTxnId());
+    std::string clientTxnId = data.value("clientTxnId", TransactionLogger::currentUuid());
 
     // ── Resolve account number from card or direct input ──────────
     std::string accountNumber;
@@ -134,7 +129,7 @@ json processECOMTransactionCore(const json &data) {
       return err("ERR_MISSING_ACCOUNT", "accountNumber or card data required");
     }
 
-    if (txnType == "PURCHASE" && amount <= 0) {
+    if (txnType == TransactionType::PURCHASE && amount <= 0) {
       trace.fail("invalid amount", {{"amount", std::to_string(amount)}});
       return err("ERR_INVALID_AMOUNT", "Amount must be > 0");
     }
@@ -147,23 +142,17 @@ json processECOMTransactionCore(const json &data) {
     double fee = data.value("fee", 0.0);
 
     // accounts table has currency_id (FK), not currency column — must JOIN
-    auto accRes = sess.sql(
-        "SELECT a.balance, c.currency_code FROM accounts a "
-        "JOIN currency c ON c.currency_id = a.currency_id "
-        "WHERE a.account_number = ?")
-        .bind(accountNumber)
-        .execute();
-
-    if (!accRes.count()) {
+    auto accInfo = DatabaseQueries::getAccountBalanceAndCurrency(sess, accountNumber);
+    if (!accInfo) {
       trace.fail("account not found", {{"accountNumber", accountNumber}});
       return err("ERR_ACCOUNT_NOT_FOUND");
     }
 
-    Row accRow = accRes.fetchOne();
-    double balance = accRow[0].get<double>();
-    std::string accCurrency = accRow[1].isNull() ? "AUD" : accRow[1].get<std::string>();
+    double balance = accInfo->balance;
+    std::string accCurrency = accInfo->currencyCode.empty() ? "AUD" : accInfo->currencyCode;
 
-    std::string txnId = genECOMTxnId();
+    // Use the correlation UUID as the DB transaction_id — one ID for everything.
+    std::string txnId = data.value("_correlationUuid", TransactionLogger::currentUuid());
     std::string scope =
         (accCurrency == currency) ? "DOMESTIC" : "INTERNATIONAL";
 
@@ -193,24 +182,30 @@ json processECOMTransactionCore(const json &data) {
     }
 
     // ── PURCHASE ─────────────────────────────────
-    if (txnType == "PURCHASE") {
-
-      if (balance < amount) {
-        trace.fail("insufficient funds",
-                   {{"balance", std::to_string(balance)},
-                    {"amount", std::to_string(amount)}});
-        return err("ERR_INSUFFICIENT_FUNDS");
-      }
-
-      double newBal = balance - amount - fee;
-
+    if (txnType == TransactionType::PURCHASE) {
+      AccountLockManager::ScopedLock accLock(
+          AccountLockManager::getInstance(), accountNumber, TxnPriority::DEBIT);
       sess.startTransaction();
       try {
-        accounts.update()
-            .set("balance", newBal)
-            .where("account_number=:a")
-            .bind("a", accountNumber)
-            .execute();
+        auto currentBalOpt = DatabaseQueries::getAccountBalance(sess, accountNumber, true);
+        if (!currentBalOpt) {
+          sess.rollback();
+          trace.fail("account not found", {{"accountNumber", accountNumber}});
+          return err("ERR_ACCOUNT_NOT_FOUND");
+        }
+        double currentBalance = *currentBalOpt;
+
+        if (currentBalance < amount + fee) {
+          sess.rollback();
+          trace.fail("insufficient funds",
+                     {{"balance", std::to_string(currentBalance)},
+                      {"amount", std::to_string(amount)}});
+          return err("ERR_INSUFFICIENT_FUNDS");
+        }
+
+        double newBal = currentBalance - amount - fee;
+
+        DatabaseQueries::updateAccountBalance(sess, accountNumber, newBal);
 
         auto ins =
             ecomTable
@@ -227,21 +222,21 @@ json processECOMTransactionCore(const json &data) {
 
         Accounting::processPurchaseLedger(txnId, accountNumber, merchantId, amount, fee, fxMarkup, "ECOM Purchase", sess);
         sess.commit();
+
+        trace.success({{"transactionId", txnId}, {"scope", scope}});
+        return {{"transactionId", txnId},
+                {"status", "SUCCESS"},
+                {"balanceAfter", newBal},
+                {"amountCharged", amount},
+                {"scope", scope}};
       } catch (...) {
         sess.rollback();
         throw;
       }
-
-      trace.success({{"transactionId", txnId}, {"scope", scope}});
-      return {{"transactionId", txnId},
-              {"status", "SUCCESS"},
-              {"balanceAfter", newBal},
-              {"amountCharged", amount},
-              {"scope", scope}};
     }
 
     // ── REFUND ───────────────────────────────────
-    if (txnType == "REFUND") {
+    if (txnType == TransactionType::REFUND) {
 
       if (!data.contains("origClientTxnId")) {
         trace.fail("missing original client transaction id");
@@ -250,81 +245,87 @@ json processECOMTransactionCore(const json &data) {
 
       std::string orig = data["origClientTxnId"].get<std::string>();
 
-      auto pRes =
-          ecomTable.select("id", "amount", "refunded_amount", "flag")
-              .where("client_txn_id=:c AND message='ECOM purchase success'")
-              .bind("c", orig)
-              .execute();
-
-      if (pRes.count() == 0) {
-        trace.fail("original ECOM purchase not found", {{"origClientTxnId", orig}});
-        return err("ERR_ORIGINAL_NOT_FOUND");
-      }
-
-      Row pRow = pRes.fetchOne();
-      int64_t refId = pRow[0].get<int64_t>();
-      double origAmt = pRow[1].get<double>();
-      double refAmt = pRow[2].isNull() ? 0.0 : pRow[2].get<double>();
-      std::string flag = pRow[3].isNull() ? "N" : pRow[3].get<std::string>();
-
-      if (flag == "RF") {
-        trace.fail("already fully refunded");
-        return err("ERR_ALREADY_REFUNDED");
-      }
-
-      if (amount + refAmt > origAmt) {
-        trace.fail("refund exceeds original amount",
-                   {{"amount", std::to_string(amount)},
-                    {"refundedAmount", std::to_string(refAmt)},
-                    {"originalAmount", std::to_string(origAmt)}});
-        return err("ERR_REFUND_EXCEEDS");
-      }
-
-      double newBal = balance + amount;
-      std::string newFlag = (amount + refAmt == origAmt) ? "RF" : "PR";
+      AccountLockManager::ScopedLock accLock(
+          AccountLockManager::getInstance(), accountNumber, TxnPriority::CREDIT);
 
       sess.startTransaction();
       try {
-          accounts.update()
-              .set("balance", newBal)
-              .where("account_number=:a")
-              .bind("a", accountNumber)
-              .execute();
-              
-          ecomTable.update()
-              .set("refunded_amount", amount + refAmt)
-              .set("flag", newFlag)
-              .where("id=:id")
-              .bind("id", refId)
-              .execute();
-
-          auto ins =
-              ecomTable
-                  .insert("transaction_id", "client_txn_id", "account_number",
-                          "amount", "currency", "status", "message", "reference_txn_id")
-                  .values(txnId, clientTxnId, accountNumber, amount, currency,
-                          "SUCCESS", "ECOM refund success", orig)
-                  .execute();
-
-          master.insert("table_name", "reference_id", "status")
-              .values("transaction_ecom", ins.getAutoIncrementValue(), "SUCCESS")
-              .execute();
-              
-          Accounting::processRefundLedger(txnId, accountNumber, merchantId, amount, "ECOM Refund", sess);
-          sess.commit();
-      } catch (...) {
+        // Lock and check the original purchase row to prevent concurrent refunds
+        auto pInfo = DatabaseQueries::getEcomPurchaseForUpdate(sess, orig);
+        if (!pInfo) {
           sess.rollback();
-          throw;
-      }
+          trace.fail("original ECOM purchase not found", {{"origClientTxnId", orig}});
+          return err("ERR_ORIGINAL_NOT_FOUND");
+        }
 
-      trace.success({{"transactionId", txnId}, {"refundAmount", std::to_string(amount)}});
-      return {{"transactionId", txnId},
-              {"status", "SUCCESS"},
-              {"flag", newFlag},
-              {"balanceAfter", newBal}};
+        int64_t refId = pInfo->id;
+        double origAmt = pInfo->amount;
+        double refAmt = pInfo->refundedAmount;
+        std::string flag = pInfo->flag.empty() ? "N" : pInfo->flag;
+
+        if (flag == "RF") {
+          sess.rollback();
+          trace.fail("already fully refunded");
+          return err("ERR_ALREADY_REFUNDED");
+        }
+
+        if (amount + refAmt > origAmt) {
+          sess.rollback();
+          trace.fail("refund exceeds original amount",
+                     {{"amount", std::to_string(amount)},
+                      {"refundedAmount", std::to_string(refAmt)},
+                      {"originalAmount", std::to_string(origAmt)}});
+          return err("ERR_REFUND_EXCEEDS");
+        }
+
+        // Lock and read account balance
+        auto balRes = DatabaseQueries::getAccountBalance(sess, accountNumber, true);
+        if (!balRes) {
+          sess.rollback();
+          trace.fail("account not found for refund", {{"accountNumber", accountNumber}});
+          return err("ERR_ACCOUNT_NOT_FOUND");
+        }
+        double currentBalance = *balRes;
+
+        double newBal = currentBalance + amount;
+        std::string newFlag = (amount + refAmt == origAmt) ? "RF" : "PR";
+
+        DatabaseQueries::updateAccountBalance(sess, accountNumber, newBal);
+            
+        ecomTable.update()
+            .set("refunded_amount", amount + refAmt)
+            .set("flag", newFlag)
+            .where("id=:id")
+            .bind("id", refId)
+            .execute();
+
+        auto ins =
+            ecomTable
+                .insert("transaction_id", "client_txn_id", "account_number",
+                        "amount", "currency", "status", "message", "reference_txn_id")
+                .values(txnId, clientTxnId, accountNumber, amount, currency,
+                        "SUCCESS", "ECOM refund success", orig)
+                .execute();
+
+        master.insert("table_name", "reference_id", "status")
+            .values("transaction_ecom", ins.getAutoIncrementValue(), "SUCCESS")
+            .execute();
+            
+        Accounting::processRefundLedger(txnId, accountNumber, merchantId, amount, "ECOM Refund", sess);
+        sess.commit();
+
+        trace.success({{"transactionId", txnId}, {"refundAmount", std::to_string(amount)}});
+        return {{"transactionId", txnId},
+                {"status", "SUCCESS"},
+                {"flag", newFlag},
+                {"balanceAfter", newBal}};
+      } catch (...) {
+        sess.rollback();
+        throw;
+      }
     }
 
-    trace.fail("unsupported ECOM transaction type", {{"transactionType", txnType}});
+    trace.fail("unsupported ECOM transaction type", {{"transactionType", transactionTypeToString(txnType)}});
     return err("ERR_INVALID_TYPE", "Unsupported transactionType");
 
   } catch (const std::exception &e) {
@@ -339,13 +340,13 @@ json processECOMTransactionCore(const json &data) {
 json processECOMTransaction(const json &data) {
 
   TransactionLogger::ScopedFunctionTrace trace("processECOMTransaction",
-                                               {{"transactionType", data.value("transactionType", "PURCHASE")}});
+                                               {{"transactionType", data.value("transactionType", transactionTypeToString(TransactionType::PURCHASE))}});
   std::string uuid = data.value("_correlationUuid", TransactionLogger::currentUuid());
   TransactionLogger::ScopedContext scope(uuid, "ECOM");
   TransactionLogger::instance().logCurrent(
       "INFO", "channel_handler_scheduled",
       "ECOM transaction handler scheduled",
-      {{"transactionType", data.value("transactionType", "PURCHASE")}});
+      {{"transactionType", data.value("transactionType", transactionTypeToString(TransactionType::PURCHASE))}});
 
   auto fut = std::async(std::launch::async, [data, uuid]() {
     TransactionLogger::ScopedContext asyncScope(uuid, "ECOM");

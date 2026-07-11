@@ -110,6 +110,7 @@ private:
     bool initialized_ = false;
     bool disabled_ = false;
     std::ofstream file_;
+    int fd_ = -1;                          // raw fd for ::fsync() — mirrors file_
     std::atomic<int> minimumSeverity_{20};
     mutable std::mutex mutex_;
 };

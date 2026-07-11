@@ -1,5 +1,6 @@
 #include "tds.h"
 #include "Database.h"
+#include "DatabaseQueries.h"
 #include "TransactionLogger.h"
 #include "panencrypted.h"
 #include "pin.h"
@@ -69,15 +70,7 @@ json processECOM3DSInitiate(const json& data) {
         std::string challengeId = genChallengeId();
         std::string otp = genOTP();
 
-        // Store transaction_data (full data payload) for Step 2
-        auto expires = std::chrono::system_clock::now() + std::chrono::minutes(10);
-        long long expTs = std::chrono::duration_cast<std::chrono::seconds>(
-                              expires.time_since_epoch()).count();
-
-        sess.sql("INSERT INTO tds_challenges (challenge_id, otp, transaction_data, channel, expires_at) "
-                 "VALUES (?, ?, ?, 'ECOM', FROM_UNIXTIME(?))")
-            .bind(challengeId, otp, data.dump(), expTs)
-            .execute();
+        DatabaseQueries::insert3DSChallenge(sess, challengeId, otp, data.dump(), "ECOM", 600);
 
         trace.success({{"challengeId", challengeId}});
         return {
@@ -108,17 +101,15 @@ json process3DSVerify(const json& data) {
         Database::ScopedConnection sc;
         Session& sess = *sc;
 
-        auto res = sess.sql("SELECT otp, transaction_data, status, expires_at FROM tds_challenges WHERE challenge_id = ?")
-                       .bind(challengeId).execute();
-        if (res.count() == 0) {
+        auto res = DatabaseQueries::get3DSChallenge(sess, challengeId);
+        if (!res) {
             trace.fail("challenge not found");
             return {{"errorCode", "ERR_CHALLENGE_NOT_FOUND"}, {"message", "Invalid challengeId"}};
         }
 
-        Row row = res.fetchOne();
-        std::string storedOtp    = row[0].get<std::string>();
-        std::string txnDataStr   = row[1].get<std::string>();
-        std::string status       = row[2].get<std::string>();
+        std::string storedOtp    = res->otp;
+        std::string txnDataStr   = res->transactionData;
+        std::string status       = res->status;
 
         if (status != "PENDING") {
             trace.fail("challenge already used", {{"status", status}});
@@ -128,10 +119,9 @@ json process3DSVerify(const json& data) {
         // Check expiry
         long long now = std::chrono::duration_cast<std::chrono::seconds>(
                             std::chrono::system_clock::now().time_since_epoch()).count();
-        long long expTs = (long long)row[3];
+        long long expTs = res->expiresAt;
         if (now > expTs) {
-            sess.sql("UPDATE tds_challenges SET status = 'EXPIRED' WHERE challenge_id = ?")
-                .bind(challengeId).execute();
+            DatabaseQueries::update3DSChallengeStatus(sess, challengeId, "EXPIRED");
             return {{"errorCode", "ERR_OTP_EXPIRED"}, {"message", "OTP has expired. Please initiate a new payment."}};
         }
 
@@ -141,8 +131,7 @@ json process3DSVerify(const json& data) {
         }
 
         // Mark challenge as VERIFIED
-        sess.sql("UPDATE tds_challenges SET status = 'VERIFIED' WHERE challenge_id = ?")
-            .bind(challengeId).execute();
+        DatabaseQueries::update3DSChallengeStatus(sess, challengeId, "VERIFIED");
 
         // Execute the actual ECOM transaction
         json txnData = json::parse(txnDataStr);

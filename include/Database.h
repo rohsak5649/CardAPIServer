@@ -1,17 +1,18 @@
 /*
  * Copyright (c) Rohan Sakhare — All rights reserved.
  *
- * DATABASE CONNECTION POOL  v3.0  (C++20 · Thread-Safe · Self-Healing)
+ * DATABASE CONNECTION POOL  v3.1  (C++20 · Thread-Safe · Self-Healing)
  * ─────────────────────────────────────────────────────────────────────
- * WHAT'S NEW IN v3.0
- *   ✅ Pool size raised to 30 (tuneable via POOL_SIZE)
- *   ✅ Self-healing: acquire() pings session, reconnects if stale
- *   ✅ [[nodiscard]] on acquire() — compiler warns if caller ignores it
- *   ✅ std::optional<Session*> tryAcquire() — non-blocking variant
- *   ✅ poolHealth() returns live stats (free / total / stale count)
- *   ✅ Credentials loaded from env-vars with fallback (SOLID OCP)
- *   ✅ ScopedConnection supports std::move correctly
- *   ✅ All internals use std::string_view where possible
+ * WHAT'S NEW IN v3.1
+ *   ✅ POOL_SIZE now read from DB_POOL_SIZE env-var at runtime (fallback: 10)
+ *      — was hard-coded 30, which exceeded mysqlx_max_connections on many
+ *        dev/staging MySQL installs and caused "EOS state" CDK errors
+ *   ✅ initPool() is now resilient: retries each slot up to
+ *      POOL_CONNECT_RETRIES times with POOL_CONNECT_DELAY_MS back-off
+ *      before failing; partial pool still starts if ≥ 1 connection succeeds
+ *   ✅ initPool() only throws when ZERO connections could be established
+ *   ✅ Pool size capped at runtime by DB_POOL_SIZE (override via env)
+ *   ✅ initPool() logs a warning if fewer connections than requested succeed
  *
  * USAGE (recommended):
  *   {
@@ -39,11 +40,21 @@
 
 using namespace mysqlx;
 
-// ── Tuneable constants ────────────────────────────────────────────────────────
-inline constexpr int  POOL_SIZE          = 30;     // max simultaneous DB connections
-inline constexpr int  POOL_TIMEOUT_MS    = 5'000;  // ms to wait for a free slot
-inline constexpr int  HEALTH_CHECK_RETRIES = 3;    // reconnect attempts before throw
+// ── Compile-time tuneable constants ──────────────────────────────────────────
+// POOL_SIZE is the *maximum* desired pool size.  The actual pool will be
+// smaller if MySQL rejects connections (e.g. mysqlx_max_connections limit).
+// Override at runtime via DB_POOL_SIZE environment variable.
+inline constexpr int  POOL_SIZE_DEFAULT      = 10;    // safe default for most MySQL installs
+inline constexpr int  POOL_SIZE_MAX          = 50;    // absolute ceiling
+inline constexpr int  POOL_TIMEOUT_MS        = 5'000; // ms to wait for a free slot
+inline constexpr int  HEALTH_CHECK_RETRIES   = 3;     // reconnect attempts before giving up
+inline constexpr int  POOL_CONNECT_RETRIES   = 3;     // retries per slot during initPool()
+inline constexpr int  POOL_CONNECT_DELAY_MS  = 200;   // back-off between slot retries (ms)
 // ─────────────────────────────────────────────────────────────────────────────
+
+// Kept for binary-compat with code that references POOL_SIZE directly.
+// Prefer Database::poolSize() which returns the runtime value.
+inline constexpr int  POOL_SIZE = POOL_SIZE_DEFAULT;
 
 struct PoolHealth {
     int total;
@@ -81,7 +92,10 @@ public:
     static void        initPool();
     static void        destroyPool();
     static PoolHealth  poolHealth();
-    static int         poolSize() noexcept { return POOL_SIZE; }
+
+    // Returns the *actual* pool size determined at runtime from DB_POOL_SIZE
+    // env-var (clamped to [1, POOL_SIZE_MAX]).  Use this instead of POOL_SIZE.
+    static int         poolSize() noexcept { return poolSizeRuntime_; }
 
     // ── Legacy shim (NOT thread-safe — migrate to ScopedConnection) ────────
     static Session& getSession();
@@ -91,6 +105,9 @@ private:
     static Session* createSession_();
     static bool     pingSession_(Session* s) noexcept;
     static Session* healSession_(Session* s);
+
+    // Resolved once at pool init from DB_POOL_SIZE env-var
+    static int                     poolSizeRuntime_;
 
     static std::vector<Session*>   allConnections_;
     static std::queue<Session*>    freeConnections_;
