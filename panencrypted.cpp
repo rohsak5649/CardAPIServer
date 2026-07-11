@@ -99,6 +99,8 @@
  */
 #include "panencrypted.h"
 #include <cstring>
+#include <memory>
+#include <vector>
 #include <openssl/bio.h>
 #include <openssl/buffer.h>
 #include <openssl/evp.h>
@@ -108,6 +110,12 @@
 const int KEY_LEN = 32;
 const int IV_LEN = 12;
 const int TAG_LEN = 16;
+
+// ── RAII wrapper for EVP_CIPHER_CTX ──────────────────────────────────────────
+// Guarantees EVP_CIPHER_CTX_free() is called on every exit path:
+// normal return, early throw, or any OpenSSL call failure.
+using EvpCipherCtxPtr =
+    std::unique_ptr<EVP_CIPHER_CTX, decltype(&EVP_CIPHER_CTX_free)>;
 
 // 🔐 IMPORTANT: move this to config/env later
 static const unsigned char AES_KEY[32] = {
@@ -123,22 +131,29 @@ PANEncryptionService &PANEncryptionService::getInstance() {
 
 // ================= BASE64 =================
 std::string PANEncryptionService::base64_decode(const std::string &input) {
-  BIO *b64, *bmem;
-  char buffer[4096];
+  // Decoded output is at most 3/4 of the base64 input — allocate exactly that
+  // to avoid the silent truncation risk of a fixed 4096-byte stack buffer.
+  const std::size_t maxDecoded = (input.size() / 4) * 3 + 3;
+  std::vector<char> buffer(maxDecoded);
 
-  b64 = BIO_new(BIO_f_base64());
-  bmem = BIO_new_mem_buf(input.data(), input.length());
-  bmem = BIO_push(b64, bmem);
+  BIO *b64  = BIO_new(BIO_f_base64());
+  BIO *bmem = BIO_new_mem_buf(input.data(), static_cast<int>(input.length()));
+  if (!b64 || !bmem) {
+    if (b64)  BIO_free(b64);
+    if (bmem) BIO_free(bmem);
+    throw std::runtime_error("Base64 decode: BIO allocation failed");
+  }
+  bmem = BIO_push(b64, bmem); // b64 now owns bmem; free via BIO_free_all(bmem)
 
   BIO_set_flags(bmem, BIO_FLAGS_BASE64_NO_NL);
-  int len = BIO_read(bmem, buffer, sizeof(buffer));
+  int len = BIO_read(bmem, buffer.data(), static_cast<int>(buffer.size()));
 
   BIO_free_all(bmem);
 
   if (len <= 0)
     throw std::runtime_error("Base64 decode failed");
 
-  return std::string(buffer, len);
+  return std::string(buffer.data(), static_cast<std::size_t>(len));
 }
 
 // ================= BASE64 ENCODE =================
@@ -164,81 +179,97 @@ std::string PANEncryptionService::base64_encode(const unsigned char *input,
 
 // ================= ENCRYPT =================
 std::string PANEncryptionService::encryptPAN(const std::string &plaintext) {
-  EVP_CIPHER_CTX *ctx;
   unsigned char iv[IV_LEN];
   unsigned char tag[TAG_LEN];
-  unsigned char ciphertext[4096];
+  // ciphertext is at most plaintext.size() + one AES block (16 bytes)
+  std::vector<unsigned char> ciphertext(plaintext.size() + 16);
 
-  int len, ciphertext_len;
+  int len = 0, ciphertext_len = 0;
 
   RAND_bytes(iv, IV_LEN);
 
-  ctx = EVP_CIPHER_CTX_new();
-  EVP_EncryptInit_ex(ctx, EVP_aes_256_gcm(), NULL, NULL, NULL);
+  // RAII: ctx is freed automatically on every exit path (return or exception)
+  EvpCipherCtxPtr ctx(EVP_CIPHER_CTX_new(), EVP_CIPHER_CTX_free);
+  if (!ctx)
+    throw std::runtime_error("encryptPAN: failed to create EVP_CIPHER_CTX");
 
-  EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_IVLEN, IV_LEN, NULL);
-  EVP_EncryptInit_ex(ctx, NULL, NULL, AES_KEY, iv);
+  if (EVP_EncryptInit_ex(ctx.get(), EVP_aes_256_gcm(), nullptr, nullptr, nullptr) != 1)
+    throw std::runtime_error("encryptPAN: EncryptInit failed");
 
-  EVP_EncryptUpdate(ctx, ciphertext, &len, (unsigned char *)plaintext.c_str(),
-                    plaintext.length());
+  EVP_CIPHER_CTX_ctrl(ctx.get(), EVP_CTRL_GCM_SET_IVLEN, IV_LEN, nullptr);
+  if (EVP_EncryptInit_ex(ctx.get(), nullptr, nullptr, AES_KEY, iv) != 1)
+    throw std::runtime_error("encryptPAN: key/IV init failed");
+
+  if (EVP_EncryptUpdate(ctx.get(), ciphertext.data(), &len,
+                        reinterpret_cast<const unsigned char*>(plaintext.data()),
+                        static_cast<int>(plaintext.size())) != 1)
+    throw std::runtime_error("encryptPAN: EncryptUpdate failed");
   ciphertext_len = len;
 
-  EVP_EncryptFinal_ex(ctx, ciphertext + len, &len);
+  if (EVP_EncryptFinal_ex(ctx.get(), ciphertext.data() + len, &len) != 1)
+    throw std::runtime_error("encryptPAN: EncryptFinal failed");
   ciphertext_len += len;
 
-  EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_GET_TAG, TAG_LEN, tag);
-
-  EVP_CIPHER_CTX_free(ctx);
+  EVP_CIPHER_CTX_ctrl(ctx.get(), EVP_CTRL_GCM_GET_TAG, TAG_LEN, tag);
+  // ctx freed here automatically by unique_ptr destructor
 
   // Combine: IV + TAG + CIPHERTEXT  (same format as offline tool)
-  std::string combined((char *)iv, IV_LEN);
-  combined.append((char *)tag, TAG_LEN);
-  combined.append((char *)ciphertext, ciphertext_len);
+  std::string combined(reinterpret_cast<char*>(iv), IV_LEN);
+  combined.append(reinterpret_cast<char*>(tag), TAG_LEN);
+  combined.append(reinterpret_cast<char*>(ciphertext.data()), ciphertext_len);
 
-  return base64_encode((unsigned char *)combined.c_str(), combined.size());
+  return base64_encode(reinterpret_cast<unsigned char*>(combined.data()),
+                       static_cast<int>(combined.size()));
 }
 
 // ================= DECRYPT =================
 std::string PANEncryptionService::decryptPAN(const std::string &encoded) {
   std::string decoded = base64_decode(encoded);
 
-  if (decoded.size() < IV_LEN + TAG_LEN)
+  if (decoded.size() < static_cast<std::size_t>(IV_LEN + TAG_LEN))
     throw std::runtime_error("Invalid encrypted PAN");
 
   unsigned char iv[IV_LEN];
   unsigned char tag[TAG_LEN];
 
-  memcpy(iv, decoded.data(), IV_LEN);
-  memcpy(tag, decoded.data() + IV_LEN, TAG_LEN);
+  memcpy(iv,  decoded.data(),           IV_LEN);
+  memcpy(tag, decoded.data() + IV_LEN,  TAG_LEN);
 
-  unsigned char *ciphertext =
-      (unsigned char *)decoded.data() + IV_LEN + TAG_LEN;
+  const unsigned char* ciphertext =
+      reinterpret_cast<const unsigned char*>(decoded.data()) + IV_LEN + TAG_LEN;
+  const int ciphertext_len = static_cast<int>(decoded.size()) - IV_LEN - TAG_LEN;
 
-  int ciphertext_len = decoded.size() - IV_LEN - TAG_LEN;
+  // RAII: ctx freed automatically on every exit path — no manual free needed
+  EvpCipherCtxPtr ctx(EVP_CIPHER_CTX_new(), EVP_CIPHER_CTX_free);
+  if (!ctx)
+    throw std::runtime_error("decryptPAN: failed to create EVP_CIPHER_CTX");
 
-  EVP_CIPHER_CTX *ctx = EVP_CIPHER_CTX_new();
+  // plaintext is at most as large as ciphertext
+  std::vector<unsigned char> plaintext(static_cast<std::size_t>(ciphertext_len) + 16);
+  int len = 0, plaintext_len = 0;
 
-  unsigned char plaintext[4096];
-  int len, plaintext_len;
+  if (EVP_DecryptInit_ex(ctx.get(), EVP_aes_256_gcm(), nullptr, nullptr, nullptr) != 1)
+    throw std::runtime_error("decryptPAN: DecryptInit failed");
+  EVP_CIPHER_CTX_ctrl(ctx.get(), EVP_CTRL_GCM_SET_IVLEN, IV_LEN, nullptr);
+  if (EVP_DecryptInit_ex(ctx.get(), nullptr, nullptr, AES_KEY, iv) != 1)
+    throw std::runtime_error("decryptPAN: key/IV init failed");
 
-  EVP_DecryptInit_ex(ctx, EVP_aes_256_gcm(), NULL, NULL, NULL);
-  EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_IVLEN, IV_LEN, NULL);
-  EVP_DecryptInit_ex(ctx, NULL, NULL, AES_KEY, iv);
-
-  EVP_DecryptUpdate(ctx, plaintext, &len, ciphertext, ciphertext_len);
+  if (EVP_DecryptUpdate(ctx.get(), plaintext.data(), &len, ciphertext, ciphertext_len) != 1)
+    throw std::runtime_error("decryptPAN: DecryptUpdate failed");
   plaintext_len = len;
 
-  EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_TAG, TAG_LEN, tag);
+  // Set GCM tag for authentication BEFORE calling DecryptFinal
+  EVP_CIPHER_CTX_ctrl(ctx.get(), EVP_CTRL_GCM_SET_TAG, TAG_LEN, tag);
 
-  if (EVP_DecryptFinal_ex(ctx, plaintext + len, &len) <= 0) {
-    EVP_CIPHER_CTX_free(ctx);
-    throw std::runtime_error("PAN decryption failed");
+  if (EVP_DecryptFinal_ex(ctx.get(), plaintext.data() + len, &len) <= 0) {
+    // ctx freed here automatically by unique_ptr — no manual call needed
+    throw std::runtime_error("PAN decryption failed: GCM authentication tag mismatch");
   }
-
   plaintext_len += len;
-  EVP_CIPHER_CTX_free(ctx);
+  // ctx freed here automatically by unique_ptr destructor
 
-  return std::string((char *)plaintext, plaintext_len);
+  return std::string(reinterpret_cast<char*>(plaintext.data()),
+                     static_cast<std::size_t>(plaintext_len));
 }
 
 // ================= MASK =================

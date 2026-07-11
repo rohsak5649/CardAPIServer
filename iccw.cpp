@@ -17,6 +17,7 @@
 #include "TransactionLogger.h"
 #include "accounting.h"
 #include "currency_converter.h"
+#include "global_contant.h"
 
 #include <cmath>
 #include <chrono>
@@ -34,16 +35,6 @@ using json = nlohmann::json;
 inline constexpr double ICCW_MAX_SINGLE = 4000.0;
 inline constexpr int ICCW_TIMEOUT_SEC = 5;
 
-[[nodiscard]] static std::string genTxnId() {
-  auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                std::chrono::system_clock::now().time_since_epoch())
-                .count();
-  std::mt19937 g{std::random_device{}()};
-  std::ostringstream oss;
-  oss << "iccw-txn-" << ms << "-"
-      << std::uniform_int_distribution<>(1000, 9999)(g);
-  return oss.str();
-}
 
 [[nodiscard]] static json err(std::string_view code,
                               std::string_view msg = "") {
@@ -70,8 +61,8 @@ struct ICCWContext {
 // ── WITHDRAWAL
 // ──────────────────────────────────────────────────────────────────
 [[nodiscard]] static json withdrawal(const json &data, ICCWContext &ctx) {
-  TransactionLogger::ScopedFunctionTrace trace("withdrawal",
-                                               {{"transactionType", "WITHDRAWAL"}});
+  TransactionLogger::ScopedFunctionTrace trace("processWithdrawal",
+                                               {{"transactionType", transactionTypeToString(TransactionType::WITHDRAWAL)}});
   try {
     if (!data.contains("card")) {
       trace.fail("missing card object");
@@ -79,7 +70,8 @@ struct ICCWContext {
     }
 
     const json &card = data["card"];
-    std::string txnId = genTxnId();
+    // Use the correlation UUID as the DB transaction_id — one ID for everything.
+    std::string txnId = data.value("_correlationUuid", TransactionLogger::currentUuid());
     std::string clientId = data.value("clientTxnId", txnId);
     std::string merchantId = data.value("merchantId", "");
     std::string terminalId = data.value("terminalId", "");
@@ -189,25 +181,31 @@ struct ICCWContext {
         trace.success({{"convertedAmount", std::to_string(amount)}, {"fxRate", std::to_string(fxRate)}});
     }
 
-    AccountLockManager::ScopedLock accLock(AccountLockManager::getInstance(), accNo, TxnPriority::DEBIT);
-
-    double balance = ctx.accounts.select("balance")
-                         .where("account_number=:a")
-                         .bind("a", accNo)
-                         .execute()
-                         .fetchOne()[0]
-                         .get<double>();
-
-    if (balance < amount + fee) {
-      trace.fail("insufficient balance",
-                 {{"balance", std::to_string(balance)},
-                  {"amount", std::to_string(amount)},
-                  {"fee", std::to_string(fee)}});
-      return err("ERR_INSUFFICIENT_FUNDS");
-    }
+    AccountLockManager::ScopedLock accLock(
+        AccountLockManager::getInstance(), accNo, TxnPriority::DEBIT);
 
     ctx.sess->startTransaction();
     try {
+      double balance = 0.0;
+      auto balRes = ctx.sess->sql("SELECT balance FROM accounts WHERE account_number = ? FOR UPDATE")
+                            .bind(accNo)
+                            .execute();
+      if (balRes.count() == 0) {
+        ctx.sess->rollback();
+        trace.fail("account not found");
+        return err("ERR_ACCOUNT_NOT_FOUND");
+      }
+      balance = balRes.fetchOne()[0].get<double>();
+
+      if (balance < amount + fee) {
+        ctx.sess->rollback();
+        trace.fail("insufficient balance",
+                   {{"balance", std::to_string(balance)},
+                    {"amount", std::to_string(amount)},
+                    {"fee", std::to_string(fee)}});
+        return err("ERR_INSUFFICIENT_FUNDS");
+      }
+
       ctx.accounts.update()
           .set("balance", balance - (amount + fee))
           .where("account_number=:a")
@@ -263,10 +261,9 @@ struct ICCWContext {
 // ── Dispatch table
 // ──────────────────────────────────────────────────────
 using ICCWHandler = std::function<json(const json &, ICCWContext &)>;
-static const std::unordered_map<std::string, ICCWHandler> ICCW_DISPATCH = {
-    {"CASH_WITHDRAWAL", withdrawal},   // primary / canonical type
-    {"WITHDRAWAL",      withdrawal},   // alias
-    {"PURCHASE",        withdrawal},   // legacy alias
+static const std::unordered_map<TransactionType, ICCWHandler> ICCW_DISPATCH = {
+    {TransactionType::WITHDRAWAL, withdrawal},
+    {TransactionType::PURCHASE,   withdrawal},
 };
 
 // ── Public entry point
@@ -282,24 +279,23 @@ json processICCWTransaction(const json &data) {
         "ICCW transaction handler scheduled",
         {{"transactionType", data.value("transactionType", "")}});
 
-    Database::ScopedConnection sc;
-    ICCWContext ctx(sc.operator->());
-
-    std::string txnType = data.value("transactionType", "WITHDRAWAL");
-    auto it = ICCW_DISPATCH.find(txnType);
-    if (it == ICCW_DISPATCH.end()) {
-      trace.fail("unsupported ICCW transaction type", {{"transactionType", txnType}});
-      return err("ERR_INVALID_TYPE", "Unsupported ICCW type: " + txnType);
-    }
-
     auto future = std::async(std::launch::async,
-                             [&, uuid]() -> json {
+                             [data, uuid]() -> json {
                                TransactionLogger::ScopedContext asyncScope(uuid, "ICCW");
                                TransactionLogger::instance().logCurrent(
                                    "INFO", "channel_handler_started",
                                    "ICCW transaction handler started",
                                    {{"transactionType", data.value("transactionType", "")}});
-                               return it->second(data, ctx);
+                               Database::ScopedConnection sc;
+                               ICCWContext ctx(sc.operator->());
+                               std::string txnTypeStr = data.value("transactionType", transactionTypeToString(TransactionType::WITHDRAWAL));
+                               TransactionType txnType = stringToTransactionType(txnTypeStr);
+                               auto it2 = ICCW_DISPATCH.find(txnType);
+                               if (it2 == ICCW_DISPATCH.end()) {
+                                 return err("ERR_INVALID_TYPE",
+                                             "Unsupported ICCW type: " + txnTypeStr);
+                               }
+                               return it2->second(data, ctx);
                              });
 
     if (future.wait_for(std::chrono::seconds(ICCW_TIMEOUT_SEC)) ==

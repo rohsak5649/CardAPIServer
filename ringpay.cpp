@@ -14,11 +14,13 @@
  * Contact: rohanavinashsakhare@gmail.com  |  +91 9112765649
  */
 
-#include "ringpay.h"
+#include "global_contant.h"
 #include "Database.h"
+#include "DatabaseQueries.h"
 #include "falcon.h"
 #include "panencrypted.h"
 #include "pin.h"
+#include "AccountLockManager.h"
 #include "TransactionLogger.h"
 
 #include <chrono>
@@ -45,12 +47,6 @@ inline constexpr int RING_RISK_BLOCK = 70;
          std::to_string(std::uniform_int_distribution<>(100000, 999999)(gen));
 }
 
-[[nodiscard]] static std::string genTxnId() {
-  auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                std::chrono::system_clock::now().time_since_epoch())
-                .count();
-  return "ring-txn-" + std::to_string(ms);
-}
 
 [[nodiscard]] static json err(std::string_view code,
                               std::string_view msg = "") {
@@ -68,7 +64,7 @@ json processRingPayTransaction(const json &data) {
   TransactionLogger::instance().logCurrent(
       "INFO", "channel_handler_started",
       "RingPay transaction handler started",
-      {{"transactionType", data.value("transactionType", "PURCHASE")}});
+      {{"transactionType", data.value("transactionType", transactionTypeToString(TransactionType::PURCHASE))}});
 
   Database::ScopedConnection sc;
   Session &sess = *sc;
@@ -159,7 +155,10 @@ json processRingPayTransaction(const json &data) {
     // ── Falcon fraud check (NEW in v3) ────────────────────────────────
     Falcon falcon(sess);
     std::string fraudReason;
-    std::string txnId = genTxnId();
+    // Use the correlation UUID injected by the router as the DB transaction_id.
+    // ring-txn-<ms> had ZERO randomness — any burst of requests in the same
+    // millisecond produced identical IDs, guaranteed. UUID eliminates this.
+    std::string txnId = data.value("_correlationUuid", TransactionLogger::currentUuid());
     if (falcon.checkFraud(accNo, amount, fraudReason, FalconChannel::RINGPAY,
                           &data)) {
       std::string clientId = data.value("clientTxnId", txnId);
@@ -244,75 +243,82 @@ json processRingPayTransaction(const json &data) {
               {"reason", "High risk score: " + std::to_string(risk)}};
     }
 
-    // ── Balance ───────────────────────────────────────────────────────
-    double balance = accounts.select("balance")
-                         .where("account_number=:a")
-                         .bind("a", accNo)
-                         .execute()
-                         .fetchOne()[0]
-                         .get<double>();
-    if (balance < amount + fee) {
-      trace.fail("insufficient balance",
-                 {{"balance", std::to_string(balance)},
-                  {"amount", std::to_string(amount)},
-                  {"fee", std::to_string(fee)}});
-      return err("ERR_INSUFFICIENT_FUNDS", "Insufficient balance");
-    }
+    // ── Balance and Transaction ───────────────────────────────────────
+    AccountLockManager::ScopedLock accLock(
+        AccountLockManager::getInstance(), accNo, TxnPriority::DEBIT);
 
-    double newBal = balance - (amount + fee);
-    accounts.update()
-        .set("balance", newBal)
-        .where("account_number=:a")
-        .bind("a", accNo)
-        .execute();
+    sess.startTransaction();
+    try {
+      auto currentBalOpt = DatabaseQueries::getAccountBalance(sess, accNo, true);
+      if (!currentBalOpt) {
+        sess.rollback();
+        trace.fail("account not found", {{"accountNumber", accNo}});
+        return err("ERR_ACCOUNT_NOT_FOUND", "Account not found");
+      }
+      double balance = *currentBalOpt;
 
-    auto ringRes = ringTable
-                       .insert("transaction_id", "token", "account_number",
-                               "amount", "fee", "status", "message",
-                               "device_id", "ip_address", "merchant_id")
-                       .values(txnId, token, accNo, amount, fee, "PROCESSING",
-                               "RingPay Processing", deviceId, ipAddr, merchant)
-                       .execute();
-    long childId = ringRes.getAutoIncrementValue();
+      if (balance < amount + fee) {
+        sess.rollback();
+        trace.fail("insufficient balance",
+                   {{"balance", std::to_string(balance)},
+                    {"amount", std::to_string(amount)},
+                    {"fee", std::to_string(fee)}});
+        return err("ERR_INSUFFICIENT_FUNDS", "Insufficient balance");
+      }
 
-    // ── Simulate random failure (10% chance) ─────────────────────────
-    std::mt19937 g{std::random_device{}()};
-    bool failed = (std::uniform_int_distribution<>(0, 9)(g) == 0);
-    if (failed) {
-      accounts.update()
-          .set("balance", balance)
-          .where("account_number=:a")
-          .bind("a", accNo)
-          .execute();
+      double newBal = balance - (amount + fee);
+      DatabaseQueries::updateAccountBalance(sess, accNo, newBal);
+
+      auto ringRes = ringTable
+                         .insert("transaction_id", "token", "account_number",
+                                 "amount", "fee", "status", "message",
+                                 "device_id", "ip_address", "merchant_id")
+                         .values(txnId, token, accNo, amount, fee, "PROCESSING",
+                                 "RingPay Processing", deviceId, ipAddr, merchant)
+                         .execute();
+      long childId = ringRes.getAutoIncrementValue();
+
+      // ── Simulate random failure (10% chance) ─────────────────────────
+      std::mt19937 g{std::random_device{}()};
+      bool failed = (std::uniform_int_distribution<>(0, 9)(g) == 0);
+      if (failed) {
+        DatabaseQueries::updateAccountBalance(sess, accNo, balance);
+        ringTable.update()
+            .set("status", "FAILED")
+            .set("reversal_status", "REVERSED")
+            .where("transaction_id=:t")
+            .bind("t", txnId)
+            .execute();
+        sess.commit();
+        trace.fail("RingPay network failure auto reversed", {{"transactionId", txnId}});
+        return {{"status", "FAILED"},
+                {"message", "Network failure — auto reversed"}};
+      }
+
       ringTable.update()
-          .set("status", "FAILED")
-          .set("reversal_status", "REVERSED")
+          .set("status", "SUCCESS")
           .where("transaction_id=:t")
           .bind("t", txnId)
           .execute();
-      trace.fail("RingPay network failure auto reversed", {{"transactionId", txnId}});
-      return {{"status", "FAILED"},
-              {"message", "Network failure — auto reversed"}};
+      masterTable.insert("table_name", "reference_id", "status")
+          .values("transaction_ringpay", childId, "SUCCESS")
+          .execute();
+
+      sess.commit();
+
+      response["status"] = "SUCCESS";
+      response["transactionId"] = txnId;
+      response["token"] = token;
+      response["balanceAfter"] = newBal;
+      response["riskScore"] = risk;
+      trace.success({{"transactionId", txnId},
+                     {"riskScore", std::to_string(risk)},
+                     {"balanceAfter", std::to_string(newBal)}});
+      return response;
+    } catch (...) {
+      sess.rollback();
+      throw;
     }
-
-    ringTable.update()
-        .set("status", "SUCCESS")
-        .where("transaction_id=:t")
-        .bind("t", txnId)
-        .execute();
-    masterTable.insert("table_name", "reference_id", "status")
-        .values("transaction_ringpay", childId, "SUCCESS")
-        .execute();
-
-    response["status"] = "SUCCESS";
-    response["transactionId"] = txnId;
-    response["token"] = token;
-    response["balanceAfter"] = newBal;
-    response["riskScore"] = risk;
-    trace.success({{"transactionId", txnId},
-                   {"riskScore", std::to_string(risk)},
-                   {"balanceAfter", std::to_string(newBal)}});
-    return response;
 
   } catch (const std::exception &e) {
     trace.fail("RingPay exception", {{"error", e.what()}});

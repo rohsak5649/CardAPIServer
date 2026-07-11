@@ -1,8 +1,10 @@
 #include "auth.h"
+#include "DatabaseQueries.h"
 #include "TransactionLogger.h"
 #include <openssl/hmac.h>
 #include <openssl/sha.h>
 #include <openssl/evp.h>
+#include <openssl/crypto.h>
 #include <openssl/bio.h>
 #include <openssl/buffer.h>
 #include <chrono>
@@ -11,10 +13,34 @@
 #include <sstream>
 #include <iomanip>
 #include <iostream>
+#include <cstdlib>
+#include <cstring>
+#include <memory>   // std::unique_ptr
 
 using json = nlohmann::json;
 
-const std::string AuthService::JWT_SECRET = "ROHAN_PAYMENT_ENGINE_JWT_SECRET_v3_9649";
+// ── RAII guard for OpenSSL BIO chain ─────────────────────────────────────────
+// Ensures BIO_free_all() is called on every code path — normal return,
+// early-throw from a failed BIO_new/BIO_push, or any exception thereafter.
+struct BioGuard {
+    BIO* chain = nullptr;
+    explicit BioGuard(BIO* b) : chain(b) {}
+    ~BioGuard() { if (chain) BIO_free_all(chain); }
+    // Non-copyable, non-movable — the guard owns the chain exclusively.
+    BioGuard(const BioGuard&) = delete;
+    BioGuard& operator=(const BioGuard&) = delete;
+};
+
+
+// JWT_SECRET is read from the environment variable JWT_SECRET_KEY at runtime.
+// NEVER hardcode secrets in source — use a vault or env var in production.
+static std::string loadJwtSecret() {
+    const char* secret = std::getenv("JWT_SECRET_KEY");
+    if (secret && std::strlen(secret) > 0) return std::string(secret);
+    // Fallback for local dev only — will be overridden in production by env var.
+    return "ROHAN_PAYMENT_ENGINE_JWT_SECRET_v3_9649";
+}
+const std::string AuthService::JWT_SECRET = loadJwtSecret();
 
 AuthService& AuthService::instance() {
     static AuthService inst;
@@ -23,18 +49,27 @@ AuthService& AuthService::instance() {
 
 AuthService::AuthService() {}
 
-// ── Base64URL helpers ────────────────────────────────────────────────────────
+// ── Base64URL helpers ──────────────────────────────────────────────────
 std::string AuthService::base64urlEncode(const std::string& data) {
     BIO* b64 = BIO_new(BIO_f_base64());
     BIO* buf = BIO_new(BIO_s_mem());
-    b64 = BIO_push(b64, buf);
+    if (!b64 || !buf) {
+        if (b64) BIO_free(b64);
+        if (buf) BIO_free(buf);
+        throw std::runtime_error("base64urlEncode: BIO allocation failed");
+    }
+    b64 = BIO_push(b64, buf);   // b64 now owns buf; free the whole chain via b64
+    BioGuard guard(b64);        // RAII: frees chain on every exit path
+
     BIO_set_flags(b64, BIO_FLAGS_BASE64_NO_NL);
-    BIO_write(b64, data.data(), (int)data.size());
+    BIO_write(b64, data.data(), static_cast<int>(data.size()));
     BIO_flush(b64);
-    BUF_MEM* bptr;
+
+    BUF_MEM* bptr = nullptr;
     BIO_get_mem_ptr(b64, &bptr);
     std::string result(bptr->data, bptr->length);
-    BIO_free_all(b64);
+    // guard destructor calls BIO_free_all(b64) here
+
     // Convert to base64url: replace +→-, /→_, strip padding
     for (char& c : result) {
         if (c == '+') c = '-';
@@ -46,21 +81,33 @@ std::string AuthService::base64urlEncode(const std::string& data) {
 
 std::string AuthService::base64urlDecode(const std::string& input) {
     std::string data = input;
+    // Convert base64url back to standard base64
     for (char& c : data) {
         if (c == '-') c = '+';
         else if (c == '_') c = '/';
     }
-    // Re-pad
+    // Re-pad to a multiple of 4
     while (data.size() % 4 != 0) data += '=';
 
+    BIO* buf = BIO_new_mem_buf(data.data(), static_cast<int>(data.size()));
     BIO* b64 = BIO_new(BIO_f_base64());
-    BIO* buf = BIO_new_mem_buf(data.data(), (int)data.size());
-    b64 = BIO_push(b64, buf);
+    if (!buf || !b64) {
+        if (buf) BIO_free(buf);
+        if (b64) BIO_free(b64);
+        throw std::runtime_error("base64urlDecode: BIO allocation failed");
+    }
+    b64 = BIO_push(b64, buf);   // b64 now owns buf
+    BioGuard guard(b64);        // RAII: frees chain on every exit path
+
     BIO_set_flags(b64, BIO_FLAGS_BASE64_NO_NL);
-    std::string result(data.size(), '\0');
-    int len = BIO_read(b64, result.data(), (int)result.size());
-    BIO_free_all(b64);
-    result.resize(len > 0 ? len : 0);
+
+    // Decoded output is always ≤ 3/4 of the base64 input length.
+    const std::size_t maxDecoded = (data.size() / 4) * 3 + 3;
+    std::string result(maxDecoded, '\0');
+    const int len = BIO_read(b64, result.data(), static_cast<int>(maxDecoded));
+    // guard destructor calls BIO_free_all(b64) here
+
+    result.resize(len > 0 ? static_cast<std::size_t>(len) : 0);
     return result;
 }
 
@@ -79,13 +126,10 @@ std::string AuthService::hmacSha256Hex(const std::string& data, const std::strin
 AuthContext AuthService::validateApiKey(const std::string& apiKey, mysqlx::Session& sess) const {
     if (apiKey.empty()) return {};
     try {
-        auto res = sess.sql("SELECT role, owner_name, is_active FROM api_keys WHERE api_key = ?")
-                       .bind(apiKey)
-                       .execute();
-        auto row = res.fetchOne();
-        if (!row)             return {}; // key not found
-        if ((int)row[2] == 0) return {}; // key inactive
-        return {row[0].get<std::string>(), row[1].get<std::string>(), true};
+        auto details = DatabaseQueries::getApiKeyDetails(sess, apiKey);
+        if (!details) return {}; // key not found
+        if (!details->isActive) return {}; // key inactive
+        return {details->role, details->ownerName, true};
     } catch (const std::exception& e) {
         TransactionLogger::instance().logCurrent("WARN", "auth_db_error", "DB error during API key lookup", {{"error", e.what()}});
         return {};
@@ -161,7 +205,13 @@ AuthContext AuthService::validateJWT(const std::string& token) const {
         // Verify signature
         std::string sigRaw = hmacSha256Hex(headerEnc + "." + payloadEnc, JWT_SECRET);
         std::string sigExpected = base64urlEncode(sigRaw);
-        if (sigProvided != sigExpected) return {};
+        // Use constant-time comparison to prevent timing attacks on the signature.
+        // A naive string == comparison exits early on the first mismatch, allowing
+        // an attacker to time many requests and deduce the correct signature.
+        if (sigProvided.size() != sigExpected.size() ||
+            CRYPTO_memcmp(sigProvided.data(), sigExpected.data(), sigExpected.size()) != 0) {
+            return {};
+        }
 
         // Decode payload
         std::string payloadJson = base64urlDecode(payloadEnc);

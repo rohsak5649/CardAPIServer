@@ -24,6 +24,7 @@
 #include "AccountLockManager.h"
 #include "TransactionLogger.h"
 #include "reversal.h"
+#include "global_contant.h"
 
 #include <iostream>
 #include <sstream>
@@ -34,6 +35,7 @@
 #include <unordered_map>
 #include <functional>
 #include <mysqlx/xdevapi.h>
+#include <atomic>
 
 using namespace mysqlx;
 using json = nlohmann::json;
@@ -43,14 +45,13 @@ inline constexpr double ATM_DAILY_WITHDRAWAL_LIMIT = 5'000.0;
 inline constexpr double ATM_DAILY_DEPOSIT_LIMIT    = 10'000.0;
 inline constexpr int    ATM_TIMEOUT_SECONDS        = 6;
 
-// ── TxnId ─────────────────────────────────────────────────────────────────────
-[[nodiscard]] static std::string makeTxnId() {
-    auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-        std::chrono::system_clock::now().time_since_epoch()).count();
-    std::mt19937 gen{std::random_device{}()};
-    return "atm-" + std::to_string(ms) + "-" +
-           std::to_string(std::uniform_int_distribution<>(1000,9999)(gen));
-}
+// ── Shutdown flag ────────────────────────────────────────────────────────────
+// Set to true by the signal handler in parser&router.cpp before the DB pool
+// is destroyed. The detached reversal thread checks this flag before attempting
+// to acquire a DB session, preventing use-after-free on pool teardown.
+static std::atomic<bool> g_engineShutdown{false};
+
+void setATMEngineShutdown() noexcept { g_engineShutdown.store(true); }
 
 // ═══════════════════════════════════════════════════════════════════════════════
 //  REPOSITORY — SRP: only DB access
@@ -187,93 +188,129 @@ static json handleWithdrawal(const json& data, ATMRepository& repo, Session& ses
                               std::string_view acc, std::string_view pan, std::string_view scheme) {
     TransactionLogger::ScopedFunctionTrace trace("handleWithdrawal",
                                                  {{"accountNumber", std::string(acc)}});
-    AccountLockManager::ScopedLock accLock(AccountLockManager::getInstance(), std::string(acc), TxnPriority::DEBIT);
+    // ⚠️  Lock BEFORE any balance/limit reads to prevent TOCTOU:
+    //   Two concurrent withdrawals must not both pass the daily-limit check
+    //   at the same time and then both succeed.
+    AccountLockManager::ScopedLock accLock(AccountLockManager::getInstance(),
+                                           std::string(acc), TxnPriority::DEBIT);
 
-    double amount = data["amount"].get<double>();
-    double fee    = data["fee"].get<double>();
+    const double amount = data["amount"].get<double>();
+    const double fee    = data["fee"].get<double>();
 
-    double todayW = repo.getTodayWithdrawalTotal(acc);
-    if (todayW + amount + fee > ATM_DAILY_WITHDRAWAL_LIMIT) {
-        trace.fail("ATM withdrawal daily limit exceeded",
-                   {{"amount", std::to_string(amount)},
-                    {"todayWithdrawalTotal", std::to_string(todayW)}});
-        throw std::runtime_error("Daily ATM withdrawal limit of " +
-                                 std::to_string(ATM_DAILY_WITHDRAWAL_LIMIT) + " exceeded");
+    // Wrap all DB writes in an explicit transaction.  getBalance() uses
+    // "FOR UPDATE" which requires an active transaction to hold the row lock.
+    sess.startTransaction();
+    try {
+        // Read balance (FOR UPDATE) and today's total inside the transaction
+        // so both reads see the same committed state.
+        const double balance = repo.getBalance(acc);
+        const double todayW  = repo.getTodayWithdrawalTotal(acc);
+
+        if (todayW + amount + fee > ATM_DAILY_WITHDRAWAL_LIMIT) {
+            sess.rollback();
+            trace.fail("ATM withdrawal daily limit exceeded",
+                       {{"amount", std::to_string(amount)},
+                        {"todayWithdrawalTotal", std::to_string(todayW)}});
+            throw std::runtime_error("Daily ATM withdrawal limit of " +
+                                     std::to_string(ATM_DAILY_WITHDRAWAL_LIMIT) + " exceeded");
+        }
+
+        if (balance < amount + fee) {
+            sess.rollback();
+            trace.fail("insufficient balance",
+                       {{"balance", std::to_string(balance)},
+                        {"amount", std::to_string(amount)},
+                        {"fee", std::to_string(fee)}});
+            throw std::runtime_error("Insufficient balance");
+        }
+
+        repo.updateBalance(acc, balance - amount - fee);
+
+        // Use the correlation UUID injected by the router as the DB transaction_id.
+        // This gives one unified ID across: HTTP response, all log lines, and DB row.
+        const std::string txnId    = data.value("_correlationUuid", TransactionLogger::currentUuid());
+        const std::string clientId = data.value("clientTxnId", txnId);
+
+        const long refId = repo.insertATMTransaction(
+            txnId, clientId,
+            data.value("atmId", ""), data.value("terminalId", ""), data.value("location", ""),
+            acc, amount, fee, pan, scheme, "SUCCESS", "ATM WITHDRAWAL successful");
+        repo.insertMasterTxn(refId);
+
+        sess.commit();
+        repo.touchCard(pan);
+
+        trace.success({{"transactionId", txnId},
+                       {"balanceAfter", std::to_string(balance - amount - fee)}});
+        return {
+            {"transactionId", txnId},
+            {"status",        "SUCCESS"},
+            {"balanceAfter",  balance - amount - fee},
+            {"message",       "ATM withdrawal successful"}
+        };
+    } catch (...) {
+        try { sess.rollback(); } catch (...) {}
+        throw;
     }
-
-    double balance = repo.getBalance(acc);
-    if (balance < amount + fee) {
-        trace.fail("insufficient balance",
-                   {{"balance", std::to_string(balance)},
-                    {"amount", std::to_string(amount)},
-                    {"fee", std::to_string(fee)}});
-        throw std::runtime_error("Insufficient balance");
-    }
-
-    repo.updateBalance(acc, balance - amount - fee);
-
-    std::string txnId     = makeTxnId();
-    std::string clientId  = data.value("clientTxnId", txnId);
-    long refId = repo.insertATMTransaction(
-        txnId, clientId,
-        data.value("atmId",""), data.value("terminalId",""), data.value("location",""),
-        acc, amount, fee, pan, scheme, "SUCCESS", "ATM WITHDRAWAL successful");
-    repo.insertMasterTxn(refId);
-    repo.touchCard(pan);
-
-    trace.success({{"transactionId", txnId},
-                   {"balanceAfter", std::to_string(balance - amount - fee)}});
-    return {
-        {"transactionId", txnId},
-        {"status",        "SUCCESS"},
-        {"balanceAfter",  balance - amount - fee},
-        {"message",       "ATM withdrawal successful"}
-    };
 }
 
 static json handleDeposit(const json& data, ATMRepository& repo, Session& sess,
                            std::string_view acc, std::string_view pan, std::string_view scheme) {
     TransactionLogger::ScopedFunctionTrace trace("handleDeposit",
                                                  {{"accountNumber", std::string(acc)}});
-    AccountLockManager::ScopedLock accLock(AccountLockManager::getInstance(), std::string(acc), TxnPriority::CREDIT);
+    AccountLockManager::ScopedLock accLock(AccountLockManager::getInstance(),
+                                           std::string(acc), TxnPriority::CREDIT);
 
-    double amount = data["amount"].get<double>();
+    const double amount = data["amount"].get<double>();
 
-    double todayD = repo.getTodayDepositTotal(acc);
-    if (todayD + amount > ATM_DAILY_DEPOSIT_LIMIT) {
-        trace.fail("ATM deposit daily limit exceeded",
-                   {{"amount", std::to_string(amount)},
-                    {"todayDepositTotal", std::to_string(todayD)}});
-        throw std::runtime_error("Daily ATM deposit limit of " +
-                                 std::to_string(ATM_DAILY_DEPOSIT_LIMIT) + " exceeded");
+    // All reads happen inside the transaction so the daily total and balance
+    // are consistent (no TOCTOU between the limit check and the update).
+    sess.startTransaction();
+    try {
+        const double todayD  = repo.getTodayDepositTotal(acc);
+        if (todayD + amount > ATM_DAILY_DEPOSIT_LIMIT) {
+            sess.rollback();
+            trace.fail("ATM deposit daily limit exceeded",
+                       {{"amount", std::to_string(amount)},
+                        {"todayDepositTotal", std::to_string(todayD)}});
+            throw std::runtime_error("Daily ATM deposit limit of " +
+                                     std::to_string(ATM_DAILY_DEPOSIT_LIMIT) + " exceeded");
+        }
+
+        const double balance = repo.getBalance(acc);
+        repo.updateBalance(acc, balance + amount);
+
+        // Use the correlation UUID injected by the router as the DB transaction_id.
+        const std::string txnId    = data.value("_correlationUuid", TransactionLogger::currentUuid());
+        const std::string clientId = data.value("clientTxnId", txnId);
+
+        const long refId = repo.insertATMTransaction(
+            txnId, clientId,
+            data.value("atmId", ""), data.value("terminalId", ""), data.value("location", ""),
+            acc, amount, 0.0, pan, scheme, "SUCCESS", "ATM DEPOSIT successful");
+        repo.insertMasterTxn(refId);
+
+        sess.commit();
+        repo.touchCard(pan);
+
+        trace.success({{"transactionId", txnId},
+                       {"balanceAfter", std::to_string(balance + amount)}});
+        return {
+            {"transactionId", txnId},
+            {"status",        "SUCCESS"},
+            {"balanceAfter",  balance + amount},
+            {"message",       "ATM deposit successful"}
+        };
+    } catch (...) {
+        try { sess.rollback(); } catch (...) {}
+        throw;
     }
-
-    double balance = repo.getBalance(acc);
-    repo.updateBalance(acc, balance + amount);
-
-    std::string txnId    = makeTxnId();
-    std::string clientId = data.value("clientTxnId", txnId);
-    long refId = repo.insertATMTransaction(
-        txnId, clientId,
-        data.value("atmId",""), data.value("terminalId",""), data.value("location",""),
-        acc, amount, 0.0, pan, scheme, "SUCCESS", "ATM DEPOSIT successful");
-    repo.insertMasterTxn(refId);
-    repo.touchCard(pan);
-
-    trace.success({{"transactionId", txnId},
-                   {"balanceAfter", std::to_string(balance + amount)}});
-    return {
-        {"transactionId", txnId},
-        {"status",        "SUCCESS"},
-        {"balanceAfter",  balance + amount},
-        {"message",       "ATM deposit successful"}
-    };
 }
 
 // OCP: register new types here — no other code changes needed
-static const std::unordered_map<std::string, ATMHandler> ATM_DISPATCH = {
-    { "WITHDRAWAL", handleWithdrawal },
-    { "DEPOSIT",    handleDeposit    },
+static const std::unordered_map<TransactionType, ATMHandler> ATM_DISPATCH = {
+    { TransactionType::WITHDRAWAL, handleWithdrawal },
+    { TransactionType::DEPOSIT,    handleDeposit    },
 };
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -287,7 +324,8 @@ static const std::unordered_map<std::string, ATMHandler> ATM_DISPATCH = {
     ATMRepository repo(sc.operator->());
 
     try {
-        std::string txnType   = data.value("transactionType", "");
+        std::string txnTypeStr = data.value("transactionType", "");
+        TransactionType txnType = stringToTransactionType(txnTypeStr);
         std::string encPan    = data["card"]["pan"].get<std::string>();
         std::string expiry    = data["card"]["expiry"].get<std::string>();
 
@@ -349,8 +387,9 @@ static const std::unordered_map<std::string, ATMHandler> ATM_DISPATCH = {
         std::string fraudReason;
         if (falcon.checkFraud(acc, data.value("amount",0.0), fraudReason,
                               FalconChannel::ATM, &data)) {
-            std::string txnId = makeTxnId();
-            std::string clientId = data.value("clientTxnId", txnId);
+            // Use the correlation UUID so the fraud-decline record ties back to the request log.
+            const std::string txnId    = data.value("_correlationUuid", TransactionLogger::currentUuid());
+            const std::string clientId = data.value("clientTxnId", txnId);
             falcon.logFraud(txnId, clientId, data.value("terminalId", ""), "",
                             acc, data.value("amount",0.0), fraudReason);
             trace.fail("fraud declined ATM transaction", {{"reason", fraudReason}});
@@ -365,8 +404,8 @@ static const std::unordered_map<std::string, ATMHandler> ATM_DISPATCH = {
         // ── Dispatch to handler via unordered_map ─────────────────────────
         auto it = ATM_DISPATCH.find(txnType);
         if (it == ATM_DISPATCH.end()) {
-            trace.fail("unsupported ATM transaction type", {{"transactionType", txnType}});
-            throw std::runtime_error("Unsupported ATM transaction type: " + txnType);
+            trace.fail("unsupported ATM transaction type", {{"transactionType", txnTypeStr}});
+            throw std::runtime_error("Unsupported ATM transaction type: " + txnTypeStr);
         }
 
         json response = it->second(data, repo, sess, acc, pan, scheme);
@@ -414,8 +453,8 @@ json processATMTransaction(const json& data) {
         // account balance will remain correct and the reversal row will still
         // be written for audit purposes.
         // ─────────────────────────────────────────────────────────────────────
-        std::string txnType = data.value("transactionType", "");
-        if (txnType == "WITHDRAWAL") {
+        TransactionType txnType = stringToTransactionType(data.value("transactionType", ""));
+        if (txnType == TransactionType::WITHDRAWAL) {
             json rev;
             // originalTransactionId is unknown at timeout — use a placeholder
             // so the drop-file / reversal record can be reconciled later.
@@ -444,8 +483,19 @@ json processATMTransaction(const json& data) {
                 {{"originalTxnId", rev["originalTransactionId"].get<std::string>()},
                  {"amount",        std::to_string(data.value("amount", 0.0))}});
 
-            // Fire-and-forget reversal (non-blocking from caller perspective)
+            // Fire-and-forget reversal (non-blocking from caller perspective).
+            // Guard: skip DB access if engine is already shutting down to avoid
+            // use-after-free on the connection pool (Database::destroyPool).
             std::thread([rev, uuid]() {
+                if (g_engineShutdown.load()) {
+                    TransactionLogger::ScopedContext revScope(uuid, "REVERSAL");
+                    TransactionLogger::instance().logCurrent(
+                        "WARN", "atm_timeout_reversal_skipped",
+                        "Reversal skipped: engine is shutting down",
+                        {{"originalTxnId",
+                          rev.value("originalTransactionId", "")}});
+                    return;
+                }
                 TransactionLogger::ScopedContext revScope(uuid, "REVERSAL");
                 json reversalResult = processReversal(rev);
                 TransactionLogger::instance().logCurrent(

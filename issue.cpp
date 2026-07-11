@@ -299,7 +299,6 @@ json processGetCardDetails(const json& data) {
         Row r = cardRes.fetchOne();
         response["status"] = "SUCCESS";
         response["card"] = {
-            {"pan", r[0].get<std::string>()},
             {"scheme", r[1].isNull() ? "" : r[1].get<std::string>()},
             {"cardType", r[2].isNull() ? "" : r[2].get<std::string>()},
             {"expiry", r[3].get<std::string>()},

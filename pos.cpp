@@ -23,6 +23,7 @@
 #include "TransactionLogger.h"
 #include "accounting.h"
 #include "currency_converter.h"
+#include "global_contant.h"
 
 #include <chrono>
 #include <functional>
@@ -39,16 +40,6 @@ using json = nlohmann::json;
 inline constexpr double POS_MAX_SINGLE = 50'000.0;
 inline constexpr int POS_TIMEOUT_SEC = 5;
 
-[[nodiscard]] static std::string genTxnId() {
-  auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                std::chrono::system_clock::now().time_since_epoch())
-                .count();
-  std::mt19937 g{std::random_device{}()};
-  std::ostringstream oss;
-  oss << "pos-txn-" << ms << "-"
-      << std::uniform_int_distribution<>(1000, 9999)(g);
-  return oss.str();
-}
 
 [[nodiscard]] static json err(std::string_view code,
                               std::string_view msg = "") {
@@ -76,7 +67,7 @@ struct POSContext {
 // ──────────────────────────────────────────────────────────────────
 [[nodiscard]] static json purchase(const json &data, POSContext &ctx) {
   TransactionLogger::ScopedFunctionTrace trace("purchase",
-                                               {{"transactionType", "PURCHASE"}});
+                                               {{"transactionType", transactionTypeToString(TransactionType::PURCHASE)}});
   try {
     if (!data.contains("card")) {
       trace.fail("missing card object");
@@ -84,7 +75,8 @@ struct POSContext {
     }
 
     const json &card = data["card"];
-    std::string txnId = genTxnId();
+    // Use the correlation UUID as the DB transaction_id — one ID for everything.
+    std::string txnId = data.value("_correlationUuid", TransactionLogger::currentUuid());
     std::string clientId = data.value("clientTxnId", txnId);
     std::string merchantId = data.value("merchantId", "");
     std::string terminalId = data.value("terminalId", "");
@@ -190,25 +182,31 @@ struct POSContext {
         trace.success({{"convertedAmount", std::to_string(amount)}, {"fxRate", std::to_string(fxRate)}});
     }
 
-    AccountLockManager::ScopedLock accLock(AccountLockManager::getInstance(), accNo, TxnPriority::DEBIT);
-
-    double balance = ctx.accounts.select("balance")
-                         .where("account_number=:a")
-                         .bind("a", accNo)
-                         .execute()
-                         .fetchOne()[0]
-                         .get<double>();
-
-    if (balance < amount + fee) {
-      trace.fail("insufficient balance",
-                 {{"balance", std::to_string(balance)},
-                  {"amount", std::to_string(amount)},
-                  {"fee", std::to_string(fee)}});
-      return err("ERR_INSUFFICIENT_FUNDS");
-    }
+    AccountLockManager::ScopedLock accLock(
+        AccountLockManager::getInstance(), accNo, TxnPriority::DEBIT);
 
     ctx.sess->startTransaction();
     try {
+      double balance = 0.0;
+      auto balRes = ctx.sess->sql("SELECT balance FROM accounts WHERE account_number = ? FOR UPDATE")
+                            .bind(accNo)
+                            .execute();
+      if (balRes.count() == 0) {
+        ctx.sess->rollback();
+        trace.fail("account not found");
+        return err("ERR_ACCOUNT_NOT_FOUND");
+      }
+      balance = balRes.fetchOne()[0].get<double>();
+
+      if (balance < amount + fee) {
+        ctx.sess->rollback();
+        trace.fail("insufficient balance",
+                   {{"balance", std::to_string(balance)},
+                    {"amount", std::to_string(amount)},
+                    {"fee", std::to_string(fee)}});
+        return err("ERR_INSUFFICIENT_FUNDS");
+      }
+
       ctx.accounts.update()
           .set("balance", balance - (amount + fee))
           .where("account_number=:a")
@@ -265,80 +263,162 @@ struct POSContext {
 // ────────────────────────────────────────────────────────────────────
 [[nodiscard]] static json refund(const json &data, POSContext &ctx) {
   TransactionLogger::ScopedFunctionTrace trace("refund",
-                                               {{"transactionType", "REFUND"}});
+                                               {{"transactionType", transactionTypeToString(TransactionType::REFUND)}});
   try {
-    std::string txnId = genTxnId();
-    std::string clientId = data.value("clientTxnId", txnId);
+    // Use the correlation UUID as the DB transaction_id — one ID for everything.
+    std::string txnId    = data.value("_correlationUuid", TransactionLogger::currentUuid());
+    std::string clientId  = data.value("clientTxnId", txnId);
     std::string origTxnId = data.value("origTransactionId", "");
-    double amount = data.value("amount", 0.0);
-    std::string merchantId = data.value("merchantId", "");
-    std::string terminalId = data.value("terminalId", "");
-    std::string location = data.value("location", "");
+    double      amount    = data.value("amount", 0.0);
+    std::string merchantId  = data.value("merchantId", "");
+    std::string terminalId  = data.value("terminalId", "");
+    std::string location    = data.value("location", "");
 
     if (origTxnId.empty()) {
       trace.fail("missing original transaction id");
       return err("ERR_INVALID_ORIG_TXN", "origTransactionId required");
     }
+    if (merchantId.empty()) {
+      trace.fail("missing merchantId in refund request");
+      return err("ERR_MISSING_MERCHANT", "merchantId is required for refund");
+    }
 
-    auto pRes = ctx.posTbl
-                    .select("id", "amount", "account_number", "card_pan",
-                            "refunded_amount", "flag", "message")
-                    .where("transaction_id=:tid")
-                    .bind("tid", origTxnId)
-                    .execute();
+    std::string acc;
+    auto accRes = ctx.sess->sql(
+        "SELECT account_number FROM transaction_pos WHERE transaction_id = ?")
+        .bind(origTxnId)
+        .execute();
+    if (accRes.count() > 0) {
+      acc = accRes.fetchOne()[0].get<std::string>();
+    }
+
+    std::unique_ptr<AccountLockManager::ScopedLock> accLock;
+    if (!acc.empty()) {
+      accLock = std::make_unique<AccountLockManager::ScopedLock>(
+          AccountLockManager::getInstance(), acc, TxnPriority::CREDIT);
+    }
+
+    // Start database transaction before executing the query, allowing us to
+    // acquire a row lock via FOR UPDATE to prevent double-refund race conditions.
+    ctx.sess->startTransaction();
+
+    RowResult pRes;
+    try {
+      pRes = ctx.sess->sql(
+          "SELECT id, amount, account_number, card_pan, refunded_amount, flag, message, merchant_id, fee "
+          "FROM transaction_pos WHERE transaction_id = ? FOR UPDATE")
+          .bind(origTxnId)
+          .execute();
+    } catch (const std::exception &e) {
+      ctx.sess->rollback();
+      trace.fail("failed to fetch and lock original transaction", {{"error", e.what()}});
+      return err("ERR_DB_FAILURE", "Failed to lookup original transaction");
+    }
+
     if (pRes.count() == 0) {
+      ctx.sess->rollback();
       trace.fail("original purchase not found", {{"origTransactionId", origTxnId}});
-      return err("ERR_PURCHASE_NOT_FOUND");
+      return err("ERR_PURCHASE_NOT_FOUND", "Original purchase transaction not found");
     }
 
     Row p = pRes.fetchOne();
-    auto id = p[0].get<int64_t>();
-    double purchAmt = p[1].get<double>();
-    std::string acc = p[2].get<std::string>();
-    std::string pan = p[3].get<std::string>();
-    double refAmt = p[4].isNull() ? 0.0 : p[4].get<double>();
-    std::string flag = p[5].get<std::string>();
-    std::string msg = p[6].get<std::string>();
+    auto        id           = p[0].get<int64_t>();
+    double      purchAmt     = p[1].get<double>();
+    acc                      = p[2].get<std::string>();
+    std::string origPan      = p[3].get<std::string>();   // PAN stored on original purchase
+    double      refAmt       = p[4].isNull() ? 0.0 : p[4].get<double>();
+    std::string flag         = p[5].get<std::string>();
+    std::string msg          = p[6].get<std::string>();
+    std::string origMerchant = p[7].isNull() ? "" : p[7].get<std::string>();
+    // fee is in the original purchase row — no extra query needed
+    double      origFee      = p[8].isNull() ? 0.0 : p[8].get<double>();
 
+    // ── Guard 1: Must be a refundable purchase row ───────────────────────
     if (msg != "POS purchase successful") {
-      trace.fail("invalid refund source");
-      return err("ERR_INVALID_REFUND_SOURCE");
+      ctx.sess->rollback();
+      trace.fail("invalid refund source — original row is not a purchase");
+      return err("ERR_INVALID_REFUND_SOURCE",
+                 "origTransactionId does not reference a POS purchase");
     }
-    if (flag == "RF") {
-      trace.fail("purchase already fully refunded", {{"flag", flag}});
-      return err("ERR_ALREADY_REFUNDED");
+
+    // ── Guard 2: Merchant ownership check ────────────────────────────────
+    if (origMerchant != merchantId) {
+      ctx.sess->rollback();
+      trace.fail("merchant mismatch — refund denied",
+                 {{"requestMerchant",  merchantId},
+                  {"originalMerchant", origMerchant}});
+      return err("ERR_MERCHANT_MISMATCH",
+                 "Refund can only be issued by the merchant who made the original sale");
     }
-    if (amount <= 0 || amount + refAmt > purchAmt) {
+
+    // ── Guard 3: Card ownership check (when card is provided) ────────────
+    if (data.contains("card") && data["card"].contains("pan")) {
+      std::string refundPan;
+      try {
+        refundPan = PANEncryptionService::getInstance()
+                        .decryptPAN(data["card"]["pan"].get<std::string>());
+      } catch (const std::exception &e) {
+        ctx.sess->rollback();
+        trace.fail("encrypted PAN decrypt failed during refund card check",
+                   {{"error", e.what()}});
+        return err("ERR_INVALID_ENCRYPTED_PAN", e.what());
+      }
+
+      if (refundPan != origPan) {
+        ctx.sess->rollback();
+        trace.fail("card PAN mismatch — refund denied",
+                   {{"origTransactionId", origTxnId}});
+        return err("ERR_CARD_MISMATCH",
+                   "The card provided does not match the card used in the original purchase");
+      }
+    }
+
+    // ── Guard 4: Already refunded ───────────────────────────────────────
+    // Enforce that a POS transaction can only be refunded ONCE.
+    if (flag != "N" || refAmt > 0) {
+      ctx.sess->rollback();
+      trace.fail("purchase already refunded", {{"flag", flag}, {"refundedAmount", std::to_string(refAmt)}});
+      return err("ERR_ALREADY_REFUNDED", "This purchase has already been refunded");
+    }
+
+    // ── Guard 5: Refund amount validity ──────────────────────────────────
+    if (amount <= 0 || amount > purchAmt) {
+      ctx.sess->rollback();
       trace.fail("invalid refund amount",
-                 {{"amount", std::to_string(amount)},
-                  {"refundedAmount", std::to_string(refAmt)},
-                  {"purchaseAmount", std::to_string(purchAmt)}});
-      return err("ERR_INVALID_REFUND_AMOUNT");
+                 {{"amount",          std::to_string(amount)},
+                  {"purchaseAmount",   std::to_string(purchAmt)}});
+      return err("ERR_INVALID_REFUND_AMOUNT",
+                 "Refund amount must be greater than 0 and cannot exceed the purchase amount");
     }
 
-    AccountLockManager::ScopedLock accLock(AccountLockManager::getInstance(), acc, TxnPriority::CREDIT);
+    double balance = 0.0;
+    try {
+      RowResult balRes = ctx.sess->sql("SELECT balance FROM accounts WHERE account_number = ? FOR UPDATE")
+                             .bind(acc)
+                             .execute();
+      if (balRes.count() == 0) {
+        ctx.sess->rollback();
+        trace.fail("account not found for refund", {{"accountNumber", acc}});
+        return err("ERR_ACCOUNT_NOT_FOUND");
+      }
+      balance = balRes.fetchOne()[0].get<double>();
+    } catch (const std::exception &e) {
+      ctx.sess->rollback();
+      trace.fail("failed to fetch/lock account balance", {{"error", e.what()}});
+      return err("ERR_DB_FAILURE", "Database error fetching account balance");
+    }
 
-    double balance = ctx.accounts.select("balance")
-                         .where("account_number=:a")
-                         .bind("a", acc)
-                         .execute()
-                         .fetchOne()[0]
-                         .get<double>();
-    Row feeRow = ctx.posTbl.select("fee")
-                     .where("id=:id")
-                     .bind("id", id)
-                     .execute()
-                     .fetchOne();
-    double fee = feeRow[0].isNull() ? 0.0 : feeRow[0].get<double>();
-
+    // Use fee from the original purchase row — avoids a separate SELECT query
+    double fee = origFee;
     if (amount <= fee) {
+      ctx.sess->rollback();
       trace.fail("refund amount less than fee",
                  {{"amount", std::to_string(amount)}, {"fee", std::to_string(fee)}});
-      return err("ERR_AMOUNT_LESS_THAN_FEE");
+      return err("ERR_AMOUNT_LESS_THAN_FEE",
+                 "Refund amount must be greater than the transaction fee");
     }
     double netRefund = amount - fee;
 
-    ctx.sess->startTransaction();
     try {
       ctx.accounts.update()
           .set("balance", balance + netRefund)
@@ -346,11 +426,10 @@ struct POSContext {
           .bind("a", acc)
           .execute();
 
-      std::string newFlag = (amount + refAmt == purchAmt) ? "RF" : "PR";
+      std::string newFlag = (amount == purchAmt) ? "RF" : "PR";
       ctx.sess
-          ->sql(
-              "UPDATE transaction_pos SET refunded_amount=?,flag=? WHERE id=?")
-          .bind(amount + refAmt)
+          ->sql("UPDATE transaction_pos SET refunded_amount=?,flag=? WHERE id=?")
+          .bind(amount)
           .bind(newFlag)
           .bind(id)
           .execute();
@@ -362,7 +441,7 @@ struct POSContext {
                       "fee", "card_pan", "status", "message",
                       "original_purchase_id")
               .values(txnId, clientId, merchantId, terminalId, location, acc,
-                      amount, 0.0, pan, "SUCCESS", "POS refund successful", id)
+                      amount, 0.0, origPan, "SUCCESS", "POS refund successful", id)
               .execute();
 
       ctx.master.insert("table_name", "reference_id", "status")
@@ -372,16 +451,21 @@ struct POSContext {
       Accounting::processRefundLedger(txnId, acc, merchantId, netRefund, "POS Refund", *ctx.sess);
 
       ctx.sess->commit();
-      trace.success({{"transactionId", txnId}, {"netRefund", std::to_string(netRefund)}});
-      return {{"transactionId", txnId},
-              {"status", "SUCCESS"},
-              {"flag", newFlag},
-              {"netRefund", netRefund},
-              {"message", "POS refund successful"}};
+
+      trace.success({{"transactionId",  txnId},
+                     {"netRefund",       std::to_string(netRefund)},
+                     {"originalMerchant", origMerchant},
+                     {"flag",            newFlag}});
+      return {{"transactionId",    txnId},
+              {"status",           "SUCCESS"},
+              {"flag",             newFlag},
+              {"netRefund",        netRefund},
+              {"accountNumber",    acc},
+              {"message",          "POS refund successful"}};
     } catch (...) {
       ctx.sess->rollback();
       trace.fail("database failure during POS refund");
-      return err("ERR_DB_FAILURE");
+      return err("ERR_DB_FAILURE", "Database error during refund — transaction rolled back");
     }
 
   } catch (const std::exception &e) {
@@ -393,9 +477,9 @@ struct POSContext {
 // ── Dispatch table (OCP)
 // ──────────────────────────────────────────────────────
 using POSHandler = std::function<json(const json &, POSContext &)>;
-static const std::unordered_map<std::string, POSHandler> POS_DISPATCH = {
-    {"PURCHASE", purchase},
-    {"REFUND", refund},
+static const std::unordered_map<TransactionType, POSHandler> POS_DISPATCH = {
+    {TransactionType::PURCHASE, purchase},
+    {TransactionType::REFUND, refund},
 };
 
 // ── Public entry point
@@ -411,24 +495,26 @@ json processPOSTransaction(const json &data) {
         "POS transaction handler scheduled",
         {{"transactionType", data.value("transactionType", "")}});
 
-    Database::ScopedConnection sc;
-    POSContext ctx(sc.operator->());
-
-    std::string txnType = data.value("transactionType", "");
-    auto it = POS_DISPATCH.find(txnType);
-    if (it == POS_DISPATCH.end()) {
-      trace.fail("unsupported POS transaction type", {{"transactionType", txnType}});
-      return err("ERR_INVALID_TYPE", "Unsupported POS type: " + txnType);
-    }
-
+    // DB connection and dispatch are acquired/resolved inside the async lambda
+    // to prevent use-after-free of stack-allocated objects.
     auto future = std::async(std::launch::async,
-                             [&, uuid]() -> json {
+                             [data, uuid]() -> json {
                                TransactionLogger::ScopedContext asyncScope(uuid, "POS");
                                TransactionLogger::instance().logCurrent(
                                    "INFO", "channel_handler_started",
                                    "POS transaction handler started",
                                    {{"transactionType", data.value("transactionType", "")}});
-                               return it->second(data, ctx);
+                               // Acquire DB connection inside async thread to avoid
+                               // capturing stack-allocated ctx by reference (use-after-free)
+                               Database::ScopedConnection sc;
+                               POSContext ctx(sc.operator->());
+                               std::string txnTypeStr = data.value("transactionType", "");
+                               TransactionType txnType = stringToTransactionType(txnTypeStr);
+                               auto it2 = POS_DISPATCH.find(txnType);
+                               if (it2 == POS_DISPATCH.end()) {
+                                 return err("ERR_INVALID_TYPE", "Unsupported POS type: " + txnTypeStr);
+                               }
+                               return it2->second(data, ctx);
                              });
 
     if (future.wait_for(std::chrono::seconds(POS_TIMEOUT_SEC)) ==

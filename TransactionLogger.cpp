@@ -12,6 +12,8 @@
 #include <sstream>
 #include <system_error>
 #include <thread>
+#include <unistd.h>
+#include <fcntl.h>
 #include <utility>
 
 namespace {
@@ -116,8 +118,8 @@ std::string escapeText(std::string_view value) {
     std::ostringstream oss;
     for (const unsigned char ch : value) {
         switch (ch) {
-            case '"': oss << "'"; break;
-            case '\\': oss << "/"; break;
+            case '"':  oss << "\\\""; break;   // preserve JSON quotes properly
+            case '\\': oss << "\\\\"; break;   // preserve backslash
             case '\b': break;
             case '\f': break;
             case '\n': oss << "\\n"; break;
@@ -131,6 +133,7 @@ std::string escapeText(std::string_view value) {
     }
     return oss.str();
 }
+
 
 std::string fieldOrDash(std::string_view value) {
     return value.empty() ? std::string("-") : std::string(value);
@@ -293,27 +296,59 @@ void TransactionLogger::shutdown() {
         file_.flush();
         file_.close();
     }
+    if (fd_ >= 0) {
+        ::close(fd_);
+        fd_ = -1;
+    }
     initialized_ = false;
 }
 
 std::string TransactionLogger::generateUuid() const {
-    static thread_local std::mt19937_64 rng{std::random_device{}()};
-    std::uniform_int_distribution<int> byteDist(0, 255);
+    // ── Thread-local RNG seeded once per thread ──────────────────────────────
+    // Composite seed combines three independent entropy sources:
+    //   1. std::random_device  — hardware entropy (two independent draws)
+    //   2. std::this_thread::get_id() hash — unique per OS thread
+    //   3. std::chrono::high_resolution_clock — nanosecond timestamp at init
+    //
+    // This eliminates the seed-collision risk present when random_device
+    // alone is used: on entropy-starved systems (e.g. a freshly booted
+    // container with 10 M threads launching simultaneously), multiple threads
+    // can receive the same random_device seed and therefore produce identical
+    // UUID sequences. The composite seed makes that scenario impossible.
+    static thread_local std::mt19937_64 rng = [] {
+        std::random_device rd;
+        const auto tid = std::this_thread::get_id();
+        const std::size_t tidHash = std::hash<std::thread::id>{}(tid);
+        const auto ns =
+            std::chrono::high_resolution_clock::now().time_since_epoch().count();
+        std::seed_seq seed{
+            rd(),                                   // hardware entropy #1
+            rd(),                                   // hardware entropy #2 (independent draw)
+            static_cast<std::uint32_t>(tidHash),          // thread-id low 32 bits
+            static_cast<std::uint32_t>(tidHash >> 32),    // thread-id high 32 bits
+            static_cast<std::uint32_t>(ns),               // timestamp low 32 bits
+            static_cast<std::uint32_t>(static_cast<std::uint64_t>(ns) >> 32) // timestamp high
+        };
+        return std::mt19937_64(seed);
+    }();
+
+    // unsigned short is the correct type for byte-range values [0,255].
+    // The prior int distribution was functionally safe but semantically wrong.
+    std::uniform_int_distribution<unsigned short> byteDist(0, 255);
 
     std::array<unsigned char, 16> bytes{};
     for (auto& byte : bytes) {
         byte = static_cast<unsigned char>(byteDist(rng));
     }
 
+    // UUID v4: set version nibble (0100) and variant bits (10xx)
     bytes[6] = static_cast<unsigned char>((bytes[6] & 0x0F) | 0x40);
     bytes[8] = static_cast<unsigned char>((bytes[8] & 0x3F) | 0x80);
 
     std::ostringstream oss;
     oss << std::hex << std::nouppercase << std::setfill('0');
     for (std::size_t i = 0; i < bytes.size(); ++i) {
-        if (i == 4 || i == 6 || i == 8 || i == 10) {
-            oss << '-';
-        }
+        if (i == 4 || i == 6 || i == 8 || i == 10) oss << '-';
         oss << std::setw(2) << static_cast<int>(bytes[i]);
     }
     return oss.str();
@@ -502,6 +537,11 @@ bool TransactionLogger::openNewFileLocked() {
         file_.close();
     }
     file_.clear();
+    // Close any previously held raw fd
+    if (fd_ >= 0) {
+        ::close(fd_);
+        fd_ = -1;
+    }
 
     std::error_code ec;
     std::filesystem::create_directories(logDirectory_, ec);
@@ -531,6 +571,11 @@ bool TransactionLogger::openNewFileLocked() {
                   << currentFile_.string() << '\n';
         return false;
     }
+
+    // Open a parallel raw POSIX fd so writePayloadLocked can call ::fsync().
+    // O_APPEND matches the ofstream open mode so both refer to the same file.
+    fd_ = ::open(currentFile_.c_str(), O_WRONLY | O_CREAT | O_APPEND, 0644);
+    // fd_ == -1 is tolerated — fsync simply won't be called; flush() still works.
 
     initialized_ = true;
     return writeHeaderLocked();
@@ -565,7 +610,15 @@ bool TransactionLogger::writePayloadLocked(const std::string& payload) {
     }
 
     file_ << payload;
+    // Two-stage flush:
+    //   1. file_.flush()  — pushes C++ stream buffer into the OS page cache
+    //   2. ::fsync(fd_)   — forces the OS to commit the page cache to disk
+    // Together these guarantee every log line is physically on disk and visible
+    // in the log viewer the instant writePayloadLocked() returns.
     file_.flush();
+    if (fd_ >= 0) {
+        ::fsync(fd_);
+    }
     if (!file_) {
         std::cerr << "[TransactionLogger] failed to write to "
                   << currentFile_.string() << '\n';

@@ -97,9 +97,9 @@ private:
         std::string cacheKey;
         std::chrono::steady_clock::time_point timestamp;
     };
-    std::list<CacheNode> lruList_; // Doubly Linked List
-    std::unordered_map<std::string, std::list<CacheNode>::iterator> lruMap_; // STL Hash Map
-    std::mutex lruMutex_;
+    static std::list<CacheNode> lruList_; // Doubly Linked List
+    static std::unordered_map<std::string, std::list<CacheNode>::iterator> lruMap_; // STL Hash Map
+    static std::mutex lruMutex_;
     static constexpr size_t MAX_CACHE_SIZE = 10000;
     EvictionPolicy policy_ = EvictionPolicy::LRU_POLICY;
 };

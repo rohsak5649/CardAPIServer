@@ -20,11 +20,17 @@
 #include "Database.h"
 #include "TransactionLogger.h"
 
+// Define Falcon static cache members
+std::list<Falcon::CacheNode> Falcon::lruList_;
+std::unordered_map<std::string, std::list<Falcon::CacheNode>::iterator> Falcon::lruMap_;
+std::mutex Falcon::lruMutex_;
+
 #include <algorithm>
 #include <cctype>
 #include <iostream>
 #include <sstream>
 #include <string>
+#include <unordered_set>
 #include <vector>
 
 namespace {
@@ -53,22 +59,23 @@ std::string lowerAscii(std::string_view value) {
 }
 
 std::string joinSignals(const std::vector<std::string>& signals) {
-    std::ostringstream oss;
-    for (std::size_t i = 0; i < signals.size(); ++i) {
-        if (i > 0) {
-            oss << ",";
-        }
-        oss << signals[i];
+    // Simple comma-join: avoids repeated ostringstream state flush
+    std::string result;
+    for (const auto& s : signals) {
+        if (!result.empty()) result += ',';
+        result += s;
     }
-    return oss.str();
+    return result;
 }
 
+// signals_set provides O(1) dedup; signals preserves insertion order for logging
 void addRisk(int& score,
              std::vector<std::string>& signals,
+             std::unordered_set<std::string>& signalSet,
              int points,
              std::string signal) {
     score = std::min(100, score + points);
-    if (std::find(signals.begin(), signals.end(), signal) == signals.end()) {
+    if (signalSet.insert(signal).second) {   // O(1) vs O(N) std::find
         signals.push_back(std::move(signal));
     }
 }
@@ -256,13 +263,14 @@ Falcon::Falcon(Session& session) : sess_(session) {
     trace.success();
 }
 
-// ── Generic row counter ───────────────────────────────────────────────────────
+// ── Generic row counter — O(1): pushes COUNT(*) to the DB engine ─────────────
+// NOTE: callers must build their SQL as "SELECT COUNT(*) FROM ..." not "SELECT id".
 int Falcon::countRows_(const std::string& sql, const std::string& acc) {
     TransactionLogger::ScopedFunctionTrace trace("Falcon::countRows_");
     try {
         auto res = sess_.sql(sql).bind(acc).execute();
-        int cnt = 0;
-        while (res.fetchOne()) ++cnt;
+        auto row = res.fetchOne();
+        int cnt = (!row.isNull() && !row[0].isNull()) ? row[0].get<int>() : 0;
         trace.success({{"count", std::to_string(cnt)}});
         return cnt;
     } catch (...) {
@@ -272,54 +280,69 @@ int Falcon::countRows_(const std::string& sql, const std::string& acc) {
 }
 
 // ── Same-second: any txn on `table` for this account in last 1 second ─────────
+//
+// Cache semantics:
+//   HIT  (timeDiff ≤ 1 000 ms) → return true immediately (O(1), fraud detected)
+//   STALE (timeDiff  > 1 000 ms) → evict old entry, fall through to DB
+//   MISS                          → fall through to DB, then cache result
+//
+// Bug-fix: previously the stale-key path updated the cache timestamp and STILL
+// hit the DB, effectively double-writing the cache.  Now we evict first, then
+// the DB result drives whether we (re-)insert into cache.
 bool Falcon::sameSecond_(std::string_view acc, std::string_view table) {
     TransactionLogger::ScopedFunctionTrace trace("Falcon::sameSecond_",
                                                  {{"table", std::string(table)}});
-                                                 
-    // ── O(1) Time Complexity Check using LRU Cache (Linked List + STL Map) ─────
-    std::string cacheKey = std::string(acc) + "|" + std::string(table);
-    auto now = std::chrono::steady_clock::now();
+
+    const std::string cacheKey = std::string(acc) + '|' + std::string(table);
+    const auto now = std::chrono::steady_clock::now();
 
     {
         std::lock_guard<std::mutex> lock(lruMutex_);
         auto it = lruMap_.find(cacheKey);
         if (it != lruMap_.end()) {
-            auto timeDiff = std::chrono::duration_cast<std::chrono::milliseconds>(now - it->second->timestamp).count();
-            if (timeDiff <= 1000) { // Within 1 second
-                // Duplicate found in O(1) time
-                if (policy_ == EvictionPolicy::LRU_POLICY) {
-                    lruList_.splice(lruList_.begin(), lruList_, it->second); // Move to front
-                }
-                trace.success({{"matched", "true"}, {"source", "cache_hit"}});
-                return true; 
-            } else {
-                // Expired, update timestamp and move to front
-                it->second->timestamp = now;
+            const auto ageMsec =
+                std::chrono::duration_cast<std::chrono::milliseconds>(
+                    now - it->second->timestamp).count();
+
+            if (ageMsec <= 1000) {
+                // ✅ Cache HIT — duplicate within 1 second, O(1) fraud detect
                 if (policy_ == EvictionPolicy::LRU_POLICY) {
                     lruList_.splice(lruList_.begin(), lruList_, it->second);
                 }
+                trace.success({{"matched", "true"}, {"source", "cache_hit"}});
+                return true;
             }
-        } else {
-            // Not found, insert new entry at the front
-            lruList_.push_front({cacheKey, now});
-            lruMap_[cacheKey] = lruList_.begin();
 
-            if (lruMap_.size() > MAX_CACHE_SIZE) {
-                auto last = std::prev(lruList_.end());
-                lruMap_.erase(last->cacheKey);
-                lruList_.pop_back(); // Evict Least Recently Used (O(1) deletion)
-            }
+            // ⚠️  Stale entry — evict, then fall through to DB
+            lruMap_.erase(it);
+            // (list node will be re-inserted below if DB finds a hit)
         }
     }
 
-    // ── Fallback to Database Query (Existing Logic Preserved) ─────────────────
-    std::string sql =
+    // ── DB fallback: existence check only (LIMIT 1 is cheapest possible query)
+    const std::string sql =
         "SELECT 1 FROM " + std::string(table) +
         " WHERE account_number = ?"
         " AND created_at >= NOW() - INTERVAL 1 SECOND LIMIT 1";
     try {
         auto res = sess_.sql(sql).bind(std::string(acc)).execute();
-        bool matched = res.count() > 0;
+        const bool matched = (res.count() > 0);
+
+        if (matched) {
+            // Populate / refresh cache so subsequent calls in this second are O(1)
+            std::lock_guard<std::mutex> lock(lruMutex_);
+            lruList_.push_front({cacheKey, now});
+            lruMap_[cacheKey] = lruList_.begin();
+            if (lruMap_.size() > MAX_CACHE_SIZE) {
+                // Capture the evicted key BEFORE pop_back() destroys the node.
+                // Erase map entry first, then remove the list node — this order
+                // ensures the key string remains valid during map erase.
+                const std::string evictedKey = std::prev(lruList_.end())->cacheKey;
+                lruMap_.erase(evictedKey);   // remove hash-map entry first
+                lruList_.pop_back();         // then destroy the list node
+            }
+        }
+
         trace.success({{"matched", matched ? "true" : "false"}, {"source", "db"}});
         return matched;
     } catch (...) {
@@ -329,16 +352,21 @@ bool Falcon::sameSecond_(std::string_view acc, std::string_view table) {
 }
 
 // ── Per-channel velocity ──────────────────────────────────────────────────────
+// Uses SELECT COUNT(*) with a LIMIT sub-query so the DB stops counting as soon
+// as it reaches the limit — avoids a full table scan on high-volume accounts.
 bool Falcon::velocity_(std::string_view acc, std::string_view table) {
     TransactionLogger::ScopedFunctionTrace trace("Falcon::velocity_",
                                                  {{"table", std::string(table)}});
-    std::string sql =
-        "SELECT id FROM " + std::string(table) +
-        " WHERE account_number = ?"
-        " AND created_at >= NOW() - INTERVAL " +
+    // Wrap with COUNT(*) so countRows_() receives a scalar, not a row-set
+    const std::string sql =
+        "SELECT COUNT(*) FROM ("
+        "  SELECT id FROM " + std::string(table) +
+        "  WHERE account_number = ?"
+        "  AND created_at >= NOW() - INTERVAL " +
         std::to_string(FALCON_VELOCITY_WINDOW) + " SECOND"
-        " LIMIT " + std::to_string(FALCON_VELOCITY_LIMIT);
-    bool matched = countRows_(sql, std::string(acc)) >= FALCON_VELOCITY_LIMIT;
+        "  LIMIT " + std::to_string(FALCON_VELOCITY_LIMIT) +
+        ") AS v";
+    const bool matched = (countRows_(sql, std::string(acc)) >= FALCON_VELOCITY_LIMIT);
     trace.success({{"matched", matched ? "true" : "false"}});
     return matched;
 }
@@ -445,24 +473,27 @@ bool Falcon::aiThreatScore_(const nlohmann::json* requestData,
     const nlohmann::json& data = *requestData;
     int score = 0;
     std::vector<std::string> signals;
+    std::unordered_set<std::string> signalSet; // O(1) dedup for addRisk
 
+    // Helper: add risk points when a boolean flag is truthy across any context object
     auto addBoolRisk = [&](std::string_view key, int points, std::string signal) {
         bool value = false;
         if ((boolValue(data, key, value) ||
              nestedBoolValue(data, "security", key, value) ||
              nestedBoolValue(data, "device", key, value) ||
              nestedBoolValue(data, "_securityContext", key, value)) && value) {
-            addRisk(score, signals, points, std::move(signal));
+            addRisk(score, signals, signalSet, points, std::move(signal));
         }
     };
 
+    // Helper: add risk points when a boolean flag is falsy (e.g., appSignatureValid=false)
     auto addFalseRisk = [&](std::string_view key, int points, std::string signal) {
         bool value = true;
         if ((boolValue(data, key, value) ||
              nestedBoolValue(data, "security", key, value) ||
              nestedBoolValue(data, "device", key, value) ||
              nestedBoolValue(data, "_securityContext", key, value)) && !value) {
-            addRisk(score, signals, points, std::move(signal));
+            addRisk(score, signals, signalSet, points, std::move(signal));
         }
     };
 
@@ -486,9 +517,9 @@ bool Falcon::aiThreatScore_(const nlohmann::json* requestData,
     if (integrity.empty()) integrity = lowerAscii(nestedStringValue(data, "_securityContext", "deviceIntegrity"));
     if (integrity == "fail" || integrity == "failed" || integrity == "compromised" ||
         integrity == "unsafe" || integrity == "low") {
-        addRisk(score, signals, 85, "device_integrity_failed");
+        addRisk(score, signals, signalSet, 85, "device_integrity_failed");
     } else if (integrity == "medium" || integrity == "unknown") {
-        addRisk(score, signals, 25, "weak_device_integrity");
+        addRisk(score, signals, signalSet, 25, "weak_device_integrity");
     }
 
     double reportedRisk = 0.0;
@@ -497,9 +528,9 @@ bool Falcon::aiThreatScore_(const nlohmann::json* requestData,
         nestedNumberValue(data, "device", "riskScore", reportedRisk) ||
         nestedNumberValue(data, "_securityContext", "riskScore", reportedRisk)) {
         if (reportedRisk >= 80.0) {
-            addRisk(score, signals, 80, "external_risk_score_high");
+            addRisk(score, signals, signalSet, 80, "external_risk_score_high");
         } else if (reportedRisk >= 60.0) {
-            addRisk(score, signals, 35, "external_risk_score_elevated");
+            addRisk(score, signals, signalSet, 35, "external_risk_score_elevated");
         }
     }
 
@@ -509,9 +540,9 @@ bool Falcon::aiThreatScore_(const nlohmann::json* requestData,
         nestedNumberValue(data, "device", "deviceTrustScore", trustScore) ||
         nestedNumberValue(data, "_securityContext", "deviceTrustScore", trustScore)) {
         if (trustScore < 30.0) {
-            addRisk(score, signals, 70, "device_trust_low");
+            addRisk(score, signals, signalSet, 70, "device_trust_low");
         } else if (trustScore < 50.0) {
-            addRisk(score, signals, 35, "device_trust_elevated");
+            addRisk(score, signals, signalSet, 35, "device_trust_elevated");
         }
     }
 
@@ -519,34 +550,34 @@ bool Falcon::aiThreatScore_(const nlohmann::json* requestData,
         nestedStringValue(data, "_securityContext", "userAgent");
     if (containsAny(userAgent, {"sqlmap", "nikto", "nmap", "masscan", "metasploit",
                                 "nuclei", "acunetix", "nessus", "wpscan"})) {
-        addRisk(score, signals, 90, "attack_tool_user_agent");
+        addRisk(score, signals, signalSet, 90, "attack_tool_user_agent");
     } else if (containsAny(userAgent, {"burp", "owasp zap", "python-requests",
                                        "curl/", "wget/"})) {
-        addRisk(score, signals, 55, "automation_user_agent");
+        addRisk(score, signals, signalSet, 55, "automation_user_agent");
     }
 
     const std::string forwardedFor =
         nestedStringValue(data, "_securityContext", "forwardedFor");
     if (!forwardedFor.empty() && forwardedFor.find(',') != std::string::npos) {
-        addRisk(score, signals, 10, "multi_hop_forwarded_for");
+        addRisk(score, signals, signalSet, 10, "multi_hop_forwarded_for");
     }
 
     std::size_t remainingChars = 4096;
     bool attackMarker = false;
     scanJsonForAttackMarkers(data, 0, remainingChars, attackMarker);
     if (attackMarker) {
-        addRisk(score, signals, 75, "payload_attack_marker");
+        addRisk(score, signals, signalSet, 75, "payload_attack_marker");
     }
 
     if ((channel == FalconChannel::MOBILE || channel == FalconChannel::RINGPAY) &&
         stringValue(data, "deviceId").empty()) {
-        addRisk(score, signals, 15, "missing_device_id");
+        addRisk(score, signals, signalSet, 15, "missing_device_id");
     }
 
     if (amount >= 100000.0) {
-        addRisk(score, signals, 20, "very_large_amount");
+        addRisk(score, signals, signalSet, 20, "very_large_amount");
     } else if (amount >= 50000.0) {
-        addRisk(score, signals, 10, "large_amount");
+        addRisk(score, signals, signalSet, 10, "large_amount");
     }
 
     const std::string signalText = joinSignals(signals);
@@ -636,18 +667,19 @@ bool Falcon::checkFraud(std::string_view     accountNumber,
     }
 
     // ── Rule 3: Cross-channel velocity ───────────────────────────────────
-    if (channel == FalconChannel::ALL) {
-        if (crossChannelVelocity_(accountNumber)) {
-            reason = "Cross-channel velocity limit exceeded (>" +
-                     std::to_string(FALCON_VELOCITY_LIMIT) +
-                     " txns across all channels in 60 sec)";
-            TransactionLogger::instance().logCurrent(
-                "WARN", "fraud_check_declined", reason,
-                {{"rule", "cross_channel_velocity"}});
-            trace.fail("fraud rule matched",
-                       {{"rule", "cross_channel_velocity"}, {"reason", reason}});
-            return true;
-        }
+    // Always check cross-channel velocity regardless of the current channel,
+    // since a fraudster could spread transactions across channels to avoid
+    // per-channel limits while exceeding the total combined limit.
+    if (crossChannelVelocity_(accountNumber)) {
+        reason = "Cross-channel velocity limit exceeded (>" +
+                 std::to_string(FALCON_VELOCITY_LIMIT) +
+                 " txns across all channels in 60 sec)";
+        TransactionLogger::instance().logCurrent(
+            "WARN", "fraud_check_declined", reason,
+            {{"rule", "cross_channel_velocity"}});
+        trace.fail("fraud rule matched",
+                   {{"rule", "cross_channel_velocity"}, {"reason", reason}});
+        return true;
     }
 
     // ── Rule 4: Amount spike ─────────────────────────────────────────────
