@@ -23,23 +23,39 @@ jobs:
       - name: Install OpenSSL
         run: choco install openssl --no-progress -y
 
-      # ── Install MySQL Connector C++ ───────────────────────────────────────────
+      # ── Download and Install MySQL Connector C++ 9.5 MSI ─────────────────────
+      # choco has no mysql-connector-c++ package, so we download from MySQL CDN
       - name: Install MySQL Connector C++
-        run: choco install mysql-connector-c++ --no-progress -y
-
-      # ── Locate OpenSSL path (Chocolatey installs to C:\Program Files\OpenSSL-Win64) ─
-      - name: Configure CMake
+        shell: pwsh
         run: |
-          cmake -B build -S . `
-            -DCMAKE_BUILD_TYPE=Release `
-            -DOPENSSL_ROOT_DIR="C:/Program Files/OpenSSL-Win64" `
-            -DOPENSSL_INCLUDE_DIR="C:/Program Files/OpenSSL-Win64/include" `
-            -DOPENSSL_CRYPTO_LIBRARY="C:/Program Files/OpenSSL-Win64/lib/libcrypto.lib" `
-            -DOPENSSL_SSL_LIBRARY="C:/Program Files/OpenSSL-Win64/lib/libssl.lib"
+          $url = "https://cdn.mysql.com//Downloads/Connector-C++/mysql-connector-c++-9.5.0-winx64.msi"
+          $out = "$env:TEMP\mysql-connector-cpp.msi"
+          Write-Host "Downloading MySQL Connector C++ from $url"
+          Invoke-WebRequest -Uri $url -OutFile $out -UseBasicParsing
+          Write-Host "Installing MySQL Connector C++..."
+          Start-Process msiexec.exe -ArgumentList "/i", $out, "/quiet", "/norestart" -Wait
+          Write-Host "Installation complete."
 
+      # ── Verify paths exist before calling CMake ───────────────────────────────
+      - name: Verify dependency paths
+        shell: pwsh
+        run: |
+          $ssl  = "C:/Program Files/OpenSSL-Win64"
+          $mysql = "C:/Program Files/MySQL/MySQL Connector C++ 9.5"
+          if (!(Test-Path $ssl))   { Write-Error "OpenSSL path not found: $ssl" }
+          if (!(Test-Path $mysql)) { Write-Error "MySQL Connector path not found: $mysql" }
+          Write-Host "OpenSSL path: $ssl"
+          Get-ChildItem "$mysql\lib64" -ErrorAction SilentlyContinue
+
+      # ── Configure CMake ───────────────────────────────────────────────────────
+      - name: Configure CMake
+        run: cmake -B build -S . -DCMAKE_BUILD_TYPE=Release
+
+      # ── Build ─────────────────────────────────────────────────────────────────
       - name: Build Project
         run: cmake --build build --config Release --parallel 4
 
+      # ── Upload resulting EXE as downloadable artifact ─────────────────────────
       - name: Upload EXE
         uses: actions/upload-artifact@v4
         with:

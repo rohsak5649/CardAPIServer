@@ -5,21 +5,46 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
-# ── Include directories ────────────────────────────────────────────────────────
-include_directories(
-        ${PROJECT_SOURCE_DIR}/include
-        /opt/homebrew/include
-        /opt/homebrew/Cellar/mysql-connector-c++/9.5.0/include
-)
+# ── Platform-specific dependency paths ────────────────────────────────────────
+if(WIN32)
+    # Windows — MySQL Connector C++ installed to default path by MSI installer
+    set(MYSQL_CONNECTOR_DIR "C:/Program Files/MySQL/MySQL Connector C++ 9.5")
 
-# ── Link directories ───────────────────────────────────────────────────────────
-link_directories(
-        /opt/homebrew/lib
-        /opt/homebrew/Cellar/mysql-connector-c++/9.5.0/lib
-)
+    include_directories(
+            ${PROJECT_SOURCE_DIR}/include
+            "${MYSQL_CONNECTOR_DIR}/include"
+            "${MYSQL_CONNECTOR_DIR}/include/mysqlx"
+    )
+
+    link_directories(
+            "${MYSQL_CONNECTOR_DIR}/lib64/vs14"
+            "${MYSQL_CONNECTOR_DIR}/lib64"
+    )
+
+    # OpenSSL — installed by Chocolatey to this path on windows-latest runners
+    set(OPENSSL_ROOT_DIR "C:/Program Files/OpenSSL-Win64")
+
+else()
+    # macOS (Homebrew) / Linux
+    include_directories(
+            ${PROJECT_SOURCE_DIR}/include
+            /opt/homebrew/include
+            /opt/homebrew/Cellar/mysql-connector-c++/9.5.0/include
+    )
+
+    link_directories(
+            /opt/homebrew/lib
+            /opt/homebrew/Cellar/mysql-connector-c++/9.5.0/lib
+    )
+
+    # OpenSSL — Homebrew on macOS
+    if(APPLE)
+        set(OPENSSL_ROOT_DIR /opt/homebrew/opt/openssl@3)
+    endif()
+
+endif()
 
 # ── OpenSSL ────────────────────────────────────────────────────────────────────
-set(OPENSSL_ROOT_DIR /opt/homebrew/opt/openssl@3)
 find_package(OpenSSL REQUIRED)
 
 # ── Threads (REQUIRED for multithreading) ─────────────────────────────────────
@@ -102,7 +127,10 @@ if(NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE Debug CACHE STRING "Build type" FORCE)
 endif()
 
-target_compile_options(BankingAPIServer PRIVATE
-    $<$<CONFIG:Debug>:   -O0 -g3 -DDEBUG>
-    $<$<CONFIG:Release>: -O2 -DNDEBUG>
-)
+# GCC / Clang flags (macOS and Linux) — MSVC uses its own /Od /O2 defaults
+if(NOT MSVC)
+    target_compile_options(BankingAPIServer PRIVATE
+        $<$<CONFIG:Debug>:   -O0 -g3 -DDEBUG>
+        $<$<CONFIG:Release>: -O2 -DNDEBUG>
+    )
+endif()
