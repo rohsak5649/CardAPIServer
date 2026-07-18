@@ -1,4 +1,4 @@
-name: Build Windows EXE
+name: Build
 
 on:
   push:
@@ -10,85 +10,59 @@ on:
 
 jobs:
   build:
-    runs-on: windows-latest
+    # Ubuntu has all POSIX headers (unistd.h, fcntl.h, fsync, gethostname, etc.)
+    # and supports MySQL Connector C++ X DevAPI natively via deb packages.
+    runs-on: ubuntu-latest
 
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
 
-      - name: Setup MSVC
-        uses: ilammy/msvc-dev-cmd@v1
-
-      # ── Install OpenSSL and discover actual install path ──────────────────────
-      - name: Install OpenSSL
-        shell: pwsh
+      # ── System build tools + OpenSSL ──────────────────────────────────────────
+      - name: Install build dependencies
         run: |
-          choco install openssl --no-progress -y
+          sudo apt-get update -q
+          sudo apt-get install -y \
+            build-essential \
+            cmake \
+            libssl-dev
 
-          $candidates = @(
-            "C:\Program Files\OpenSSL-Win64",
-            "C:\OpenSSL-Win64",
-            "C:\Program Files\OpenSSL",
-            "C:\OpenSSL"
-          )
-          $root = $candidates | Where-Object { Test-Path "$_\lib" } | Select-Object -First 1
-
-          if (!$root) {
-            $exe = Get-Command openssl.exe -ErrorAction SilentlyContinue
-            if ($exe) { $root = Split-Path (Split-Path $exe.Source -Parent) -Parent }
-          }
-          if (!$root) { Write-Error "Cannot locate OpenSSL after choco install."; exit 1 }
-
-          Write-Host "✅ OpenSSL found at: $root"
-          "OPENSSL_ROOT_DIR=$root" | Out-File -FilePath $env:GITHUB_ENV -Append
-
-      # ── Download and Install MySQL Connector C++ 9.5 MSI ─────────────────────
-      - name: Install MySQL Connector C++
-        shell: pwsh
+      # ── MySQL Connector C++ 9.5 (X DevAPI) ───────────────────────────────────
+      # No apt package exists — download deb directly from MySQL CDN.
+      - name: Install MySQL Connector C++ 9.5
         run: |
-          $url = "https://cdn.mysql.com//Downloads/Connector-C++/mysql-connector-c++-9.5.0-winx64.msi"
-          $msi = "$env:TEMP\mysql-connector-cpp.msi"
-          Write-Host "Downloading MySQL Connector C++ 9.5..."
-          Invoke-WebRequest -Uri $url -OutFile $msi -UseBasicParsing
-          Write-Host "Installing via msiexec..."
-          Start-Process msiexec.exe -ArgumentList "/i `"$msi`" /quiet /norestart" -Wait -NoNewWindow
+          cd /tmp
 
-          # ── Discover where the MSI actually installed ────────────────────────
-          # The version string in the dir name may vary (9.5 vs 9.5.0)
-          $mysqlBase = "C:\Program Files\MySQL"
-          $dir = Get-ChildItem $mysqlBase -Directory -ErrorAction SilentlyContinue |
-                 Where-Object { $_.Name -like "MySQL Connector C++*" } |
-                 Sort-Object Name -Descending |
-                 Select-Object -First 1 -ExpandProperty FullName
+          # Runtime library
+          wget -q "https://cdn.mysql.com/Downloads/Connector-C++/libmysqlcppconnx2_9.5.0-1ubuntu24.04_amd64.deb" \
+               -O mysql-runtime.deb
 
-          if (!$dir) {
-            Write-Error "MySQL Connector C++ not found under $mysqlBase"
-            Get-ChildItem $mysqlBase -ErrorAction SilentlyContinue
-            exit 1
-          }
+          # Development headers + .so symlink
+          wget -q "https://cdn.mysql.com/Downloads/Connector-C++/libmysqlcppconnx-dev_9.5.0-1ubuntu24.04_amd64.deb" \
+               -O mysql-dev.deb
 
-          Write-Host "✅ MySQL Connector found at: $dir"
-          Get-ChildItem "$dir\include" -ErrorAction SilentlyContinue | Select-Object -First 5 Name
-          "MYSQL_CONNECTOR_DIR=$dir" | Out-File -FilePath $env:GITHUB_ENV -Append
+          sudo dpkg -i mysql-runtime.deb mysql-dev.deb
 
-      # ── Configure CMake — pass both dependency roots explicitly ───────────────
+          # Verify headers landed in a standard path
+          if find /usr /usr/local -name "xdevapi.h" 2>/dev/null | grep -q xdevapi; then
+            echo "✅ mysqlx/xdevapi.h found:"
+            find /usr /usr/local -name "xdevapi.h" 2>/dev/null
+          else
+            echo "⚠ xdevapi.h not in /usr — checking dpkg content list..."
+            dpkg -L libmysqlcppconnx-dev 2>/dev/null || true
+          fi
+
+      # ── CMake configure ───────────────────────────────────────────────────────
       - name: Configure CMake
-        shell: pwsh
-        run: |
-          Write-Host "OPENSSL_ROOT_DIR : $env:OPENSSL_ROOT_DIR"
-          Write-Host "MYSQL_CONNECTOR_DIR: $env:MYSQL_CONNECTOR_DIR"
-          cmake -B build -S . `
-            -DCMAKE_BUILD_TYPE=Release `
-            -DOPENSSL_ROOT_DIR="$env:OPENSSL_ROOT_DIR" `
-            -DMYSQL_CONNECTOR_DIR="$env:MYSQL_CONNECTOR_DIR"
+        run: cmake -B build -S . -DCMAKE_BUILD_TYPE=Release
 
       # ── Build ─────────────────────────────────────────────────────────────────
-      - name: Build Project
-        run: cmake --build build --config Release --parallel 4
+      - name: Build
+        run: cmake --build build --parallel 4
 
-      # ── Upload EXE ────────────────────────────────────────────────────────────
-      - name: Upload EXE
+      # ── Upload binary ─────────────────────────────────────────────────────────
+      - name: Upload Binary
         uses: actions/upload-artifact@v4
         with:
-          name: BankingAPIServer-EXE
-          path: build/**/*.exe
+          name: BankingAPIServer-Linux
+          path: build/BankingAPIServer

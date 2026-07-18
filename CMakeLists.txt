@@ -31,21 +31,32 @@ if(WIN32)
     endif()
 
 else()
-    # macOS (Homebrew) / Linux
-    include_directories(
-            ${PROJECT_SOURCE_DIR}/include
-            /opt/homebrew/include
-            /opt/homebrew/Cellar/mysql-connector-c++/9.5.0/include
-    )
-
-    link_directories(
-            /opt/homebrew/lib
-            /opt/homebrew/Cellar/mysql-connector-c++/9.5.0/lib
-    )
-
-    # OpenSSL — Homebrew on macOS
     if(APPLE)
+        # macOS — Homebrew
+        include_directories(
+                ${PROJECT_SOURCE_DIR}/include
+                /opt/homebrew/include
+                /opt/homebrew/Cellar/mysql-connector-c++/9.5.0/include
+        )
+        link_directories(
+                /opt/homebrew/lib
+                /opt/homebrew/Cellar/mysql-connector-c++/9.5.0/lib
+        )
         set(OPENSSL_ROOT_DIR /opt/homebrew/opt/openssl@3)
+
+    else()
+        # Linux (Ubuntu CI) — MySQL Connector C++ deb installs to system paths:
+        #   Headers: /usr/include/mysqlx/  or  /usr/local/include/
+        #   Library: /usr/lib/x86_64-linux-gnu/libmysqlcppconnx.so
+        # Both are in the compiler's default search path — no extra dirs needed.
+        include_directories(${PROJECT_SOURCE_DIR}/include)
+
+        # Allow CI to override if the deb installs to a non-standard prefix
+        if(MYSQL_CONNECTOR_DIR)
+            include_directories("${MYSQL_CONNECTOR_DIR}/include")
+            link_directories("${MYSQL_CONNECTOR_DIR}/lib64" "${MYSQL_CONNECTOR_DIR}/lib")
+        endif()
+
     endif()
 
 endif()

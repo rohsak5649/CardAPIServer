@@ -37,8 +37,8 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
-#include <unistd.h>   // gethostname
 #include <vector>
+
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Hex helpers
