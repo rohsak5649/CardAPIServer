@@ -4,7 +4,6 @@ on:
   push:
     branches:
       - main
-
   pull_request:
     branches:
       - main
@@ -14,18 +13,32 @@ jobs:
     runs-on: windows-latest
 
     steps:
-
       - name: Checkout Repository
         uses: actions/checkout@v4
 
       - name: Setup MSVC
         uses: ilammy/msvc-dev-cmd@v1
 
+      # ── Install OpenSSL (Chocolatey is pre-installed on windows-latest) ───────
+      - name: Install OpenSSL
+        run: choco install openssl --no-progress -y
+
+      # ── Install MySQL Connector C++ ───────────────────────────────────────────
+      - name: Install MySQL Connector C++
+        run: choco install mysql-connector-c++ --no-progress -y
+
+      # ── Locate OpenSSL path (Chocolatey installs to C:\Program Files\OpenSSL-Win64) ─
       - name: Configure CMake
-        run: cmake -B build -S .
+        run: |
+          cmake -B build -S . `
+            -DCMAKE_BUILD_TYPE=Release `
+            -DOPENSSL_ROOT_DIR="C:/Program Files/OpenSSL-Win64" `
+            -DOPENSSL_INCLUDE_DIR="C:/Program Files/OpenSSL-Win64/include" `
+            -DOPENSSL_CRYPTO_LIBRARY="C:/Program Files/OpenSSL-Win64/lib/libcrypto.lib" `
+            -DOPENSSL_SSL_LIBRARY="C:/Program Files/OpenSSL-Win64/lib/libssl.lib"
 
       - name: Build Project
-        run: cmake --build build --config Release
+        run: cmake --build build --config Release --parallel 4
 
       - name: Upload EXE
         uses: actions/upload-artifact@v4
