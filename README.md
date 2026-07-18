@@ -108,111 +108,82 @@ This engine simulates the complete core responsibilities of a production banking
 
 ## System Architecture
 
-```
-Client / Channel App
-        │
-        ▼
-┌───────────────────────────────────────────────────────────────────────┐
-│  HTTP Server (parser&router.cpp)  — 10M-thread pool (cpp-httplib)    │
-│                                                                       │
-│  ① Auth Middleware   — X-API-Key header lookup or JWT Bearer verify  │
-│  ② IP Rate Limiter   — 200 requests/min per source IP, sliding window │
-│  ③ RBAC Check        — role × channelId permission matrix (O(1))      │
-│  ④ Idempotency Gate  — cache hit → return stored response immediately │
-│  ⑤ UUID Generation   — makeRequestId() → _correlationUuid injected   │
-│  ⑥ LOG request_body  — full sanitized JSON, PAN/PIN/CVV redacted      │
-│  ⑦ Channel Dispatch  — O(1) unordered_map<channelId, handler>        │
-│  ⑧ LOG response_body — outgoing JSON + httpStatus                    │
-└───────────────────────────────────────────────────────────────────────┘
-        │
-        ▼
-Channel Handler (one per channelId — 20 channels)
-   ATM │ MOBILE │ POS │ ECOM │ QRCODE │ RINGPAY │ ICCW │
-   ISSUER │ CARD_* │ ACCOUNT_* │ 3DS │ REVERSAL
-        │
-        ├──► DbConfig::load()     — AES-256-GCM encrypted db.ini (startup only)
-        │
-        ├──► Falcon Fraud Engine  — velocity · duplicate · spike · AI score
-        │        └──► transaction_falcon (DB write on decline)
-        │
-        ├──► DCC Engine           — FX rate lookup + 2% bank markup
-        │        └──► exchange_rates (DB read)
-        │
-        ├──► AccountLockManager   — per-account mutex, credit > debit priority
-        │
-        ├──► Double-Entry Ledger  — DEBIT/CREDIT journal entries
-        │        └──► ledger_entries + ledger_accounts (DB write)
-        │
-        └──► DB Connection Pool   — acquire() → SQL → release()
-                 (10 sessions default, POOL_SIZE_MAX=50, self-healing)
-        │
-        ▼
-MySQL bankingdb
-   ├── accounts               (balance, freeze, country, currency)
-   ├── cards                  (PAN, encryptedPan, expiry, CVV, scheme, limits, status)
-   ├── api_keys               (authentication key → role mapping)
-   ├── idempotency_keys       (deduplication cache)
-   ├── tds_challenges         (3DS OTP challenges, 10-min TTL)
-   ├── ledger_accounts        (running balances per ledger node)
-   ├── ledger_entries         (DEBIT/CREDIT journal)
-   ├── exchange_rates         (FX rates for 7 currency pairs)
-   ├── transaction_atm        (transaction_id = UUID)
-   ├── transaction_mobile     (transaction_id = UUID)
-   ├── transaction_pos        (transaction_id = UUID, refunded_amount, flag)
-   ├── transaction_ecom       (transaction_id = UUID, refunded_amount, flag)
-   ├── transaction_qrcode     (transaction_id = UUID)
-   ├── transaction_ringpay    (transaction_id = UUID)
-   ├── transaction_falcon     (fraud decline records)
-   └── transactions           (master registry — one row per request)
-        │
-        ▼
-TransactionLogger (bin/debug/log/log_YYYYMMDD_HHMMSS.log)
-   ├── event=request_body    (sanitized incoming JSON)
-   ├── event=response_body   (outgoing JSON + httpStatus)
-   ├── event=function_enter/exit  (ScopedFunctionTrace blocks)
-   ├── file_.flush()         (C++ buffer → OS page cache)
-   └── ::fsync(fd_)          (OS page cache → physical disk)
+```mermaid
+graph TD
+    Client[Client / Channel App] --> Router[HTTP Server: parser&router.cpp]
+    
+    subgraph Pipeline [HTTP Processing Pipeline]
+        Router --> Auth[Auth Middleware: X-API-Key / JWT]
+        Auth --> RateLimit[IP Rate Limiter: 200 req/min]
+        RateLimit --> RBAC[RBAC Matrix Validation]
+        RBAC --> Idempotency{Idempotency Key Check}
+        Idempotency -- Hit --> ReturnCached[Return Stored Response]
+        Idempotency -- Miss --> GenUUID[Generate Request UUID]
+        GenUUID --> LogRequest[Log Request Body: Sanitized/Masked]
+    end
+
+    LogRequest --> Dispatch{Channel Router}
+
+    subgraph Channels [Payment Channel Handlers]
+        Dispatch --> ATM[ATM Handler]
+        Dispatch --> MOBILE[Mobile Handler]
+        Dispatch --> POS[POS Handler]
+        Dispatch --> ECOM[ECOM Handler]
+        Dispatch --> QR[QRCode Handler]
+        Dispatch --> Other[Other Channels]
+    end
+
+    subgraph Modules [Core Switch Modules]
+        ATM & MOBILE & POS & ECOM & QR & Other --> Falcon[Falcon Fraud Engine]
+        ATM & MOBILE & POS & ECOM & QR & Other --> Decrypt[PAN Decryption GCM]
+        ATM & MOBILE & POS & ECOM & QR & Other --> DCC[DCC FX Engine]
+        ATM & MOBILE & POS & ECOM & QR & Other --> Lock[AccountLockManager]
+        ATM & MOBILE & POS & ECOM & QR & Other --> Ledger[Double-Entry Ledger]
+    end
+
+    Lock --> DB[(MySQL Database: bankingdb)]
+    Ledger --> DB
+    
+    Modules --> Logger[TransactionLogger: Immediate fsync]
 ```
 
 ---
 
 ## Request Lifecycle
 
-Every request follows this exact sequence:
+Every request follows this exact sequence to ensure atomic operations, transaction isolation, and secure log durability:
 
-```
-1.  HTTP request arrives on port 8084
-2.  Auth Middleware: parse X-API-Key or Authorization: Bearer header
-    → DB lookup or HMAC-SHA256 JWT verify → extract role
-3.  IP Rate Limiter: sliding window counter per source IP
-    → 429 ERR_RATE_LIMIT if > 200/min
-4.  RBAC: check (role, channelId) pair against permission matrix
-    → 403 ERR_FORBIDDEN if not permitted
-5.  Idempotency: lookup Idempotency-Key in cache
-    → 200 cached response if already processed
-    → 409 ERR_CONFLICT if another request with same key is in-flight
-6.  UUID generation: makeRequestId() → 36-char hyphenated UUID
-    → injected into request JSON as _correlationUuid
-    → set as active TransactionLogger thread_local context
-7.  LOG: event=request_body (sanitized — pan/pin/cvv → "****")
-8.  Channel dispatch: O(1) map lookup → call handler(data, uuid)
-9.  Inside channel handler:
-    a. Parse and validate input fields
-    b. Falcon fraud check (velocity, duplicate, spike, AI score)
-    c. Decrypt PAN (AES-256-GCM) → card DB lookup
-    d. Validate expiry, CVV, PIN (HMAC-SHA256)
-    e. Check account freeze, balance, daily/monthly limits
-    f. DCC conversion if currency differs
-    g. AccountLockManager: acquire per-account lock
-    h. Execute balance update + DB transaction
-    i. Write double-entry ledger entries
-    j. Insert channel-specific transaction row (transaction_id = UUID)
-    k. Insert master transactions row
-    l. Release account lock
-10. Build JSON response with requestId + transactionUuid = UUID
-11. LOG: event=response_body (full response + httpStatus)
-12. Idempotency: store response in cache against key
-13. Return HTTP response to client
+```mermaid
+sequenceDiagram
+    autonumber
+    actor Client
+    participant Router as Router & Middleware
+    participant Channel as Channel Handler
+    participant Falcon as Falcon Engine
+    participant DB as MySQL DB
+    participant Log as TransactionLogger (fsync)
+
+    Client->>Router: POST /transaction/initiate
+    Note over Router: Authenticate, Rate Limit, RBAC & Idempotency checks
+    Router->>Log: event=request_body (redacted PAN/PIN)
+    Log-->>Log: file.flush() & fsync()
+    Router->>Channel: Dispatch to channel (with correlation UUID)
+    
+    rect rgb(240, 248, 255)
+        Note over Channel: Decrypt PAN, check PIN/Limits/DCC
+        Channel->>Falcon: checkFraud(account, amount)
+        Falcon-->>Channel: Fraud check status (Score / Velocity)
+        Channel->>Channel: AccountLockManager: Lock account
+        Channel->>DB: Start DB Transaction & mutate balance
+        Channel->>DB: Write double-entry ledger journal entries
+        Channel->>DB: Insert master & channel-specific txn rows
+        Channel->>Channel: AccountLockManager: Release lock
+    end
+
+    Channel-->>Router: Transaction result (Status / MSG)
+    Router->>Log: event=response_body (UUID correlation)
+    Log-->>Log: file.flush() & fsync()
+    Router-->>Client: HTTP response (includes transactionUuid)
 ```
 
 ---
@@ -221,52 +192,51 @@ Every request follows this exact sequence:
 
 ### Problem Solved
 
-Previously, database credentials (`host`, `port`, `user`, `password`, `dbname`) had hardcoded fallback values directly in source code (`Database.cpp`). This is a critical security risk — anyone with access to the source code or binary can extract credentials.
+Previously, database credentials (`host`, `port`, `user`, `password`, `dbname`) had fallback values hardcoded directly in the source files. This is a critical security risk—anyone with access to the source code or compilation binaries could extract database secrets.
 
 ### Solution: Encrypted db.ini
 
-The new `DbConfig` module (`DbConfig.h` / `DbConfig.cpp`) implements a **self-sealing encrypted credential file** with the following guarantees:
+The `DbConfig` module implements a **self-sealing encrypted credential file** with the following guarantees:
 
-| Property | Implementation |
-|----------|---------------|
-| **Confidentiality** | AES-256-GCM encryption — file is unreadable without the derived key |
-| **Integrity** | GCM 16-byte authentication tag — any bit-flip is detected |
-| **Machine-locked** | Key derived from machine hostname + compiled-in pepper via PBKDF2 |
-| **Tamper detection** | Modified file triggers startup abort with a clear security alert |
-| **One-way sealing** | Plain-text credentials are overwritten with ciphertext on first run |
-| **Git-safe** | `db.ini` is in `.gitignore` — never committed to the repository |
+* 🔒 **Confidentiality:** AES-256-GCM encryption makes the config file completely unreadable without the derived key.
+* 🛡️ **Integrity:** GCM 16-byte authentication tag guarantees that any modification to the file will trigger a loading error.
+* 🖥️ **Machine-locked:** The key is derived from the machine's hostname and a compiled-in pepper value via PBKDF2.
+* ⚠️ **Tamper detection:** Modified files cause the application to immediately abort startup with a security alert.
+* 📥 **One-way sealing:** Plain-text credentials are encrypted and overwritten in-place on the very first execution.
+* 🚫 **Git-safe:** `db.ini` is added to `.gitignore` and is never committed to the repository.
 
 ### How It Works
 
-```
-First Launch:
-─────────────
-  User creates db.ini (plain text)          ← you fill this in
-          │
-          ▼
-  DbConfig::load("db.ini") detects plain text
-  Parses INI → DbCredentials struct
-  deriveKey() = PBKDF2-HMAC-SHA256(PEPPER, hostname::PEPPER, 200000 rounds)
-  encryptCredentials() = AES-256-GCM with random 12-byte nonce
-  Overwrites db.ini with encrypted 4-line format
-          │
-          ▼
-  Application starts with decrypted credentials in memory
-  Plain text is GONE from disk
+```mermaid
+graph TD
+    Start([Application Startup]) --> CheckExists{db.ini exists?}
+    CheckExists -- No --> Abort[Abort: db.ini missing template instructions]
+    CheckExists -- Yes --> ReadContent[Read db.ini content]
+    ReadContent --> CheckMagic{Starts with DBCFG_V1_ENC magic?}
+    
+    subgraph FirstRun [First Run: Auto-Encryption Flow]
+        CheckMagic -- No --> ParsePlain[Parse Plain-Text Credentials]
+        ParsePlain --> KeyDerivation[Derive Machine-Locked Key via PBKDF2]
+        KeyDerivation --> EncryptGCM[AES-256-GCM Encrypt Credentials]
+        EncryptGCM --> WriteCipher[Overwrite db.ini with Ciphertext + Nonce + GCM Tag]
+        WriteCipher --> ConnectDB[Initialize MySQL Pool & Connect]
+    end
 
-Every Subsequent Launch:
-─────────────────────────
-  DbConfig::load("db.ini") sees "DBCFG_V1_ENC" sentinel on line 1
-  Reads nonce (line 2), GCM tag (line 3), ciphertext (line 4)
-  deriveKey() = same PBKDF2 derivation
-  AES-256-GCM decrypt + verify tag
-  → Tag matches: credentials loaded normally
-  → Tag MISMATCH: "SECURITY ALERT: DB config tampered" → startup aborted
+    subgraph SubsequentRuns [Subsequent Runs: Authenticated Decryption]
+        CheckMagic -- Yes --> ReadCipher[Read Nonce, Tag, & Ciphertext]
+        ReadCipher --> KeyDerivationSub[Derive Machine-Locked Key via PBKDF2]
+        KeyDerivationSub --> DecryptGCM[Decrypt & Verify GCM Tag]
+        DecryptGCM --> VerifyTag{GCM Tag Valid?}
+        VerifyTag -- Yes --> ConnectDB
+        VerifyTag -- No --> TamperAbort[Abort: SECURITY ALERT - Database Config Tampered!]
+    end
+
+    ConnectDB --> RunApp([Application Running])
 ```
 
 ### Encrypted File Format
 
-After first run, `db.ini` looks like this (unreadable):
+After the first run, `db.ini` is converted to the following secure 4-line format:
 
 ```
 DBCFG_V1_ENC
@@ -277,7 +247,7 @@ a3f2c1e9b4d7...     ← 12-byte random nonce (24 hex chars)
 
 ### Plain-Text Format (before first run)
 
-Create `db.ini` in your project root before first launch:
+Create `db.ini` in your project root before your first launch:
 
 ```ini
 [database]
@@ -288,8 +258,8 @@ pass=YourActualPassword
 name=bankingdb
 ```
 
-> **⚠ Keep a secure offline backup of your password before first run.
-> Once the application starts, the plain-text is permanently gone from disk.**
+> [!WARNING]
+> Keep a secure offline backup of your database password. Once the application successfully starts, the plain-text credentials are permanently erased from the file and replaced with ciphertext.
 
 ### Key Derivation Details
 
@@ -302,19 +272,19 @@ PBKDF2-HMAC-SHA256(
 )
 ```
 
-- **Machine-locked:** The hostname is part of the salt. Moving `db.ini` to another machine will not decrypt correctly.
-- **App-locked:** The PEPPER string is compiled into the binary. Change it before production to make your deployment unique.
+* **Machine-locked:** The local hostname acts as the salt component. If you copy an encrypted `db.ini` to a different machine, decryption will fail.
+* **App-locked:** The pepper string is compiled directly into the binary.
 
 ### Credential Search Path
 
-The application looks for `db.ini` in these locations, in order:
+The application dynamically searches for `db.ini` in the following prioritized locations:
 
-| Priority | Path | When Used |
-|----------|------|-----------|
-| 1 | `db.ini` (CWD) | Production: binary run from project root |
-| 2 | `../db.ini` | CLion debug: binary in `cmake-build-debug/` |
-| 3 | `../../db.ini` | Nested build dirs |
-| 4 | `<exe_dir>/db.ini` | macOS: next to the binary (uses `_NSGetExecutablePath`) |
+1. `db.ini` (Current Working Directory)
+2. `../db.ini` (CLion build/debug directories)
+3. `../../db.ini` (Deeply nested build directories)
+4. `<exe_dir>/db.ini` (MacOS/Linux executable path)
+
+---
 
 ---
 
@@ -1035,17 +1005,29 @@ curl -X POST http://localhost:8084/transaction/initiate \
 
 ## Falcon Fraud Detection Engine
 
-The Falcon engine (`falcon.cpp`, `falcon.h`) is invoked **before any balance mutation** on every money-moving channel.
+The Falcon engine (`falcon.cpp`, `falcon.h`) is invoked **before any balance mutation** on every money-moving channel. It acts as an inline gateway evaluating transaction context in real-time.
 
-### Fraud Rules (Applied in Order)
-
-| # | Rule | Threshold | Action |
-|---|------|-----------|--------|
-| 1 | **Same-second duplicate** | Any transaction on same account within 1 second | DECLINE |
-| 2 | **Per-channel velocity** | > 5 transactions on same channel in 60 seconds | DECLINE |
-| 3 | **Cross-channel velocity** | > 5 combined transactions across ALL channels in 60 seconds | DECLINE |
-| 4 | **Amount spike** | Current amount > 3× the 7-day rolling average for this account | DECLINE |
-| 5 | **AI security scoring** | Composite risk score ≥ 85 based on device/network signals | DECLINE |
+```mermaid
+graph TD
+    Start([Incoming Money Mutation]) --> SameSecond{1. Same-Second Dup?}
+    SameSecond -- Yes --> Decline1[DECLINE: Same-second duplicate]
+    SameSecond -- No --> VelocityPerChannel{2. Per-Channel Velocity > 5 tx/min?}
+    
+    VelocityPerChannel -- Yes --> Decline2[DECLINE: Channel rate limit exceeded]
+    VelocityPerChannel -- No --> VelocityCross{3. Cross-Channel Velocity > 5 tx/min?}
+    
+    VelocityCross -- Yes --> Decline3[DECLINE: Combined rate limit exceeded]
+    VelocityCross -- No --> AmountSpike{4. Amount Spike > 3x 7-day Avg?}
+    
+    AmountSpike -- Yes --> Decline4[DECLINE: Unusual transaction size]
+    AmountSpike -- No --> AIScore{5. AI Security Score >= 85?}
+    
+    AIScore -- Yes --> Decline5[DECLINE: Device/network integrity risk]
+    AIScore -- No --> Approve([Approve: Forward to Switch])
+    
+    Decline1 & Decline2 & Decline3 & Decline4 & Decline5 --> LogDecline[Log to transaction_falcon table]
+    LogDecline --> DeclineEnd([Decline: Abort Transaction])
+```
 
 ### Channels Covered
 
