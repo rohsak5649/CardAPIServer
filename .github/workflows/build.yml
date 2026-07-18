@@ -19,43 +19,73 @@ jobs:
       - name: Setup MSVC
         uses: ilammy/msvc-dev-cmd@v1
 
-      # ── Install OpenSSL (Chocolatey is pre-installed on windows-latest) ───────
+      # ── Install OpenSSL and discover its actual install path ─────────────────
+      # Chocolatey can install to different paths depending on the package version.
+      # We search all known locations and export OPENSSL_ROOT_DIR to GITHUB_ENV.
       - name: Install OpenSSL
-        run: choco install openssl --no-progress -y
+        shell: pwsh
+        run: |
+          choco install openssl --no-progress -y
+
+          # Search common Chocolatey install locations
+          $candidates = @(
+            "C:\Program Files\OpenSSL-Win64",
+            "C:\OpenSSL-Win64",
+            "C:\Program Files\OpenSSL",
+            "C:\OpenSSL"
+          )
+          $root = $candidates | Where-Object { Test-Path "$_\lib" } | Select-Object -First 1
+
+          # Fallback: locate openssl.exe and walk two directories up
+          if (!$root) {
+            $exe = Get-Command openssl.exe -ErrorAction SilentlyContinue
+            if ($exe) {
+              $root = Split-Path (Split-Path $exe.Source -Parent) -Parent
+            }
+          }
+
+          if (!$root) {
+            Write-Error "Cannot locate OpenSSL installation after choco install."
+            exit 1
+          }
+
+          Write-Host "✅ OpenSSL root: $root"
+          "OPENSSL_ROOT_DIR=$root" | Out-File -FilePath $env:GITHUB_ENV -Append
 
       # ── Download and Install MySQL Connector C++ 9.5 MSI ─────────────────────
-      # choco has no mysql-connector-c++ package, so we download from MySQL CDN
+      # No Chocolatey package exists — download directly from MySQL CDN.
       - name: Install MySQL Connector C++
         shell: pwsh
         run: |
           $url = "https://cdn.mysql.com//Downloads/Connector-C++/mysql-connector-c++-9.5.0-winx64.msi"
-          $out = "$env:TEMP\mysql-connector-cpp.msi"
-          Write-Host "Downloading MySQL Connector C++ from $url"
-          Invoke-WebRequest -Uri $url -OutFile $out -UseBasicParsing
-          Write-Host "Installing MySQL Connector C++..."
-          Start-Process msiexec.exe -ArgumentList "/i", $out, "/quiet", "/norestart" -Wait
-          Write-Host "Installation complete."
+          $msi = "$env:TEMP\mysql-connector-cpp.msi"
+          Write-Host "Downloading MySQL Connector C++ 9.5..."
+          Invoke-WebRequest -Uri $url -OutFile $msi -UseBasicParsing
+          Write-Host "Installing..."
+          Start-Process msiexec.exe -ArgumentList "/i `"$msi`" /quiet /norestart" -Wait -NoNewWindow
+          $dir = "C:\Program Files\MySQL\MySQL Connector C++ 9.5"
+          if (!(Test-Path $dir)) {
+            Write-Error "MySQL Connector not found at expected path: $dir"
+            Get-ChildItem "C:\Program Files\MySQL" -ErrorAction SilentlyContinue
+            exit 1
+          }
+          Write-Host "✅ MySQL Connector found at: $dir"
+          Get-ChildItem "$dir\lib64" -ErrorAction SilentlyContinue | Select-Object Name
 
-      # ── Verify paths exist before calling CMake ───────────────────────────────
-      - name: Verify dependency paths
+      # ── Configure CMake — paths are now set via GITHUB_ENV and CMakeLists ─────
+      - name: Configure CMake
         shell: pwsh
         run: |
-          $ssl  = "C:/Program Files/OpenSSL-Win64"
-          $mysql = "C:/Program Files/MySQL/MySQL Connector C++ 9.5"
-          if (!(Test-Path $ssl))   { Write-Error "OpenSSL path not found: $ssl" }
-          if (!(Test-Path $mysql)) { Write-Error "MySQL Connector path not found: $mysql" }
-          Write-Host "OpenSSL path: $ssl"
-          Get-ChildItem "$mysql\lib64" -ErrorAction SilentlyContinue
-
-      # ── Configure CMake ───────────────────────────────────────────────────────
-      - name: Configure CMake
-        run: cmake -B build -S . -DCMAKE_BUILD_TYPE=Release
+          Write-Host "Using OPENSSL_ROOT_DIR: ${{ env.OPENSSL_ROOT_DIR }}"
+          cmake -B build -S . `
+            -DCMAKE_BUILD_TYPE=Release `
+            -DOPENSSL_ROOT_DIR="${{ env.OPENSSL_ROOT_DIR }}"
 
       # ── Build ─────────────────────────────────────────────────────────────────
       - name: Build Project
         run: cmake --build build --config Release --parallel 4
 
-      # ── Upload resulting EXE as downloadable artifact ─────────────────────────
+      # ── Upload resulting EXE ──────────────────────────────────────────────────
       - name: Upload EXE
         uses: actions/upload-artifact@v4
         with:
