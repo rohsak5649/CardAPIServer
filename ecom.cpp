@@ -32,6 +32,7 @@ static json err(const std::string &code, const std::string &msg = "") {
   return e;
 }
 
+
 // ═══════════════════════════════════════════════════════
 // CORE LOGIC
 // ═══════════════════════════════════════════════════════
