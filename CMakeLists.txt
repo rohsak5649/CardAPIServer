@@ -73,6 +73,8 @@ add_executable(BankingAPIServer
         include/global_contant.h
         DatabaseQueries.cpp
         include/DatabaseQueries.h
+        DbConfig.cpp
+        include/DbConfig.h
 )
 
 # ── Compiler flags ─────────────────────────────────────────────────────────────

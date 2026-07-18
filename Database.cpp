@@ -14,13 +14,15 @@
  */
 
 #include "Database.h"
+#include "DbConfig.h"
 #include "TransactionLogger.h"
 #include <iostream>
 #include <cstdlib>
 #include <thread>
 
-// ── Static member definitions ─────────────────────────────────────────────────
+// ── Static member definitions ───────────────────────────────────────────────────
 int                     Database::poolSizeRuntime_ = POOL_SIZE_DEFAULT;
+DbCredentials           Database::creds_;   // populated by DbConfig::load() in initPool()
 std::vector<Session*>   Database::allConnections_;
 std::queue<Session*>    Database::freeConnections_;
 std::mutex              Database::poolMutex_;
@@ -29,24 +31,19 @@ bool                    Database::poolReady_    = false;
 std::atomic<int>        Database::staleReconnects_{0};
 Session*                Database::legacySession_ = nullptr;
 
-// ── Env-var helpers ───────────────────────────────────────────────────────────
-static std::string env(const char* key, const char* fallback) {
-    const char* val = std::getenv(key);
-    return val ? std::string(val) : std::string(fallback);
-}
+// ── NOTE: DB credentials are loaded from db.ini via DbConfig::load() ─────────
+// The env() helper has been removed — no credential fallbacks exist in source.
 
-// ── Internal: create a fresh authenticated Session ────────────────────────────
+// ── Internal: create a fresh authenticated Session ─────────────────────────────────
+// Uses credentials loaded from db.ini by DbConfig::load() — no hardcoded values.
 Session* Database::createSession_() {
     TransactionLogger::ScopedFunctionTrace trace("Database::createSession_");
-    std::string host = env("DB_HOST", "localhost");
-    int         port = std::atoi(env("DB_PORT", "33060").c_str());
-    std::string user = env("DB_USER", "root");
-    std::string pass = env("DB_PASS", "Rohan@5649");   // ⚠ move to vault in prod
-    std::string name = env("DB_NAME", "bankingdb");
 
-    Session* s = new Session(host, port, user, pass);
-    s->sql("USE " + name).execute();
-    trace.success({{"host", host}, {"port", std::to_string(port)}, {"database", name}});
+    Session* s = new Session(creds_.host, creds_.port, creds_.user, creds_.pass);
+    s->sql("USE " + creds_.dbName).execute();
+    trace.success({{"host", creds_.host},
+                   {"port", std::to_string(creds_.port)},
+                   {"database", creds_.dbName}});
     return s;
 }
 
@@ -86,6 +83,20 @@ Session* Database::healSession_(Session* old) {
 
 // ── initPool() ────────────────────────────────────────────────────────────────
 void Database::initPool() {
+    // ── Step 1: Load credentials from encrypted db.ini (once, before pool opens) ─
+    //   DbConfig::load() will:
+    //     • Auto-encrypt plain-text file on first run
+    //     • Verify GCM tag and abort with an error if file was tampered
+    //     • Throw if the file is missing (user must create db.ini first)
+    try {
+        creds_ = DbConfig::load(DB_CONFIG_PATH);
+    } catch (const std::exception& ex) {
+        std::cerr << "\n[DB] FATAL: Failed to load database configuration.\n"
+                  << "       Reason: " << ex.what() << "\n\n";
+        throw;  // propagate — cannot start without credentials
+    }
+
+    // ── Step 2: Determine pool size (env-var override, non-sensitive) ────────
     int size = POOL_SIZE_DEFAULT;
     if (const char* envVal = std::getenv("DB_POOL_SIZE")) {
         try {
@@ -321,8 +332,8 @@ Session& Database::getSession() {
 
 Schema Database::getSchema() {
     TransactionLogger::ScopedFunctionTrace trace("Database::getSchema");
-    std::string name = env("DB_NAME", "bankingdb");
-    Schema schema = getSession().getSchema(name);
-    trace.success({{"database", name}});
+    // creds_ is already loaded in initPool() — use it directly.
+    Schema schema = getSession().getSchema(creds_.dbName);
+    trace.success({{"database", creds_.dbName}});
     return schema;
 }

@@ -1,51 +1,68 @@
 # Payment Switching Engine — v3.2
 
-A production-grade **C++20 banking and card payment switching engine** that routes multiple digital payment channels through a single HTTP API. Built for concurrency, auditability, and correctness at scale.
+> A production-grade **C++20 banking and card payment switching engine** that routes multiple digital payment channels through a single unified HTTP API. Built on thread-safe connection pooling, military-grade encryption, real-time fraud detection, and immediate audit logging.
 
 ---
 
 ## Table of Contents
 
-- [Project Goals](#project-goals)
+- [Project Overview](#project-overview)
 - [What's New in v3.2](#whats-new-in-v32)
 - [Core Features](#core-features)
-- [Architecture](#architecture)
+- [System Architecture](#system-architecture)
+- [Request Lifecycle](#request-lifecycle)
+- [Database Configuration & Security (db.ini)](#database-configuration--security-dbini)
 - [Transaction ID & Correlation System](#transaction-id--correlation-system)
 - [Structured Logging](#structured-logging)
 - [Authentication & RBAC](#authentication--rbac)
-- [HTTP Endpoints](#http-endpoints)
-- [Payment Channels](#payment-channels)
+- [HTTP Endpoints — Complete Reference](#http-endpoints--complete-reference)
+- [Payment Channels — Detailed](#payment-channels--detailed)
+  - [ATM Channel](#atm-channel)
+  - [Mobile Banking Channel](#mobile-banking-channel)
+  - [POS Channel](#pos-channel)
+  - [ECOM Channel](#ecom-channel)
+  - [3D Secure Flow](#3d-secure-flow)
+  - [QRCode Channel](#qrcode-channel)
+  - [RingPay (Contactless) Channel](#ringpay-contactless-channel)
+  - [Issuer Channel](#issuer-channel)
+  - [Card Management Channels](#card-management-channels)
+  - [Account Management Channels](#account-management-channels)
+  - [Reversal Channel](#reversal-channel)
+  - [ICCW Channel](#iccw-channel)
 - [Advanced Financial Capabilities](#advanced-financial-capabilities)
-- [3D Secure Flow](#3d-secure-flow)
-- [Card Lifecycle Management](#card-lifecycle-management)
+  - [Double-Entry Ledger Accounting](#double-entry-ledger-accounting)
+  - [Dynamic Currency Conversion (DCC)](#dynamic-currency-conversion-dcc)
+  - [Partial Refunds](#partial-refunds)
 - [Idempotency](#idempotency)
-- [Falcon Fraud Engine](#falcon-fraud-engine)
+- [Falcon Fraud Detection Engine](#falcon-fraud-detection-engine)
 - [Security Model](#security-model)
 - [Database Design](#database-design)
 - [Build and Run](#build-and-run)
+- [First-Run Database Config Setup](#first-run-database-config-setup)
 - [Environment Variables](#environment-variables)
-- [API Examples](#api-examples)
-- [Error Codes](#error-codes)
+- [API Examples — curl Reference](#api-examples--curl-reference)
+- [Error Codes — Complete Reference](#error-codes--complete-reference)
 - [Project Structure](#project-structure)
-- [Production Notes](#production-notes)
+- [Production Hardening Notes](#production-hardening-notes)
 
 ---
 
-## Project Goals
+## Project Overview
 
-This engine simulates the core responsibilities of a production banking payment switch:
+This engine simulates the complete core responsibilities of a production banking **payment switch**:
 
-- Accept transaction requests from multiple channels through one unified endpoint.
-- Authenticate callers via API keys or JWTs and enforce role-based access control.
-- Normalize requests into a single internal routing format.
-- Validate card, PIN, account, balance, limits, and fraud signals.
-- Update balances safely with double-entry ledger accounting.
-- Support Dynamic Currency Conversion (DCC) with FX markup.
-- Support partial and full refunds tracked per transaction.
-- Prevent duplicate charges via idempotency key enforcement.
-- Assign one globally unique Transaction ID per request — visible in HTTP response, every log line, and every database row.
-- Store channel-specific transaction records linked to a master transaction registry.
-- Generate immediately-flushed, structured logs for operations, debugging, and audit tracing.
+- Accept transaction requests from **20+ named channels** through one unified HTTP endpoint
+- Authenticate callers via **API keys** or **HMAC-SHA256 JWTs** with role-based access control
+- Normalize requests into a single internal routing format and dispatch to channel handlers
+- Validate card, PIN, expiry, CVV, account balance, spending limits, and fraud signals **before** touching the database
+- Update balances safely using a **double-entry ledger** accounting model
+- Support **Dynamic Currency Conversion (DCC)** with live FX rates and a configurable bank markup
+- Support **partial and full refunds** tracked cumulatively per original transaction
+- Prevent duplicate charges via **idempotency key enforcement** with concurrent-request conflict detection
+- Assign one **globally unique Transaction UUID** per request — visible in the HTTP response, every log line, and every database row
+- Store channel-specific transaction records linked to a **master transaction registry**
+- Generate immediately-flushed, **structured audit logs** with physical disk guarantee (fsync)
+- Protect database credentials using **AES-256-GCM encryption** with machine-locked key derivation and tamper detection
 
 ---
 
@@ -53,94 +70,251 @@ This engine simulates the core responsibilities of a production banking payment 
 
 | Area | Change |
 |------|--------|
-| **Unified Transaction UUID** | Every channel now uses the UUID generated by the router as `transaction_id`. Eliminated 7 separate collision-prone generators (`atm-<ms>-<rand>`, `ring-txn-<ms>`, `std::rand()` in QR, etc.). One ID traces HTTP response, all log lines, and DB row. |
-| **Hardened UUID entropy** | `generateUuid()` in `TransactionLogger` now seeds `std::mt19937_64` using `std::seed_seq` combining two hardware-entropy reads, thread-ID hash, and nanosecond timestamp. Collision probability ≈ 0 across 10M concurrent threads. |
-| **Request/response logging** | Every transaction now logs `event=request_body` (sanitized incoming JSON) and `event=response_body` (outgoing JSON) with the shared UUID. Sensitive fields (`pan`, `pin`, `cvv`, `password`, `token`, `secret`) are automatically redacted to `"****"`. |
-| **Immediate log flush (fsync)** | `TransactionLogger` now opens a parallel POSIX file descriptor alongside the `std::ofstream`. After every write, `file_.flush()` + `::fsync(fd_)` ensures every log line is physically on disk the instant it is written. No buffering delay. |
-| **Memory leak fixes** | RAII wrappers throughout all channel files. LRU eviction for caches. Signal-handler-safe cleanup. All raw pointer ownership replaced with deterministic destructors. |
-| **Sensitive field masking fixed** | `escapeText()` now properly escapes `"` as `\"` and `\` as `\\` — preserving JSON in log field values. Previously `"` was mangled to `'`, corrupting stored JSON blobs. |
-| **`std::rand()` UB removed** | `qrcode.cpp` used `std::rand()` without synchronization — a data race under concurrent load (UB per C++11). Replaced entirely with the UUID correlation system. |
+| **Encrypted DB Config** | Database credentials are no longer hardcoded. A `db.ini` file is auto-encrypted with AES-256-GCM on first startup using a PBKDF2-derived, machine-locked key. Any tampering with the encrypted file is detected via the GCM authentication tag and triggers a startup abort. |
+| **Unified Transaction UUID** | Every channel now uses the UUID generated by the router as `transaction_id`. Eliminated 7 separate collision-prone generators (`atm-<ms>-<rand>`, `ring-txn-<ms>`, `std::rand()` in QR, etc.). One ID traces HTTP response, all log lines, and the DB row. |
+| **Hardened UUID Entropy** | `generateUuid()` in `TransactionLogger` now seeds `std::mt19937_64` using `std::seed_seq` combining two hardware-entropy reads, thread-ID hash, and nanosecond timestamp. Collision probability ≈ 0 across 10M concurrent threads. |
+| **Request/Response Logging** | Every transaction logs `event=request_body` (sanitized incoming JSON) and `event=response_body` (outgoing JSON) with the shared UUID. Sensitive fields (`pan`, `pin`, `cvv`, `password`, `token`, `secret`) are automatically redacted to `"****"`. |
+| **Immediate Log Flush (fsync)** | `TransactionLogger` now opens a parallel POSIX file descriptor alongside the `std::ofstream`. After every write, `file_.flush()` + `::fsync(fd_)` ensures every log line is physically on disk the instant it is written. No buffering delay. |
+| **Memory Leak Fixes** | RAII wrappers throughout all channel files. LRU eviction for Falcon caches. Signal-handler-safe cleanup. All raw pointer ownership replaced with deterministic destructors. |
+| **Sensitive Field Masking Fixed** | `escapeText()` now properly escapes `"` as `\"` and `\` as `\\` — preserving JSON in log field values. Previously `"` was mangled to `'`, corrupting stored JSON blobs. |
+| **`std::rand()` UB Removed** | `qrcode.cpp` used `std::rand()` without synchronization — a data race under concurrent load (UB per C++11). Replaced entirely with the UUID correlation system. |
 
 ---
 
 ## Core Features
 
-- **Unified router** — one `/transaction/initiate` endpoint routes all payment channels by `channelId`.
-- **One UUID per request** — generated at the router, injected into the channel's JSON data as `_correlationUuid`, stored in the DB as `transaction_id`, returned as `requestId`/`transactionUuid` in every response.
-- **API Key + JWT auth** — every endpoint requires `X-API-Key` or `Authorization: Bearer`.
-- **RBAC** — five roles (ADMIN, MERCHANT, TERMINAL, ISSUER_ROLE, MOBILE_USER) with a per-channel permission matrix.
-- **Direct account APIs** — add, view, freeze, unfreeze, and list accounts.
-- **Card lifecycle** — activate, block (TEMPORARY/PERMANENT), set spending limits, reset PIN.
-- **3D Secure mock flow** — two-step OTP challenge for ECOM payments.
-- **Double-entry ledger** — every purchase/refund writes balanced DEBIT/CREDIT journal entries.
-- **Dynamic Currency Conversion** — automatic FX lookup + 2% bank markup for cross-currency transactions.
-- **Partial refunds** — multiple refunds against one purchase until fully refunded (flag: N → PR → RF).
-- **Idempotency keys** — `Idempotency-Key` header prevents duplicate charges on network retries.
-- **Channel coverage** — ATM, Mobile, POS, ECOM, QRCode, RingPay, Issuer, Card Details, Card Management.
-- **Falcon fraud detection** — velocity checks, duplicate detection, amount spike, AI security scoring.
-- **10M worker thread pool** — `CPPHTTPLIB_THREAD_POOL_COUNT=10000000` with bounded queue back-pressure.
-- **DB connection pool** — 30 MySQL X DevAPI sessions with stale-session self-healing.
-- **Per-account locking** — `AccountLockManager` serializes concurrent credit/debit updates (credits have priority).
-- **Structured logs** — request body, response body, function traces, error source locations, immediate fsync.
-- **Metrics and health** — `/health`, `/status`, and Prometheus-style `/metrics` endpoints.
-- **PAN encryption** — AES-256-GCM service for encrypted PAN transport.
-- **PIN verification** — deterministic HMAC-SHA256 derivation from PAN, no stored PIN table.
+| Category | Feature |
+|----------|---------|
+| **Routing** | Unified `/transaction/initiate` endpoint dispatches to 20 named channels by `channelId` using O(1) `unordered_map` lookup |
+| **Correlation** | One UUID per request, injected into JSON, stored in DB, returned in response, and present in every log line |
+| **Auth** | API Key (`X-API-Key`) or JWT (`Authorization: Bearer`) — all endpoints protected |
+| **RBAC** | Five roles (ADMIN, MERCHANT, TERMINAL, ISSUER_ROLE, MOBILE_USER) with a per-channel permission matrix |
+| **Accounts** | Create, view, freeze, unfreeze, and list accounts |
+| **Cards** | Full card lifecycle: issue (Luhn PAN), activate, block (temporary/permanent), set limits, reset PIN |
+| **3D Secure** | Two-step OTP challenge + verification flow for ECOM payments |
+| **Ledger** | Double-entry accounting: every purchase/refund writes balanced DEBIT/CREDIT journal entries |
+| **DCC** | Automatic FX lookup + configurable bank markup for cross-currency transactions |
+| **Partial Refunds** | Multiple refunds against one transaction until fully refunded (N → PR → RF state machine) |
+| **Idempotency** | `Idempotency-Key` header prevents duplicate charges; concurrent retries return 409 Conflict |
+| **Fraud** | Falcon engine: velocity, duplicate, amount spike, AI security scoring |
+| **DB Security** | AES-256-GCM encrypted `db.ini`, machine-locked PBKDF2 key, GCM tamper detection |
+| **PAN Security** | AES-256-GCM PAN encryption/decryption (12-byte IV, 16-byte tag) |
+| **PIN Security** | HMAC-SHA256 deterministic PIN derivation from PAN — no PIN table in DB |
+| **Concurrency** | Self-healing MySQL X DevAPI connection pool (10–50 sessions); per-account locking with credit priority |
+| **Logging** | Structured logs with immediate fsync; sensitive field auto-redaction; grep-able by UUID |
+| **Observability** | `/health`, `/status`, and Prometheus-style `/metrics` endpoints |
 
 ---
 
-## Architecture
+## System Architecture
 
 ```
 Client / Channel App
         │
         ▼
-┌─────────────────────────────────────────────────────────┐
-│  HTTP Server  (parser&router.cpp)  — 10M thread pool   │
-│                                                         │
-│  ① Auth Middleware  (X-API-Key or Bearer JWT)          │
-│  ② IP Rate Limiter  (200 req/min per IP)               │
-│  ③ RBAC Check       (role × channel permission matrix)  │
-│  ④ Idempotency      (cache hit → return stored response)│
-│  ⑤ UUID Generation  (makeRequestId → _correlationUuid) │
-│  ⑥ LOG: request_body (sanitized, PAN/PIN redacted)     │
-│  ⑦ Channel Dispatch (O(1) unordered_map lookup)        │
-│  ⑧ LOG: response_body + httpStatus                     │
-└─────────────────────────────────────────────────────────┘
+┌───────────────────────────────────────────────────────────────────────┐
+│  HTTP Server (parser&router.cpp)  — 10M-thread pool (cpp-httplib)    │
+│                                                                       │
+│  ① Auth Middleware   — X-API-Key header lookup or JWT Bearer verify  │
+│  ② IP Rate Limiter   — 200 requests/min per source IP, sliding window │
+│  ③ RBAC Check        — role × channelId permission matrix (O(1))      │
+│  ④ Idempotency Gate  — cache hit → return stored response immediately │
+│  ⑤ UUID Generation   — makeRequestId() → _correlationUuid injected   │
+│  ⑥ LOG request_body  — full sanitized JSON, PAN/PIN/CVV redacted      │
+│  ⑦ Channel Dispatch  — O(1) unordered_map<channelId, handler>        │
+│  ⑧ LOG response_body — outgoing JSON + httpStatus                    │
+└───────────────────────────────────────────────────────────────────────┘
         │
         ▼
-Channel Handler  (one per channelId)
-   ATM │ Mobile │ POS │ ECOM │ QRCode │ RingPay │ Issuer │ CardMgmt │ 3DS
+Channel Handler (one per channelId — 20 channels)
+   ATM │ MOBILE │ POS │ ECOM │ QRCODE │ RINGPAY │ ICCW │
+   ISSUER │ CARD_* │ ACCOUNT_* │ 3DS │ REVERSAL
         │
-        ├──► Falcon Fraud Engine ──────────► transaction_falcon (DB)
-        │        velocity · duplicate · spike · AI score
+        ├──► DbConfig::load()     — AES-256-GCM encrypted db.ini (startup only)
         │
-        ├──► DCC Engine ───────────────────► exchange_rates (DB)
-        │        FX lookup + 2% markup
+        ├──► Falcon Fraud Engine  — velocity · duplicate · spike · AI score
+        │        └──► transaction_falcon (DB write on decline)
         │
-        ├──► AccountLockManager ────────────► per-account mutex (credit > debit priority)
+        ├──► DCC Engine           — FX rate lookup + 2% bank markup
+        │        └──► exchange_rates (DB read)
         │
-        ▼
-MySQL  bankingdb
-   ├── accounts              (balance, freeze, country, currency)
-   ├── cards                 (PAN, expiry, CVV, scheme, status, limits)
-   ├── ledger_entries        (double-entry DEBIT/CREDIT journal)
-   ├── ledger_accounts       (running balances per ledger node)
-   ├── transaction_atm       (transaction_id = UUID)
-   ├── transaction_mobile    (transaction_id = UUID)
-   ├── transaction_pos       (transaction_id = UUID, refunded_amount, flag)
-   ├── transaction_ecom      (transaction_id = UUID, refunded_amount, flag)
-   ├── transaction_qrcode    (transaction_id = UUID)
-   ├── transaction_ringpay   (transaction_id = UUID)
-   ├── transaction_falcon    (fraud decline records)
-   └── transactions          (master registry — one row per request)
+        ├──► AccountLockManager   — per-account mutex, credit > debit priority
+        │
+        ├──► Double-Entry Ledger  — DEBIT/CREDIT journal entries
+        │        └──► ledger_entries + ledger_accounts (DB write)
+        │
+        └──► DB Connection Pool   — acquire() → SQL → release()
+                 (10 sessions default, POOL_SIZE_MAX=50, self-healing)
         │
         ▼
-TransactionLogger
-   ├── event=request_body   (sanitized incoming JSON)
-   ├── event=response_body  (outgoing JSON + httpStatus)
-   ├── file_.flush()        (C++ buffer → OS page cache)
-   └── ::fsync(fd_)         (OS page cache → disk, immediate)
+MySQL bankingdb
+   ├── accounts               (balance, freeze, country, currency)
+   ├── cards                  (PAN, encryptedPan, expiry, CVV, scheme, limits, status)
+   ├── api_keys               (authentication key → role mapping)
+   ├── idempotency_keys       (deduplication cache)
+   ├── tds_challenges         (3DS OTP challenges, 10-min TTL)
+   ├── ledger_accounts        (running balances per ledger node)
+   ├── ledger_entries         (DEBIT/CREDIT journal)
+   ├── exchange_rates         (FX rates for 7 currency pairs)
+   ├── transaction_atm        (transaction_id = UUID)
+   ├── transaction_mobile     (transaction_id = UUID)
+   ├── transaction_pos        (transaction_id = UUID, refunded_amount, flag)
+   ├── transaction_ecom       (transaction_id = UUID, refunded_amount, flag)
+   ├── transaction_qrcode     (transaction_id = UUID)
+   ├── transaction_ringpay    (transaction_id = UUID)
+   ├── transaction_falcon     (fraud decline records)
+   └── transactions           (master registry — one row per request)
+        │
+        ▼
+TransactionLogger (bin/debug/log/log_YYYYMMDD_HHMMSS.log)
+   ├── event=request_body    (sanitized incoming JSON)
+   ├── event=response_body   (outgoing JSON + httpStatus)
+   ├── event=function_enter/exit  (ScopedFunctionTrace blocks)
+   ├── file_.flush()         (C++ buffer → OS page cache)
+   └── ::fsync(fd_)          (OS page cache → physical disk)
 ```
+
+---
+
+## Request Lifecycle
+
+Every request follows this exact sequence:
+
+```
+1.  HTTP request arrives on port 8084
+2.  Auth Middleware: parse X-API-Key or Authorization: Bearer header
+    → DB lookup or HMAC-SHA256 JWT verify → extract role
+3.  IP Rate Limiter: sliding window counter per source IP
+    → 429 ERR_RATE_LIMIT if > 200/min
+4.  RBAC: check (role, channelId) pair against permission matrix
+    → 403 ERR_FORBIDDEN if not permitted
+5.  Idempotency: lookup Idempotency-Key in cache
+    → 200 cached response if already processed
+    → 409 ERR_CONFLICT if another request with same key is in-flight
+6.  UUID generation: makeRequestId() → 36-char hyphenated UUID
+    → injected into request JSON as _correlationUuid
+    → set as active TransactionLogger thread_local context
+7.  LOG: event=request_body (sanitized — pan/pin/cvv → "****")
+8.  Channel dispatch: O(1) map lookup → call handler(data, uuid)
+9.  Inside channel handler:
+    a. Parse and validate input fields
+    b. Falcon fraud check (velocity, duplicate, spike, AI score)
+    c. Decrypt PAN (AES-256-GCM) → card DB lookup
+    d. Validate expiry, CVV, PIN (HMAC-SHA256)
+    e. Check account freeze, balance, daily/monthly limits
+    f. DCC conversion if currency differs
+    g. AccountLockManager: acquire per-account lock
+    h. Execute balance update + DB transaction
+    i. Write double-entry ledger entries
+    j. Insert channel-specific transaction row (transaction_id = UUID)
+    k. Insert master transactions row
+    l. Release account lock
+10. Build JSON response with requestId + transactionUuid = UUID
+11. LOG: event=response_body (full response + httpStatus)
+12. Idempotency: store response in cache against key
+13. Return HTTP response to client
+```
+
+---
+
+## Database Configuration & Security (db.ini)
+
+### Problem Solved
+
+Previously, database credentials (`host`, `port`, `user`, `password`, `dbname`) had hardcoded fallback values directly in source code (`Database.cpp`). This is a critical security risk — anyone with access to the source code or binary can extract credentials.
+
+### Solution: Encrypted db.ini
+
+The new `DbConfig` module (`DbConfig.h` / `DbConfig.cpp`) implements a **self-sealing encrypted credential file** with the following guarantees:
+
+| Property | Implementation |
+|----------|---------------|
+| **Confidentiality** | AES-256-GCM encryption — file is unreadable without the derived key |
+| **Integrity** | GCM 16-byte authentication tag — any bit-flip is detected |
+| **Machine-locked** | Key derived from machine hostname + compiled-in pepper via PBKDF2 |
+| **Tamper detection** | Modified file triggers startup abort with a clear security alert |
+| **One-way sealing** | Plain-text credentials are overwritten with ciphertext on first run |
+| **Git-safe** | `db.ini` is in `.gitignore` — never committed to the repository |
+
+### How It Works
+
+```
+First Launch:
+─────────────
+  User creates db.ini (plain text)          ← you fill this in
+          │
+          ▼
+  DbConfig::load("db.ini") detects plain text
+  Parses INI → DbCredentials struct
+  deriveKey() = PBKDF2-HMAC-SHA256(PEPPER, hostname::PEPPER, 200000 rounds)
+  encryptCredentials() = AES-256-GCM with random 12-byte nonce
+  Overwrites db.ini with encrypted 4-line format
+          │
+          ▼
+  Application starts with decrypted credentials in memory
+  Plain text is GONE from disk
+
+Every Subsequent Launch:
+─────────────────────────
+  DbConfig::load("db.ini") sees "DBCFG_V1_ENC" sentinel on line 1
+  Reads nonce (line 2), GCM tag (line 3), ciphertext (line 4)
+  deriveKey() = same PBKDF2 derivation
+  AES-256-GCM decrypt + verify tag
+  → Tag matches: credentials loaded normally
+  → Tag MISMATCH: "SECURITY ALERT: DB config tampered" → startup aborted
+```
+
+### Encrypted File Format
+
+After first run, `db.ini` looks like this (unreadable):
+
+```
+DBCFG_V1_ENC
+a3f2c1e9b4d7...     ← 12-byte random nonce (24 hex chars)
+9e1a3b5c7d2f...     ← 16-byte GCM tag (32 hex chars)
+4a7f3c9d1b2e...     ← ciphertext (variable hex chars)
+```
+
+### Plain-Text Format (before first run)
+
+Create `db.ini` in your project root before first launch:
+
+```ini
+[database]
+host=localhost
+port=33060
+user=root
+pass=YourActualPassword
+name=bankingdb
+```
+
+> **⚠ Keep a secure offline backup of your password before first run.
+> Once the application starts, the plain-text is permanently gone from disk.**
+
+### Key Derivation Details
+
+```
+PBKDF2-HMAC-SHA256(
+    password  = PEPPER ("CardAPIServer-v1-rohan-secure-2026"),
+    salt      = hostname + "::" + PEPPER,
+    iterations = 200,000,
+    keylen    = 32 bytes  → AES-256 key
+)
+```
+
+- **Machine-locked:** The hostname is part of the salt. Moving `db.ini` to another machine will not decrypt correctly.
+- **App-locked:** The PEPPER string is compiled into the binary. Change it before production to make your deployment unique.
+
+### Credential Search Path
+
+The application looks for `db.ini` in these locations, in order:
+
+| Priority | Path | When Used |
+|----------|------|-----------|
+| 1 | `db.ini` (CWD) | Production: binary run from project root |
+| 2 | `../db.ini` | CLion debug: binary in `cmake-build-debug/` |
+| 3 | `../../db.ini` | Nested build dirs |
+| 4 | `<exe_dir>/db.ini` | macOS: next to the binary (uses `_NSGetExecutablePath`) |
 
 ---
 
@@ -149,111 +323,125 @@ TransactionLogger
 Every request receives exactly **one UUID** that flows through the entire system:
 
 ```
-Router generates UUID  ──────────────────────────────────────────────────────────┐
-        │                                                                        │
-        ├── Injected into request JSON as   _correlationUuid                    │
-        ├── Stored in DB row as             transaction_id (all channel tables) │
-        ├── Returned in HTTP response as    requestId / transactionUuid         │
-        └── Present in every log line as   uuid=<value>                         │
-                                                                                 │
-Log file: grep  uuid=d1eb7e1f-b31c-4a2f-812d-6a9a699c033d  ──── finds ALL lines ┘
+Router generates UUID (makeRequestId())
+        │
+        ├── Injected into request JSON as   _correlationUuid
+        ├── Stored in every DB row as       transaction_id  (VARCHAR(36))
+        ├── Returned in HTTP response as    requestId
+        ├── Returned in HTTP response as    transactionUuid
+        └── Present in every log line as   uuid=<value>
+
+To trace any request end-to-end:
+    grep "uuid=d1eb7e1f-b31c-4a2f-812d-6a9a699c033d" bin/debug/log/*.log
+    → shows every log line, from request_body to response_body,
+      including all internal function traces and DB writes
 ```
 
-### UUID Generation (Hardened)
+### UUID Generation — Hardened Entropy
 
-`TransactionLogger::generateUuid()` seeds `std::mt19937_64` via `std::seed_seq` combining:
+`TransactionLogger::generateUuid()` seeds `std::mt19937_64` via `std::seed_seq` combining five sources:
 
 ```cpp
 std::seed_seq seq {
     rd(),                                        // hardware entropy read 1
     rd(),                                        // hardware entropy read 2
     std::hash<std::thread::id>{}(id),            // thread ID hash
-    static_cast<uint32_t>(now_ns & 0xFFFFFFFF),  // nanosecond timestamp low
-    static_cast<uint32_t>(now_ns >> 32)          // nanosecond timestamp high
+    static_cast<uint32_t>(now_ns & 0xFFFFFFFF),  // nanosecond timestamp low-32
+    static_cast<uint32_t>(now_ns >> 32)          // nanosecond timestamp high-32
 };
 ```
 
-Collision probability under 10M concurrent threads: effectively zero.
+Collision probability under 10M concurrent threads: **effectively zero**.
+This replaces the previous per-channel generators that used `std::rand()` (UB under concurrent use) and millisecond timestamps (collision-prone).
 
 ---
 
 ## Structured Logging
 
-`TransactionLogger` writes to `bin/debug/log/log_YYYYMMDD_HHMMSS.log`.
+`TransactionLogger` writes to `bin/debug/log/log_YYYYMMDD_HHMMSS.log` (new file per process start).
 
-### Log Format
+### Log Line Format
 
 ```
 YYYY-MM-DD HH:MM:SS.mmm | LEVEL | uuid=<UUID> | channel=<CHANNEL> | event=<EVENT> | message="<MSG>" | thread=<TID> [key=value ...]
 ```
 
-### Key Events Per Request
+### Events Written Per Request
 
 | Event | When Written |
 |-------|-------------|
 | `request_received` | HTTP request received, before JSON parsing |
 | `request_body` | After JSON parsed, before channel dispatch — full sanitized body |
-| `response_body` | After channel handler returns — full response + httpStatus |
-| `request_finished` | After HTTP response sent — includes durationMs |
-| `function_enter` / `function_exit` | Entry/exit of every `ScopedFunctionTrace` block |
+| `function_enter` | Entry of each `ScopedFunctionTrace` block (channel handlers, DB calls) |
+| `checkpoint` | Mid-function milestones (e.g., Falcon pass, card validated) |
+| `function_exit` | Normal exit of each `ScopedFunctionTrace` block |
+| `function_error` | Exception caught inside a `ScopedFunctionTrace` block |
+| `response_body` | After channel handler returns — full response JSON + httpStatus |
+| `request_finished` | After HTTP response sent — includes `durationMs` |
 
 ### Example Log Lines
 
 ```
-2026-07-11 16:26:40.103 | INFO  | uuid=6a986c6b-97a8-409c-90e4-e048269ee3bf | channel=ADD_ACCOUNT | event=request_body    | message="Incoming request body" | channel=ADD_ACCOUNT body="{\"accountNumber\":\"A00978967890\",\"balance\":1000000.0,\"countryCode\":\"AU\",\"currencyCode\":\"AUD\",\"isFrozen\":false}"
-2026-07-11 16:26:41.274 | INFO  | uuid=6a986c6b-97a8-409c-90e4-e048269ee3bf | channel=ADD_ACCOUNT | event=response_body   | message="Outgoing response body" | channel=ADD_ACCOUNT httpStatus=200 body="{\"account\":{\"accountId\":41,...},\"message\":\"Account added successfully\",\"status\":\"SUCCESS\"}"
-2026-07-11 16:26:41.274 | INFO  | uuid=6a986c6b-97a8-409c-90e4-e048269ee3bf | channel=ADD_ACCOUNT | event=request_finished | message="HTTP request completed" | durationMs=17 httpStatus=200 status=SUCCESS
+2026-07-18 22:10:15.001 | INFO  | uuid=a1b2c3d4-... | channel=POS | event=request_body    | message="Incoming request body" | body="{\"transactionType\":\"PURCHASE\",\"amount\":100.00,\"card\":{\"pan\":\"****\",\"pin\":\"****\"}}"
+2026-07-18 22:10:15.004 | DEBUG | uuid=a1b2c3d4-... | channel=POS | event=function_enter  | message="Database::acquire entered"
+2026-07-18 22:10:15.005 | DEBUG | uuid=a1b2c3d4-... | channel=POS | event=checkpoint      | message="Falcon check passed"
+2026-07-18 22:10:15.018 | INFO  | uuid=a1b2c3d4-... | channel=POS | event=response_body   | message="Outgoing response body" | httpStatus=200 body="{\"status\":\"SUCCESS\",\"transactionUuid\":\"a1b2c3d4-...\"}"
+2026-07-18 22:10:15.019 | INFO  | uuid=a1b2c3d4-... | channel=POS | event=request_finished | message="HTTP request completed" | durationMs=18 httpStatus=200
 ```
 
 ### Sensitive Field Redaction
 
-Fields redacted automatically before any log write:
+These fields are automatically replaced with `"****"` before any log write (recursive, including nested objects):
 
-`pan` · `pin` · `cvv` · `password` · `token` · `secret` · `encryptedPan` · `encPan` → `"****"`
+```
+pan · pin · cvv · password · token · secret · encryptedPan · encPan
+```
 
-Redaction is recursive — nested objects (e.g. `data.card.pan`) are also covered.
+Example: `data.card.pan` in a nested object → `"****"`.
 
-### Immediate Flush (fsync)
+### Immediate Flush — Physical Disk Guarantee
 
 Every write path:
-1. `file_ << payload`  — writes to C++ stream buffer
-2. `file_.flush()`     — flushes C++ buffer → OS page cache
-3. `::fsync(fd_)`      — forces OS page cache → physical disk
 
-Log lines appear in the file the instant they are written. No buffering delay.
+1. `file_ << payload` — writes to C++ stream buffer
+2. `file_.flush()` — flushes C++ buffer → OS page cache
+3. `::fsync(fd_)` — forces OS page cache → physical disk (POSIX)
 
-### Log Level
+Log lines appear on disk **the instant they are written**. No OS buffering delay means logs survive crashes between write and flush.
+
+### Log Level Control
 
 ```bash
-export TRANSACTION_LOG_LEVEL=INFO   # TRACE | DEBUG | INFO | WARN | ERROR
+export TRANSACTION_LOG_LEVEL=DEBUG   # TRACE | DEBUG | INFO | WARN | ERROR
 ```
+
+Default: `INFO`
 
 ---
 
 ## Authentication & RBAC
 
-### How to Authenticate
+### Authentication Methods
 
-Every endpoint requires one of:
+Every endpoint (except `/health`, `/status`, `/metrics`) requires one of:
 
+**Option A — API Key header:**
 ```
 X-API-Key: sk_admin_ROHAN_MASTER_9649
 ```
 
-or a JWT obtained from `/auth/token`:
-
+**Option B — JWT Bearer token** (obtained from `/auth/token`):
 ```
-Authorization: Bearer <token>
+Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...
 ```
 
-### Get a JWT Token
+### Getting a JWT
 
 ```bash
 curl -X POST http://localhost:8084/auth/token \
   -H 'X-API-Key: sk_admin_ROHAN_MASTER_9649'
 ```
 
-Response:
 ```json
 {
   "token": "eyJ...",
@@ -263,81 +451,465 @@ Response:
 }
 ```
 
-### API Keys (Seed Data)
+JWTs are **HMAC-SHA256 signed**, expire after 1 hour, and are stateless (no server-side session store).
 
-| Key | Role | Allowed Channels |
-|-----|------|-----------------|
-| `sk_admin_ROHAN_MASTER_9649` | ADMIN | All channels |
-| `sk_merchant_POS_MCH001` | MERCHANT | POS, ECOM, QRCODE, RINGPAY, 3DS |
-| `sk_terminal_ATM_4455` | TERMINAL | ATM, POS |
-| `sk_issuer_BANK_CORE` | ISSUER_ROLE | ISSUER, CARD_*, Account management |
-| `sk_mobile_APP_USER1` | MOBILE_USER | MOBILE, CARD_RESET_PIN |
+### Seed API Keys
+
+| Key | Role | Description |
+|-----|------|-------------|
+| `sk_admin_ROHAN_MASTER_9649` | `ADMIN` | Full access to all channels |
+| `sk_merchant_POS_MCH001` | `MERCHANT` | POS, ECOM, QRCODE, RINGPAY, 3DS |
+| `sk_terminal_ATM_4455` | `TERMINAL` | ATM, POS |
+| `sk_issuer_BANK_CORE` | `ISSUER_ROLE` | ISSUER, CARD_*, Account management |
+| `sk_mobile_APP_USER1` | `MOBILE_USER` | MOBILE, CARD_RESET_PIN |
 
 ### RBAC Permission Matrix
 
-| Channel | ADMIN | MERCHANT | TERMINAL | ISSUER_ROLE | MOBILE_USER |
-|---------|-------|----------|----------|-------------|-------------|
-| ATM | ✅ | ❌ | ✅ | ❌ | ❌ |
-| POS | ✅ | ✅ | ✅ | ❌ | ❌ |
-| ECOM | ✅ | ✅ | ❌ | ❌ | ❌ |
-| MOBILE | ✅ | ❌ | ❌ | ❌ | ✅ |
-| QRCODE / RINGPAY | ✅ | ✅ | ❌ | ❌ | ❌ |
-| ISSUER / CARD_* | ✅ | ❌ | ❌ | ✅ | ❌ |
-| CARD_RESET_PIN | ✅ | ❌ | ❌ | ❌ | ✅ |
-| 3DS_INITIATE | ✅ | ✅ | ❌ | ❌ | ❌ |
-| ADD_ACCOUNT | ✅ | ❌ | ❌ | ✅ | ❌ |
+| Channel / Endpoint | ADMIN | MERCHANT | TERMINAL | ISSUER_ROLE | MOBILE_USER |
+|--------------------|-------|----------|----------|-------------|-------------|
+| `ATM` | ✅ | ❌ | ✅ | ❌ | ❌ |
+| `MOBILE` | ✅ | ❌ | ❌ | ❌ | ✅ |
+| `POS` | ✅ | ✅ | ✅ | ❌ | ❌ |
+| `ECOM` | ✅ | ✅ | ❌ | ❌ | ❌ |
+| `3DS_INITIATE` | ✅ | ✅ | ❌ | ❌ | ❌ |
+| `QRCODE` | ✅ | ✅ | ❌ | ❌ | ❌ |
+| `RINGPAY` | ✅ | ✅ | ❌ | ❌ | ❌ |
+| `ICCW` | ✅ | ✅ | ✅ | ❌ | ❌ |
+| `ISSUER` | ✅ | ❌ | ❌ | ✅ | ❌ |
+| `CARD_DETAILS` | ✅ | ❌ | ❌ | ✅ | ❌ |
+| `CARD_ACTIVATE` | ✅ | ❌ | ❌ | ✅ | ❌ |
+| `CARD_BLOCK` | ✅ | ❌ | ❌ | ✅ | ❌ |
+| `CARD_SET_LIMIT` | ✅ | ❌ | ❌ | ✅ | ❌ |
+| `CARD_RESET_PIN` | ✅ | ❌ | ❌ | ❌ | ✅ |
+| `ADD_ACCOUNT` | ✅ | ❌ | ❌ | ✅ | ❌ |
+| `ACCOUNT_DETAILS` | ✅ | ✅ | ✅ | ✅ | ✅ |
+| `FREEZE_ACCOUNT` | ✅ | ❌ | ❌ | ✅ | ❌ |
+| `UNFREEZE_ACCOUNT` | ✅ | ❌ | ❌ | ✅ | ❌ |
+| `LIST_ACCOUNTS` | ✅ | ✅ | ✅ | ✅ | ✅ |
+| `REVERSAL` | ✅ | ✅ | ✅ | ❌ | ❌ |
 
 ---
 
-## HTTP Endpoints
+## HTTP Endpoints — Complete Reference
 
-| Method | Endpoint | Auth Role | Purpose |
-|--------|----------|-----------|---------|
-| `POST` | `/auth/token` | Any API Key | Exchange API key for JWT |
-| `POST` | `/transaction/initiate` | Role by channel | **Unified payment router** |
-| `POST` | `/account/add` | ISSUER_ROLE/ADMIN | Create account |
-| `POST` | `/account/details` | MERCHANT+ | Fetch account details |
-| `POST` | `/account/freeze` | ISSUER_ROLE/ADMIN | Freeze account |
-| `POST` | `/account/unfreeze` | ISSUER_ROLE/ADMIN | Unfreeze account |
-| `POST` | `/account/list` | MERCHANT+ | List all accounts |
-| `POST` | `/card/activate` | ISSUER_ROLE/ADMIN | Activate card |
-| `POST` | `/card/block` | ISSUER_ROLE/ADMIN | Block card (TEMPORARY/PERMANENT) |
-| `POST` | `/card/set_limit` | ISSUER_ROLE/ADMIN | Set daily/monthly spending limits |
-| `POST` | `/card/reset_pin` | MOBILE_USER/ADMIN | Reset card PIN |
-| `POST` | `/3ds/verify` | MERCHANT/ADMIN | Verify 3DS OTP & complete payment |
-| `POST` | `/reversal/initiate` | MERCHANT/ADMIN | Initiate auto-reversal |
-| `GET` | `/health` | None | Service health check |
-| `GET` | `/status` | None | Runtime counters |
-| `GET` | `/metrics` | None | Prometheus-style metrics |
+All endpoints listen on **port 8084** (`http://0.0.0.0:8084`).
 
-All endpoints listen on port **8084**.
+| Method | Endpoint | Auth Role | Description |
+|--------|----------|-----------|-------------|
+| `POST` | `/auth/token` | Any valid API key | Exchange API key for a 1-hour JWT |
+| `POST` | `/transaction/initiate` | Role by `channelId` | **Unified payment channel router** |
+| `POST` | `/account/add` | ISSUER_ROLE / ADMIN | Create a new bank account |
+| `POST` | `/account/details` | Any authenticated role | Fetch account details by account number |
+| `POST` | `/account/freeze` | ISSUER_ROLE / ADMIN | Freeze an account (blocks all transactions) |
+| `POST` | `/account/unfreeze` | ISSUER_ROLE / ADMIN | Unfreeze a previously frozen account |
+| `POST` | `/account/list` | Any authenticated role | List all accounts |
+| `POST` | `/card/activate` | ISSUER_ROLE / ADMIN | Re-activate a temporarily blocked card |
+| `POST` | `/card/block` | ISSUER_ROLE / ADMIN | Block a card (TEMPORARY or PERMANENT) |
+| `POST` | `/card/set_limit` | ISSUER_ROLE / ADMIN | Update daily and/or monthly spending limits |
+| `POST` | `/card/reset_pin` | MOBILE_USER / ADMIN | Reset card PIN (HMAC-SHA256 validated) |
+| `POST` | `/3ds/verify` | MERCHANT / ADMIN | Verify 3DS OTP and complete ECOM purchase |
+| `POST` | `/reversal/initiate` | MERCHANT / TERMINAL / ADMIN | Initiate a transaction auto-reversal |
+| `GET` | `/health` | None | Returns `{"status":"UP"}` |
+| `GET` | `/status` | None | Runtime request counters |
+| `GET` | `/metrics` | None | Prometheus-format metrics |
 
----
+### Universal Request/Response Envelope
 
-## Payment Channels
-
-All channels are invoked via `POST /transaction/initiate` with `{ "channelId": "...", "data": { ... } }`.
-
-| Channel ID | Operations | Notes |
-|------------|-----------|-------|
-| `ATM` | WITHDRAWAL, DEPOSIT | Encrypted PAN, PIN, daily/monthly limits |
-| `MOBILE` | FUND_TRANSFER | Hourly + daily limits, PAN+PIN or account-based |
-| `POS` | PURCHASE, REFUND | DCC, partial refunds, double-entry ledger |
-| `ECOM` | PURCHASE, REFUND | DCC, partial refunds, double-entry ledger |
-| `3DS_INITIATE` | Challenge | Returns OTP challenge for ECOM payments |
-| `QRCODE` | PURCHASE, REFUND | QR merchant/terminal/currency parsing |
-| `RINGPAY` | Contactless purchase | Wearable token, merchant/daily limits, auto-reversal |
-| `ISSUER` | Issue card | Luhn-valid PAN generation, expiry, CVV, encrypted PAN |
-| `CARD_DETAILS` | Card lookup | Returns full card details from encrypted PAN |
-| `CARD_ACTIVATE` | Activate | Re-activates a temporarily blocked card |
-| `CARD_BLOCK` | Block | TEMPORARY (reversible) or PERMANENT |
-| `CARD_SET_LIMIT` | Limits | Update dailyLimit and/or monthlyLimit |
-| `CARD_RESET_PIN` | PIN reset | Verifies new PIN against PAN-derived HMAC |
-
-### Request/Response Envelope
+All `POST /transaction/initiate` requests use this envelope:
 
 ```json
-// Request
+{
+  "channelId": "CHANNEL_NAME",
+  "data": {
+    // channel-specific fields
+  }
+}
+```
+
+All successful responses include:
+
+```json
+{
+  "status": "SUCCESS",
+  "message": "Human-readable description",
+  "requestId": "d1eb7e1f-b31c-4a2f-812d-6a9a699c033d",
+  "transactionUuid": "d1eb7e1f-b31c-4a2f-812d-6a9a699c033d",
+  // channel-specific response fields
+}
+```
+
+`requestId` and `transactionUuid` are always the same UUID — the correlation ID that links every log line and DB row for this request.
+
+---
+
+## Payment Channels — Detailed
+
+### ATM Channel
+
+**Channel ID:** `ATM`  
+**Operations:** `WITHDRAWAL`, `DEPOSIT`  
+**Auth Role:** TERMINAL / ADMIN
+
+The ATM channel handles physical cash transactions. Both operations require:
+- **Encrypted PAN** (AES-256-GCM) — decrypted internally to look up the card
+- **PIN verification** — HMAC-SHA256 against the stored PAN-derived hash
+- **Expiry and CVV validation**
+- **Daily and monthly limit checks** against `dailyLimit` and `monthlyLimit` columns in the `cards` table
+
+**WITHDRAWAL:**
+1. Decrypt PAN → look up card → validate expiry, CVV, PIN
+2. Check account is not frozen
+3. Check sufficient balance
+4. Check daily and monthly withdrawal limits
+5. Falcon fraud check (velocity, duplicate, amount spike)
+6. Debit balance atomically (AccountLockManager)
+7. Insert `transaction_atm` row with `transaction_id = UUID`
+
+**DEPOSIT:**
+1. Decrypt PAN → look up card → validate expiry, CVV, PIN
+2. Check account is not frozen
+3. Credit balance atomically (AccountLockManager, credits have priority over debits)
+4. Insert `transaction_atm` row
+
+**Request fields:**
+```json
+{
+  "channelId": "ATM",
+  "data": {
+    "clientTxnId": "atm-client-001",
+    "transactionType": "WITHDRAWAL",
+    "amount": 5000.00,
+    "currency": "AUD",
+    "card": {
+      "pan": "<encryptedPan>",
+      "pin": "<pin>",
+      "expiry": "12/27",
+      "cvv": "123"
+    }
+  }
+}
+```
+
+---
+
+### Mobile Banking Channel
+
+**Channel ID:** `MOBILE`  
+**Operations:** `FUND_TRANSFER`  
+**Auth Role:** MOBILE_USER / ADMIN
+
+Mobile fund transfers move money between accounts. Supports both card-based and account-number-based transfers.
+
+**Validations:**
+- Encrypted PAN or account number lookup
+- PIN verification (if card-based)
+- Account freeze check on source and destination
+- Balance check
+- Hourly transfer limit check
+- Daily transfer limit check
+- Falcon fraud check across mobile channel
+
+**Request fields:**
+```json
+{
+  "channelId": "MOBILE",
+  "data": {
+    "clientTxnId": "mob-001",
+    "transactionType": "FUND_TRANSFER",
+    "fromAccount": "AU0978967890",
+    "toAccount": "AU1234567890",
+    "amount": 1000.00,
+    "currency": "AUD",
+    "mobileNo": "+61412345678",
+    "deviceId": "device-abc123",
+    "card": {
+      "pan": "<encryptedPan>",
+      "pin": "<pin>"
+    }
+  }
+}
+```
+
+---
+
+### POS Channel
+
+**Channel ID:** `POS`  
+**Operations:** `PURCHASE`, `REFUND`  
+**Auth Role:** MERCHANT / TERMINAL / ADMIN
+
+POS (Point of Sale) terminal transactions with full DCC and double-entry ledger support.
+
+**PURCHASE flow:**
+1. Decrypt PAN → validate card (expiry, CVV, PIN)
+2. Falcon fraud check
+3. DCC: if `currency` ≠ account currency → lookup FX rate → apply 2% markup
+4. AccountLockManager: acquire source account lock
+5. Debit customer balance; credit merchant + fee revenue + FX revenue (4-leg ledger)
+6. Insert `transaction_pos` row: `refunded_amount=0`, `flag='N'`
+7. Insert `transactions` master row
+
+**REFUND flow:**
+1. Look up original transaction by `origTransactionId` (UUID)
+2. Validate card ownership
+3. Check `flag` ≠ `'RF'` (not fully refunded)
+4. Calculate remaining refundable amount: `original_amount - refunded_amount`
+5. Validate `refund_amount ≤ remaining`
+6. Update `refunded_amount` and set `flag`: `'PR'` (partial) or `'RF'` (full)
+7. Reverse ledger entries (debit merchant, credit customer)
+
+**Request fields — PURCHASE:**
+```json
+{
+  "channelId": "POS",
+  "data": {
+    "clientTxnId": "pos-1001",
+    "transactionType": "PURCHASE",
+    "merchantId": "MCH-POS-001",
+    "terminalId": "TERM-001",
+    "amount": 150.00,
+    "fee": 2.50,
+    "currency": "USD",
+    "card": {
+      "pan": "<encryptedPan>",
+      "pin": "<pin>",
+      "expiry": "12/27",
+      "cvv": "123"
+    }
+  }
+}
+```
+
+**Request fields — REFUND:**
+```json
+{
+  "channelId": "POS",
+  "data": {
+    "transactionType": "REFUND",
+    "origTransactionId": "<UUID of original purchase>",
+    "amount": 50.00,
+    "card": {
+      "pan": "<encryptedPan>",
+      "pin": "<pin>",
+      "expiry": "12/27"
+    }
+  }
+}
+```
+
+---
+
+### ECOM Channel
+
+**Channel ID:** `ECOM`  
+**Operations:** `PURCHASE`, `REFUND`  
+**Auth Role:** MERCHANT / ADMIN
+
+ECOM (E-Commerce) channel mirrors POS functionality but for card-not-present online payments. No PIN required (card details: PAN + expiry + CVV).
+
+Supports the same DCC, partial refunds, double-entry ledger, and Falcon fraud checks as POS.
+
+ECOM purchases are the terminal step after a successful 3DS verification (`3DS_INITIATE` → `/3ds/verify` → ECOM `PURCHASE`).
+
+---
+
+### 3D Secure Flow
+
+**Channel IDs:** `3DS_INITIATE` (Step 1) + `/3ds/verify` endpoint (Step 2)  
+**Auth Role:** MERCHANT / ADMIN
+
+**Step 1 — Initiate Challenge:**
+
+```json
+POST /transaction/initiate
+{
+  "channelId": "3DS_INITIATE",
+  "data": {
+    "amount": 250.00,
+    "currency": "AUD",
+    "card": {
+      "pan": "<encryptedPan>",
+      "expiry": "12/27",
+      "cvv": "123"
+    }
+  }
+}
+```
+
+Response:
+```json
+{
+  "challengeId": "3DS-a1b2c3d4-...",
+  "otpHint": "492817",
+  "expiresInSeconds": 600,
+  "status": "CHALLENGE_REQUIRED"
+}
+```
+
+**Step 2 — Verify OTP:**
+
+```json
+POST /3ds/verify
+{
+  "challengeId": "3DS-a1b2c3d4-...",
+  "otp": "492817"
+}
+```
+
+Response:
+```json
+{
+  "status": "SUCCESS",
+  "threeDSStatus": "AUTHENTICATED",
+  "transactionUuid": "..."
+}
+```
+
+**Rules:**
+- OTPs expire after **10 minutes** (`tds_challenges` table TTL)
+- Each `challengeId` can only be verified **once** (challenge is deleted on success)
+- Wrong OTP → `ERR_INVALID_OTP` (400)
+- Expired OTP → `ERR_OTP_EXPIRED` (400)
+
+---
+
+### QRCode Channel
+
+**Channel ID:** `QRCODE`  
+**Operations:** `PURCHASE`, `REFUND`  
+**Auth Role:** MERCHANT / ADMIN
+
+QR-based payments parse merchant, terminal, and currency information from the QR payload. The channel uses the correlation UUID as the transaction ID (previously used `std::rand()` — now fixed).
+
+---
+
+### RingPay (Contactless) Channel
+
+**Channel ID:** `RINGPAY`  
+**Auth Role:** MERCHANT / ADMIN
+
+RingPay handles contactless wearable/ring-based payments (NFC token transactions). Features:
+- Wearable token validation
+- Merchant category limit checks
+- Daily contactless limit enforcement
+- Auto-reversal simulation for network timeout scenarios
+
+---
+
+### Issuer Channel
+
+**Channel ID:** `ISSUER`  
+**Auth Role:** ISSUER_ROLE / ADMIN
+
+Issues a new payment card for an existing account.
+
+**Process:**
+1. Look up account by `accountNumber`
+2. Generate a **Luhn-valid PAN** (16 digits, passes Luhn check)
+3. Generate `expiry` (5 years from today)
+4. Generate `CVV` (3-digit random)
+5. Derive PIN using **HMAC-SHA256** from PAN (no PIN stored in DB)
+6. **AES-256-GCM encrypt PAN** → `encryptedPan`
+7. Insert `cards` row with all fields
+8. Return card details to caller
+
+**Request:**
+```json
+{
+  "channelId": "ISSUER",
+  "data": {
+    "accountNumber": "AU0978967890",
+    "cardholderName": "Rohan Sakhare",
+    "scheme": "MASTERCARD"
+  }
+}
+```
+
+**Response:**
+```json
+{
+  "status": "SUCCESS",
+  "card": {
+    "pan": "5412345678901234",
+    "encryptedPan": "<AES-256-GCM encrypted>",
+    "expiry": "07/31",
+    "cvv": "492",
+    "scheme": "MASTERCARD",
+    "cardholderName": "Rohan Sakhare"
+  }
+}
+```
+
+> **`CARD_DETAILS` channel:** Lookup the full card details by submitting an `encryptedPan`. Returns PAN, expiry, CVV, scheme, status, and limits. Restrict this channel to internal networks in production.
+
+---
+
+### Card Management Channels
+
+#### Activate Card
+**Channel ID:** `CARD_ACTIVATE` (via `/transaction/initiate`) or `POST /card/activate`
+
+Re-activates a temporarily blocked card. Cannot activate a `PERMANENT` block.
+
+```json
+{ "encryptedPan": "<encryptedPan>" }
+```
+
+#### Block Card
+**Channel ID:** `CARD_BLOCK` or `POST /card/block`
+
+```json
+{ "encryptedPan": "<encryptedPan>", "blockType": "TEMPORARY" }
+```
+
+| `blockType` | Reversible | Description |
+|-------------|-----------|-------------|
+| `TEMPORARY` | Yes — via `CARD_ACTIVATE` | Temporary hold |
+| `PERMANENT` | **No** | Permanent block, cannot be reversed |
+
+#### Set Spending Limits
+**Channel ID:** `CARD_SET_LIMIT` or `POST /card/set_limit`
+
+```json
+{
+  "encryptedPan": "<encryptedPan>",
+  "dailyLimit": 5000.00,
+  "monthlyLimit": 50000.00
+}
+```
+
+Both fields are optional — send only the one you want to update.
+
+#### Reset PIN
+**Channel ID:** `CARD_RESET_PIN` or `POST /card/reset_pin`  
+**Auth Role:** MOBILE_USER / ADMIN
+
+```json
+{
+  "encryptedPan": "<encryptedPan>",
+  "expiry": "12/27",
+  "newPin": "1234"
+}
+```
+
+The new PIN is validated against the HMAC-SHA256 PAN-derived expected value before the card is updated.
+
+---
+
+### Account Management Channels
+
+All account operations are available both via `POST /transaction/initiate` (with `channelId`) and via dedicated endpoints.
+
+| Channel ID | Endpoint | Description |
+|------------|----------|-------------|
+| `ADD_ACCOUNT` | `POST /account/add` | Create a new account with balance, currency, country |
+| `ACCOUNT_DETAILS` | `POST /account/details` | Fetch account by `accountNumber` |
+| `FREEZE_ACCOUNT` | `POST /account/freeze` | Freeze account — blocks all debit transactions |
+| `UNFREEZE_ACCOUNT` | `POST /account/unfreeze` | Unfreeze account |
+| `LIST_ACCOUNTS` | `POST /account/list` | List all accounts with balances |
+
+**Add Account request:**
+```json
 {
   "channelId": "ADD_ACCOUNT",
   "data": {
@@ -348,18 +920,31 @@ All channels are invoked via `POST /transaction/initiate` with `{ "channelId": "
     "isFrozen": false
   }
 }
-
-// Response
-{
-  "account": { "accountId": 41, "accountNumber": "AU0978967890", ... },
-  "message": "Account added successfully",
-  "requestId": "d1eb7e1f-b31c-4a2f-812d-6a9a699c033d",
-  "status": "SUCCESS",
-  "transactionUuid": "d1eb7e1f-b31c-4a2f-812d-6a9a699c033d"
-}
 ```
 
-`requestId` and `transactionUuid` are always the same UUID — the correlation ID that links every log line, HTTP response, and DB row for this request.
+---
+
+### Reversal Channel
+
+**Channel ID:** `REVERSAL` or `POST /reversal/initiate`  
+**Auth Role:** MERCHANT / TERMINAL / ADMIN
+
+Initiates an auto-reversal for a failed or timed-out transaction. The reversal engine:
+1. Looks up the original transaction by UUID
+2. Verifies the transaction is in a reversible state
+3. Calculates the reversal amount
+4. Restores the deducted balance
+5. Marks the original transaction as reversed
+6. Writes a reversal record
+
+---
+
+### ICCW Channel
+
+**Channel ID:** `ICCW`  
+**Auth Role:** MERCHANT / TERMINAL / ADMIN
+
+ICC/Contactless Waveform channel for chip-and-contactless card present transactions. Supports EMV-style chip validation flows.
 
 ---
 
@@ -367,148 +952,201 @@ All channels are invoked via `POST /transaction/initiate` with `{ "channelId": "
 
 ### Double-Entry Ledger Accounting
 
-Every purchase and refund creates balanced ledger entries across four accounts:
+Every purchase and refund creates balanced accounting entries. The ledger uses four ledger account nodes:
 
-**Purchase:**
-- DEBIT:  Customer Account (full amount)
-- CREDIT: Merchant Account (net after fees)
-- CREDIT: Bank Fee Revenue (flat fee)
-- CREDIT: Bank FX Revenue (DCC markup, if applicable)
+**Purchase — 4 legs:**
 
-**Refund:**
-- DEBIT:  Merchant Account (refund amount)
-- CREDIT: Customer Account (refund amount)
+| Leg | Type | Account | Amount |
+|-----|------|---------|--------|
+| 1 | DEBIT | Customer Receivable | Full amount |
+| 2 | CREDIT | Merchant Payable | Amount minus fee |
+| 3 | CREDIT | Bank Fee Revenue | Flat fee |
+| 4 | CREDIT | Bank FX Revenue | DCC markup (if applicable) |
 
-Tables: `ledger_accounts`, `ledger_entries`
+**Refund — 2 legs:**
+
+| Leg | Type | Account | Amount |
+|-----|------|---------|--------|
+| 1 | DEBIT | Merchant Payable | Refund amount |
+| 2 | CREDIT | Customer Receivable | Refund amount |
+
+**Tables:** `ledger_accounts` (running balances), `ledger_entries` (individual DEBIT/CREDIT rows)
+
+Every ledger entry includes `transaction_id = UUID` for full traceability.
+
+---
 
 ### Dynamic Currency Conversion (DCC)
 
-When the transaction currency differs from the account currency, the engine:
-1. Looks up the FX rate from the `exchange_rates` table.
-2. Converts the amount to the account's base currency.
-3. Applies a **2% bank FX markup**.
-4. Records the FX markup as a separate ledger entry.
+When the transaction `currency` differs from the account's base `currencyCode`, the DCC engine:
 
-Supported currencies: `USD`, `EUR`, `GBP`, `JPY`, `NZD`, `INR`, `AUD`.
+1. Looks up the FX rate from the `exchange_rates` table (e.g., `USD → AUD`)
+2. Converts the transaction amount to the account's base currency
+3. Applies a **2% bank FX markup** on top of the mid-market rate
+4. Records the FX markup as a separate `CREDIT Bank FX Revenue` ledger leg
+5. Stores both the original currency amount and the converted amount in the transaction row
+
+**Supported currency pairs:** `USD`, `EUR`, `GBP`, `JPY`, `NZD`, `INR`, `AUD`
+
+FX rates are stored in the `exchange_rates` table and can be updated independently of the application.
+
+---
 
 ### Partial Refunds
 
-Refunds are tracked cumulatively per original transaction:
+Refunds are tracked cumulatively per original transaction using three states:
 
-| Flag | Meaning |
-|------|---------|
-| `N`  | No refund |
-| `PR` | Partial Refund (some amount refunded) |
-| `RF` | Fully Refunded (cannot refund further) |
+| Flag Value | Meaning | Next Allowed States |
+|------------|---------|---------------------|
+| `N` | No refund issued | → `PR` or `RF` |
+| `PR` | Partial refund (some amount returned) | → `PR` (more) or `RF` (complete) |
+| `RF` | Fully refunded (cannot refund further) | None |
 
-Attempting to refund beyond the original amount returns `ERR_REFUND_EXCEEDS`.
-
----
-
-## 3D Secure Flow
-
-**Step 1 — Initiate:**
-```json
-POST /transaction/initiate
-{ "channelId": "3DS_INITIATE", "data": { "amount": 250.00, "currency": "AUD", "card": { ... } } }
-```
-Response: `{ "challengeId": "3DS-...", "otpHint": "492817", "expiresInSeconds": 600 }`
-
-**Step 2 — Verify:**
-```json
-POST /3ds/verify
-{ "challengeId": "3DS-...", "otp": "492817" }
-```
-Response: Same as a successful ECOM purchase + `"threeDSStatus": "AUTHENTICATED"`
-
-OTPs expire after **10 minutes**. Each challenge can only be used once.
-
----
-
-## Card Lifecycle Management
-
-| Endpoint | Body Fields | Notes |
-|----------|-------------|-------|
-| `POST /card/activate` | `encryptedPan` | Cannot activate PERMANENT blocks |
-| `POST /card/block` | `encryptedPan`, `blockType` | `TEMPORARY` or `PERMANENT` |
-| `POST /card/set_limit` | `encryptedPan`, `dailyLimit`, `monthlyLimit` | Either field is optional |
-| `POST /card/reset_pin` | `encryptedPan`, `expiry`, `newPin` | Verifies PIN is PAN-derived via HMAC |
+**Rules:**
+- `refunded_amount + new_refund_amount ≤ original_amount` (enforced)
+- Attempting to refund beyond the original amount → `ERR_REFUND_EXCEEDS` (400)
+- Attempting to refund a fully-refunded transaction → `ERR_ALREADY_REFUNDED` (400)
+- The flag is updated atomically with the `refunded_amount` column in the same DB transaction
 
 ---
 
 ## Idempotency
 
-Send `Idempotency-Key: <uuid>` with any POST request to prevent duplicate processing on network retries:
+Send `Idempotency-Key: <uuid>` with any POST request to prevent duplicate charges on network retries:
 
 ```bash
 curl -X POST http://localhost:8084/transaction/initiate \
   -H 'X-API-Key: sk_merchant_POS_MCH001' \
-  -H 'Idempotency-Key: a1b2c3d4-e5f6-...' \
+  -H 'Idempotency-Key: a1b2c3d4-e5f6-7890-abcd-ef1234567890' \
   -H 'Content-Type: application/json' \
   -d '{ "channelId": "POS", "data": { ... } }'
 ```
 
-On retry with the same key, the server returns the **cached response immediately** without reprocessing. Concurrent requests with the same key receive `ERR_CONFLICT` (HTTP 409).
+**Behavior:**
+| Scenario | Response |
+|----------|----------|
+| First request with this key | Process normally, cache response |
+| Retry after success | Return cached response immediately (HTTP 200) — no double charge |
+| Concurrent request with same key | HTTP 409 `ERR_CONFLICT` — in-flight lock detected |
 
-Table: `idempotency_keys`
+**Storage:** `idempotency_keys` table with the key, cached response, and creation timestamp.
 
 ---
 
-## Falcon Fraud Engine
+## Falcon Fraud Detection Engine
 
-| Rule | Description |
-|------|-------------|
-| Same-second duplicate | Declines duplicate transaction for same account within 1 second |
-| Per-channel velocity | Declines if channel exceeds 5 transactions in 60 seconds |
-| Cross-channel velocity | Detects rapid multi-channel activity on same account |
-| Amount spike | Declines if amount > 3× the 7-day average for that account |
-| AI security score | Scores device integrity, malware, proxy, VPN, and tamper signals |
+The Falcon engine (`falcon.cpp`, `falcon.h`) is invoked **before any balance mutation** on every money-moving channel.
 
-Falcon declines at risk score **≥ 85**. All declined events are written to `transaction_falcon`. The shared UUID means the fraud decline record is traceable back to the original request log.
+### Fraud Rules (Applied in Order)
 
-### Security Headers for Falcon Scoring
+| # | Rule | Threshold | Action |
+|---|------|-----------|--------|
+| 1 | **Same-second duplicate** | Any transaction on same account within 1 second | DECLINE |
+| 2 | **Per-channel velocity** | > 5 transactions on same channel in 60 seconds | DECLINE |
+| 3 | **Cross-channel velocity** | > 5 combined transactions across ALL channels in 60 seconds | DECLINE |
+| 4 | **Amount spike** | Current amount > 3× the 7-day rolling average for this account | DECLINE |
+| 5 | **AI security scoring** | Composite risk score ≥ 85 based on device/network signals | DECLINE |
 
-`X-Device-Integrity` · `X-App-Signature-Valid` · `X-Device-Binding-Valid` · `X-Device-Trust-Score` · `X-Malware-Detected` · `X-Rooted-Device` · `X-Debugger-Detected` · `X-Proxy-Detected` · `X-VPN-Detected` · `X-Falcon-Risk-Score`
+### Channels Covered
+
+```
+ATM · MOBILE · POS · ECOM · QRCODE · RINGPAY · ICCW
+(ISSUER is exempt — no money flows out on card issuance)
+```
+
+### AI Security Scoring
+
+The AI scorer evaluates signals from HTTP request headers and the request payload:
+
+| Signal Header | Risk Contribution |
+|---------------|------------------|
+| `X-Device-Integrity` | Device integrity compromised → +risk |
+| `X-App-Signature-Valid` | App signature invalid → +risk |
+| `X-Device-Binding-Valid` | Device binding broken → +risk |
+| `X-Device-Trust-Score` | Low trust score → +risk |
+| `X-Malware-Detected` | Malware signal → +risk |
+| `X-Rooted-Device` | Rooted/jailbroken device → +risk |
+| `X-Debugger-Detected` | Debugger attached → +risk |
+| `X-Proxy-Detected` | Proxy/anonymizer → +risk |
+| `X-VPN-Detected` | VPN active → +risk |
+| `X-Falcon-Risk-Score` | External pre-computed score → incorporated |
+
+Composite score ≥ **85** → transaction declined.
+
+### LRU Cache for Performance
+
+Falcon maintains an in-memory LRU cache (`MAX_CACHE_SIZE = 10,000` entries) to avoid redundant DB velocity queries for recently-seen accounts:
+
+- Cache uses a `std::list<CacheNode>` (doubly linked list) + `std::unordered_map` for O(1) get/evict
+- Thread-safe via `std::mutex lruMutex_`
+- Configurable eviction policy: `LRU_POLICY` or `FIFO_POLICY`
+
+### Fraud Logging
+
+All declined transactions are written to `transaction_falcon` with:
+- `transaction_id` = UUID
+- `client_txn_id`, `device_id`, `mobile_no`, `account_number`
+- `amount`, `fraud_reason`
+- Timestamp
+
+The shared UUID means the Falcon decline record is traceable back to the original request log entry.
 
 ---
 
 ## Security Model
 
-| Mechanism | Implementation |
-|-----------|---------------|
-| API Keys | Stored in `api_keys` table, looked up per request |
-| JWT | HMAC-SHA256 signed, 1-hour validity, stateless verification |
-| PAN Transport | AES-256-GCM encrypted (12-byte IV, 16-byte tag, Base64) |
-| PIN Storage | Deterministic HMAC-SHA256 derivation from PAN — no stored PIN table |
-| Concurrency | `AccountLockManager` serializes per-account updates; credits prioritized over debits |
-| DB Transactions | All balance updates wrapped in DB transactions with rollback on failure |
-| UUID Entropy | Composite seed: 2× hardware entropy + thread ID hash + nanosecond timestamp |
+| Mechanism | Implementation Details |
+|-----------|----------------------|
+| **DB Credentials** | AES-256-GCM encrypted `db.ini`; PBKDF2-derived machine-locked key; GCM tag tamper detection; file in `.gitignore` |
+| **API Keys** | Stored in `api_keys` DB table; looked up per request with direct RAII DB connection |
+| **JWT Tokens** | HMAC-SHA256 signed; 1-hour validity; stateless (no session store); issued by `/auth/token` |
+| **PAN Transport** | AES-256-GCM with 12-byte random IV and 16-byte authentication tag; Base64 encoded for transport |
+| **PIN Storage** | Deterministic HMAC-SHA256 derivation from PAN — **no PIN column exists in the DB** |
+| **PIN Verification** | `newPin == HMAC-SHA256(pan, secret)` checked at card issuance and PIN reset |
+| **Account Concurrency** | `AccountLockManager` issues per-account mutexes; credit operations have higher priority than debits |
+| **DB Transactions** | All balance mutations wrapped in `BEGIN/COMMIT` with `ROLLBACK` on any exception |
+| **UUID Entropy** | Composite seed: 2× `std::random_device` + thread ID hash + nanosecond timestamp |
+| **Log Redaction** | `pan`, `pin`, `cvv`, `password`, `token`, `secret`, `encryptedPan`, `encPan` → `"****"` before any log write |
+| **Rate Limiting** | 200 requests/min per IP via sliding window counter; HTTP 429 on breach |
+| **Input Validation** | All required fields validated before any DB call; typed parsing with explicit error codes |
 
 ---
 
 ## Database Design
 
-| Table | Purpose |
-|-------|---------|
-| `accounts` | Balance, freeze status, country, currency |
-| `currency` | Currency master |
-| `cards` | PAN, encrypted PAN, scheme, expiry, CVV, priority, status, daily/monthly limits |
-| `api_keys` | Authentication keys with associated roles |
-| `idempotency_keys` | Idempotency deduplication cache |
-| `tds_challenges` | 3DS OTP challenges (10-min expiry) |
-| `ledger_accounts` | Double-entry account balances |
-| `ledger_entries` | DEBIT/CREDIT journal entries |
-| `exchange_rates` | FX rates for DCC (USD, EUR, GBP, JPY, NZD, INR, AUD) |
-| `transaction_atm` | ATM records (`transaction_id` = UUID) |
-| `transaction_mobile` | Mobile records (`transaction_id` = UUID) |
-| `transaction_pos` | POS records (`transaction_id` = UUID, `refunded_amount`, `flag`) |
-| `transaction_ecom` | ECOM records (`transaction_id` = UUID, `refunded_amount`, `flag`) |
-| `transaction_qrcode` | QR records (`transaction_id` = UUID) |
-| `transaction_ringpay` | RingPay records (`transaction_id` = UUID) |
-| `transaction_falcon` | Fraud decline records |
-| `transactions` | Master transaction registry |
+### Schema Overview
 
-> **DB column requirement:** All `transaction_id` columns must be `VARCHAR(36)` or wider — UUID strings are exactly 36 characters.
+| Table | Primary Key | Purpose |
+|-------|-------------|---------|
+| `accounts` | `accountId` | Account balance, freeze status, country, currency |
+| `currency` | `currencyId` | Currency master (code, name, symbol) |
+| `cards` | `cardId` | PAN, encryptedPan, scheme, expiry, CVV, priority, status, limits |
+| `api_keys` | `keyId` | Authentication key → role mapping |
+| `idempotency_keys` | `key` | Idempotency deduplication cache with stored response |
+| `tds_challenges` | `challengeId` | 3DS OTP challenges with 10-minute expiry |
+| `ledger_accounts` | `ledgerId` | Double-entry running balances (customer, merchant, bank fees, FX revenue) |
+| `ledger_entries` | `entryId` | Individual DEBIT/CREDIT journal entries |
+| `exchange_rates` | `rateId` | FX rates for 7 currency pairs used by DCC engine |
+| `transaction_atm` | `id` | ATM transaction records (`transaction_id` = UUID) |
+| `transaction_mobile` | `id` | Mobile transfer records (`transaction_id` = UUID) |
+| `transaction_pos` | `id` | POS records (`transaction_id` = UUID, `refunded_amount`, `flag`) |
+| `transaction_ecom` | `id` | ECOM records (`transaction_id` = UUID, `refunded_amount`, `flag`) |
+| `transaction_qrcode` | `id` | QR payment records (`transaction_id` = UUID) |
+| `transaction_ringpay` | `id` | RingPay records (`transaction_id` = UUID) |
+| `transaction_falcon` | `id` | Fraud decline records with reason |
+| `transactions` | `id` | Master transaction registry — one row per request |
+
+> **⚠ DB Column Requirement:** All `transaction_id` columns must be `VARCHAR(36)` — UUID strings are exactly 36 characters (32 hex + 4 hyphens).
+
+### Key Relationships
+
+```
+accounts ──< cards              (one account, many cards)
+accounts ──< ledger_accounts    (customer and merchant ledger nodes)
+ledger_accounts ──< ledger_entries
+transactions ──< transaction_atm / transaction_mobile / transaction_pos / ...
+                (all channel tables foreign-key to transactions master)
+```
 
 ---
 
@@ -516,11 +1154,32 @@ Falcon declines at risk score **≥ 85**. All declined events are written to `tr
 
 ### Requirements
 
-- C++20 compiler (Apple Clang 15+ / GCC 13+)
-- CMake 3.15+
-- MySQL Server with X Plugin enabled (port 33060)
-- MySQL Connector/C++ 9.5 (X DevAPI)
-- OpenSSL 3
+| Dependency | Version | Notes |
+|------------|---------|-------|
+| C++ Compiler | Clang 15+ / GCC 13+ | C++20 required |
+| CMake | 3.15+ | |
+| MySQL Server | 8.0+ | X Plugin must be enabled (port 33060) |
+| MySQL Connector/C++ | 9.5 | X DevAPI (`mysqlx/xdevapi.h`) |
+| OpenSSL | 3.x | For AES-256-GCM (db.ini encryption) and HMAC-SHA256 (JWT, PIN) |
+
+### macOS Install via Homebrew
+
+```bash
+brew install mysql mysql-connector-c++ openssl@3
+```
+
+Enable MySQL X Plugin (run in mysql console):
+```sql
+INSTALL PLUGIN mysqlx SONAME 'mysqlx.so';
+```
+
+### Initialize the Database
+
+```bash
+mysql -u root -p < "Create DB.sql"
+```
+
+This creates the `bankingdb` schema, all tables, and seeds API keys and exchange rates.
 
 ### Build
 
@@ -529,14 +1188,42 @@ cmake -S . -B cmake-build-debug
 cmake --build cmake-build-debug --target BankingAPIServer -j 6
 ```
 
+### First-Run Database Config Setup
+
+Before running for the first time, create `db.ini` in the project root:
+
+```ini
+[database]
+host=localhost
+port=33060
+user=root
+pass=YourMySQLPassword
+name=bankingdb
+```
+
+> **⚠ IMPORTANT:** Make a secure offline backup of your password now.
+> On first startup, this file will be overwritten with AES-256-GCM ciphertext.
+> The plain-text password will be permanently gone from disk.
+
 ### Run
 
 ```bash
 ./cmake-build-debug/BankingAPIServer
 ```
 
-Server listens on **`http://0.0.0.0:8084`**.
+**Expected startup output:**
+```
+[DbConfig] Found config at '../db.ini'
+[DbConfig] Plain-text config detected.
+[DbConfig] Encrypting with AES-256-GCM (machine-locked key)…
+[DbConfig] ✅ Config encrypted successfully. Plain-text credentials replaced with ciphertext.
+[DbConfig] ⚠  Keep a backup of your password — the plain-text version no longer exists on disk.
+[DB] Initialising connection pool (10 sessions)…
+[DB] Pool ready — 10 connections available.
+[SERVER] Listening on 0.0.0.0:8084
+```
 
+Server listens on **`http://0.0.0.0:8084`**.  
 Log files are written to `bin/debug/log/log_YYYYMMDD_HHMMSS.log`.
 
 ---
@@ -545,23 +1232,33 @@ Log files are written to `bin/debug/log/log_YYYYMMDD_HHMMSS.log`.
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `DB_HOST` | `localhost` | MySQL host |
-| `DB_PORT` | `33060` | MySQL X Plugin port |
-| `DB_USER` | `root` | Database user |
-| `DB_PASS` | dev fallback | Database password |
-| `DB_NAME` | `bankingdb` | Database name |
-| `TRANSACTION_LOG_LEVEL` | `INFO` | Logger minimum level: `TRACE` `DEBUG` `INFO` `WARN` `ERROR` |
+| `DB_POOL_SIZE` | `10` | Number of MySQL connections in the pool (max 50, min 1) |
+| `TRANSACTION_LOG_LEVEL` | `INFO` | Minimum log level: `TRACE` · `DEBUG` · `INFO` · `WARN` · `ERROR` |
+
+> **Note:** `DB_HOST`, `DB_PORT`, `DB_USER`, `DB_PASS`, `DB_NAME` are no longer used.
+> All database credentials are now loaded exclusively from `db.ini`. The hardcoded fallback values have been removed from source code.
 
 ---
 
-## API Examples
+## API Examples — curl Reference
 
-### Authenticate (Get JWT)
+### Authenticate — Get JWT Token
 
 ```bash
 curl -X POST http://localhost:8084/auth/token \
   -H 'X-API-Key: sk_admin_ROHAN_MASTER_9649'
 ```
+
+```json
+{
+  "token": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...",
+  "role": "ADMIN",
+  "expiresIn": 3600,
+  "tokenType": "Bearer"
+}
+```
+
+---
 
 ### Add Account
 
@@ -581,7 +1278,6 @@ curl -X POST http://localhost:8084/transaction/initiate \
   }'
 ```
 
-Response:
 ```json
 {
   "account": {
@@ -589,7 +1285,11 @@ Response:
     "accountNumber": "AU0978967890",
     "balance": 1000000.0,
     "countryCode": "AU",
-    "currency": { "currencyCode": "AUD", "currencyId": 1, "currencyName": "Australian Dollar" },
+    "currency": {
+      "currencyCode": "AUD",
+      "currencyId": 1,
+      "currencyName": "Australian Dollar"
+    },
     "isFrozen": false
   },
   "message": "Account added successfully",
@@ -599,7 +1299,9 @@ Response:
 }
 ```
 
-### Issue Card
+---
+
+### Issue a Card
 
 ```bash
 curl -X POST http://localhost:8084/transaction/initiate \
@@ -614,6 +1316,32 @@ curl -X POST http://localhost:8084/transaction/initiate \
     }
   }'
 ```
+
+---
+
+### ATM Withdrawal
+
+```bash
+curl -X POST http://localhost:8084/transaction/initiate \
+  -H 'X-API-Key: sk_terminal_ATM_4455' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "channelId": "ATM",
+    "data": {
+      "transactionType": "WITHDRAWAL",
+      "amount": 500.00,
+      "currency": "AUD",
+      "card": {
+        "pan": "<encryptedPan>",
+        "pin": "<pin>",
+        "expiry": "12/27",
+        "cvv": "492"
+      }
+    }
+  }'
+```
+
+---
 
 ### POS Purchase with DCC
 
@@ -630,26 +1358,17 @@ curl -X POST http://localhost:8084/transaction/initiate \
       "amount": 100.00,
       "fee": 2.00,
       "currency": "USD",
-      "card": { "pan": "<encryptedPan>", "pin": "<pin>", "expiry": "<expiry>", "cvv": "<cvv>" }
+      "card": {
+        "pan": "<encryptedPan>",
+        "pin": "<pin>",
+        "expiry": "12/27",
+        "cvv": "492"
+      }
     }
   }'
 ```
 
-### ECOM 3DS Flow
-
-```bash
-# Step 1: Initiate challenge
-curl -X POST http://localhost:8084/transaction/initiate \
-  -H 'X-API-Key: sk_merchant_POS_MCH001' \
-  -H 'Content-Type: application/json' \
-  -d '{ "channelId": "3DS_INITIATE", "data": { "amount": 250.00, "currency": "AUD", "card": { "pan": "<encryptedPan>", "expiry": "<expiry>", "cvv": "<cvv>" } } }'
-
-# Step 2: Verify OTP
-curl -X POST http://localhost:8084/3ds/verify \
-  -H 'X-API-Key: sk_merchant_POS_MCH001' \
-  -H 'Content-Type: application/json' \
-  -d '{ "challengeId": "<from step 1>", "otp": "<otpHint from step 1>" }'
-```
+---
 
 ### Partial Refund
 
@@ -661,12 +1380,67 @@ curl -X POST http://localhost:8084/transaction/initiate \
     "channelId": "POS",
     "data": {
       "transactionType": "REFUND",
-      "origTransactionId": "<UUID of original purchase>",
-      "amount": 20.00,
-      "card": { "pan": "<encryptedPan>", "pin": "<pin>", "expiry": "<expiry>" }
+      "origTransactionId": "d1eb7e1f-b31c-4a2f-812d-6a9a699c033d",
+      "amount": 30.00,
+      "card": {
+        "pan": "<encryptedPan>",
+        "pin": "<pin>",
+        "expiry": "12/27"
+      }
     }
   }'
 ```
+
+---
+
+### ECOM 3DS Full Flow
+
+```bash
+# Step 1: Initiate 3DS challenge
+curl -X POST http://localhost:8084/transaction/initiate \
+  -H 'X-API-Key: sk_merchant_POS_MCH001' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "channelId": "3DS_INITIATE",
+    "data": {
+      "amount": 250.00,
+      "currency": "AUD",
+      "card": { "pan": "<encryptedPan>", "expiry": "12/27", "cvv": "492" }
+    }
+  }'
+
+# → Response: { "challengeId": "3DS-...", "otpHint": "492817", "expiresInSeconds": 600 }
+
+# Step 2: Verify OTP
+curl -X POST http://localhost:8084/3ds/verify \
+  -H 'X-API-Key: sk_merchant_POS_MCH001' \
+  -H 'Content-Type: application/json' \
+  -d '{ "challengeId": "3DS-...", "otp": "492817" }'
+```
+
+---
+
+### Mobile Fund Transfer
+
+```bash
+curl -X POST http://localhost:8084/transaction/initiate \
+  -H 'X-API-Key: sk_mobile_APP_USER1' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "channelId": "MOBILE",
+    "data": {
+      "transactionType": "FUND_TRANSFER",
+      "fromAccount": "AU0978967890",
+      "toAccount": "AU1234567890",
+      "amount": 1000.00,
+      "currency": "AUD",
+      "mobileNo": "+61412345678",
+      "card": { "pan": "<encryptedPan>", "pin": "<pin>" }
+    }
+  }'
+```
+
+---
 
 ### Block Card
 
@@ -677,49 +1451,74 @@ curl -X POST http://localhost:8084/card/block \
   -d '{ "encryptedPan": "<encryptedPan>", "blockType": "TEMPORARY" }'
 ```
 
-### Health Check
+---
+
+### Idempotent Request
 
 ```bash
-curl http://localhost:8084/health
+curl -X POST http://localhost:8084/transaction/initiate \
+  -H 'X-API-Key: sk_merchant_POS_MCH001' \
+  -H 'Idempotency-Key: a1b2c3d4-e5f6-7890-abcd-ef1234567890' \
+  -H 'Content-Type: application/json' \
+  -d '{ "channelId": "POS", "data": { ... } }'
 ```
 
-### Trace a Request in Logs
+---
+
+### Health and Observability
 
 ```bash
-# Every log line for one request — same UUID across request, all function calls, DB write, and response:
+# Service health
+curl http://localhost:8084/health
+
+# Runtime counters
+curl http://localhost:8084/status
+
+# Prometheus metrics
+curl http://localhost:8084/metrics
+```
+
+---
+
+### Trace a Full Request in Logs
+
+```bash
+# Every log line for one request — UUID links request body, all DB calls, Falcon check, and response
 grep "uuid=d1eb7e1f-b31c-4a2f-812d-6a9a699c033d" bin/debug/log/*.log
 ```
 
 ---
 
-## Error Codes
+## Error Codes — Complete Reference
 
-| Code | HTTP | Meaning |
-|------|------|---------|
-| `ERR_UNAUTHORIZED` | 401 | Missing or invalid API key or JWT |
-| `ERR_FORBIDDEN` | 403 | Role not permitted for this channel |
-| `ERR_CONFLICT` | 409 | Idempotency key in use by concurrent request |
-| `ERR_RATE_LIMIT` | 429 | > 200 requests/min per IP |
-| `ERR_CARD_NOT_FOUND` | 404 | Card PAN not found |
-| `ERR_INVALID_EXPIRY` | 400 | Wrong expiry date |
-| `ERR_INVALID_CVV` | 400 | Wrong CVV |
-| `ERR_INVALID_ENCRYPTED_PAN` | 400 | PAN decryption failed |
-| `ERR_INVALID_PIN` | 400 | PIN mismatch |
-| `ERR_CARD_INACTIVE` | 400 | Card is BLOCKED |
-| `ERR_CARD_PERMANENTLY_BLOCKED` | 400 | Cannot re-activate permanent block |
-| `ERR_ACCOUNT_NOT_FOUND` | 404 | Account does not exist |
-| `ERR_ACCOUNT_FROZEN` | 400 | Account is frozen |
-| `ERR_INSUFFICIENT_FUNDS` | 400 | Balance too low |
-| `ERR_ALREADY_REFUNDED` | 400 | Transaction fully refunded (flag=RF) |
-| `ERR_REFUND_EXCEEDS` | 400 | Refund total exceeds original amount |
-| `ERR_CHALLENGE_NOT_FOUND` | 404 | Invalid 3DS challengeId |
-| `ERR_INVALID_OTP` | 400 | Wrong 3DS OTP |
-| `ERR_OTP_EXPIRED` | 400 | 3DS OTP 10-minute window passed |
-| `ERR_FX_RATE_NOT_FOUND` | 400 | No FX rate for this currency pair |
-| `ERR_FRAUD` | 403 | Falcon declined the transaction |
-| `ERR_TIMEOUT` | 504 | Channel processing exceeded timeout |
-| `ERR_UNKNOWN_CHANNEL` | 400 | Unsupported channelId |
-| `ERR_SERVER` | 500 | Unhandled exception in channel handler |
+| Code | HTTP Status | Meaning |
+|------|-------------|---------|
+| `ERR_UNAUTHORIZED` | 401 | Missing, invalid, or expired API key or JWT |
+| `ERR_FORBIDDEN` | 403 | Authenticated role not permitted for this channel/endpoint |
+| `ERR_CONFLICT` | 409 | Idempotency key is already in-flight for a concurrent request |
+| `ERR_RATE_LIMIT` | 429 | Source IP exceeded 200 requests/min |
+| `ERR_UNKNOWN_CHANNEL` | 400 | `channelId` not recognized by the router |
+| `ERR_CARD_NOT_FOUND` | 404 | Card PAN not found in the `cards` table |
+| `ERR_INVALID_EXPIRY` | 400 | Card expiry date does not match |
+| `ERR_INVALID_CVV` | 400 | CVV does not match the stored value |
+| `ERR_INVALID_ENCRYPTED_PAN` | 400 | AES-256-GCM PAN decryption failed (bad ciphertext or key) |
+| `ERR_INVALID_PIN` | 400 | PIN does not match the HMAC-SHA256 PAN-derived expected value |
+| `ERR_CARD_INACTIVE` | 400 | Card status is BLOCKED (TEMPORARY) |
+| `ERR_CARD_PERMANENTLY_BLOCKED` | 400 | Card status is BLOCKED (PERMANENT) — cannot be re-activated |
+| `ERR_ACCOUNT_NOT_FOUND` | 404 | Account number not found in the `accounts` table |
+| `ERR_ACCOUNT_FROZEN` | 400 | Account is frozen — all debit transactions blocked |
+| `ERR_INSUFFICIENT_FUNDS` | 400 | Account balance < requested transaction amount |
+| `ERR_DAILY_LIMIT` | 400 | Transaction would exceed card daily spending limit |
+| `ERR_MONTHLY_LIMIT` | 400 | Transaction would exceed card monthly spending limit |
+| `ERR_ALREADY_REFUNDED` | 400 | Transaction flag = `RF` — already fully refunded |
+| `ERR_REFUND_EXCEEDS` | 400 | Requested refund amount exceeds remaining refundable amount |
+| `ERR_CHALLENGE_NOT_FOUND` | 404 | Invalid or already-used 3DS `challengeId` |
+| `ERR_INVALID_OTP` | 400 | 3DS OTP does not match the stored challenge value |
+| `ERR_OTP_EXPIRED` | 400 | 3DS OTP challenge has expired (10-minute window elapsed) |
+| `ERR_FX_RATE_NOT_FOUND` | 400 | No FX rate found for this currency pair in `exchange_rates` |
+| `ERR_FRAUD` | 403 | Falcon fraud engine declined this transaction |
+| `ERR_TIMEOUT` | 504 | Channel processing exceeded the configured timeout |
+| `ERR_SERVER` | 500 | Unhandled exception in channel handler — check logs for UUID |
 
 ---
 
@@ -727,67 +1526,146 @@ grep "uuid=d1eb7e1f-b31c-4a2f-812d-6a9a699c033d" bin/debug/log/*.log
 
 ```
 CardAPIServer/
-├── parser&router.cpp       # HTTP server, routing, auth middleware, RBAC, request/response logging
-├── TransactionLogger.cpp   # Structured logger with fsync, thread_local context, UUID generation
-├── Database.cpp            # Self-healing MySQL X DevAPI connection pool (30 sessions)
-├── auth.cpp                # API key validation, JWT generation/verification (HMAC-SHA256)
-├── account.cpp             # Account CRUD and freeze/unfreeze APIs
-├── issue.cpp               # Card issuance (Luhn PAN) and card details lookup
-├── atm.cpp                 # ATM channel — WITHDRAWAL / DEPOSIT, uses correlation UUID
-├── mobile.cpp              # Mobile banking — FUND_TRANSFER, uses correlation UUID
-├── pos.cpp                 # POS channel — PURCHASE / REFUND, DCC, double-entry, uses correlation UUID
-├── ecom.cpp                # ECOM channel — PURCHASE / REFUND, DCC, double-entry, uses correlation UUID
-├── qrcode.cpp              # QRCode channel — PURCHASE / REFUND, uses correlation UUID (std::rand removed)
-├── ringpay.cpp             # RingPay contactless — uses correlation UUID (zero-entropy generator removed)
-├── card_mgmt.cpp           # Card lifecycle: activate, block, set_limit, reset_pin
-├── tds.cpp                 # 3D Secure mock OTP challenge flow
-├── falcon.cpp              # Falcon fraud detection engine + AI risk scoring
-├── accounting.cpp          # Double-entry ledger accounting
-├── currency_converter.cpp  # Dynamic Currency Conversion + FX markup
-├── idempotency.cpp         # Idempotency key deduplication
-├── pin.cpp                 # PIN generation and HMAC-SHA256 verification
-├── panencrypted.cpp        # AES-256-GCM PAN encryption/decryption
-├── reversal.cpp            # Transaction reversal engine
-├── DatabaseQueries.cpp     # Shared parameterised DB query helpers
+│
+├── parser&router.cpp         # HTTP server (cpp-httplib), routing, auth middleware,
+│                             # RBAC, IP rate limiter, idempotency gate, UUID generation,
+│                             # request/response logging, channel dispatch
+│
+├── TransactionLogger.cpp     # Structured JSON-line logger; thread_local ScopedContext;
+│                             # ScopedFunctionTrace RAII; hardened UUID generation;
+│                             # immediate fsync; sensitive field auto-redaction
+│
+├── Database.cpp              # Self-healing MySQL X DevAPI connection pool;
+│                             # acquire/release/tryAcquire; stale session healing;
+│                             # credentials loaded exclusively from DbConfig::load()
+│
+├── DbConfig.cpp              # AES-256-GCM encrypted db.ini loader;
+│                             # PBKDF2-HMAC-SHA256 machine-locked key derivation;
+│                             # GCM tamper detection; multi-path file search
+│
+├── falcon.cpp                # Falcon fraud detection engine: same-second, velocity
+│                             # (per-channel + cross-channel), amount spike, AI scorer;
+│                             # LRU/FIFO cache; fraud logging to transaction_falcon
+│
+├── auth.cpp                  # API key DB lookup; JWT generation (HMAC-SHA256);
+│                             # JWT verification and role extraction
+│
+├── account.cpp               # Account CRUD (create, details, list);
+│                             # freeze/unfreeze with account lock
+│
+├── issue.cpp                 # Card issuance (Luhn PAN generation);
+│                             # AES-256-GCM PAN encryption; CARD_DETAILS lookup
+│
+├── atm.cpp                   # ATM channel: WITHDRAWAL, DEPOSIT;
+│                             # daily/monthly limit enforcement
+│
+├── mobile.cpp                # Mobile channel: FUND_TRANSFER;
+│                             # hourly + daily limit checks
+│
+├── pos.cpp                   # POS channel: PURCHASE, REFUND;
+│                             # DCC, partial refunds, double-entry ledger
+│
+├── ecom.cpp                  # ECOM channel: PURCHASE, REFUND;
+│                             # card-not-present, DCC, partial refunds, ledger
+│
+├── qrcode.cpp                # QR payment channel: PURCHASE, REFUND;
+│                             # QR payload parsing, correlation UUID (std::rand removed)
+│
+├── ringpay.cpp               # RingPay contactless channel;
+│                             # wearable token, merchant/daily limits, auto-reversal
+│
+├── iccw.cpp                  # ICCW chip-and-contactless channel;
+│                             # EMV-style validation
+│
+├── card_mgmt.cpp             # Card lifecycle: CARD_ACTIVATE, CARD_BLOCK,
+│                             # CARD_SET_LIMIT, CARD_RESET_PIN
+│
+├── tds.cpp                   # 3D Secure mock: OTP challenge generation (3DS_INITIATE),
+│                             # OTP verification (/3ds/verify), 10-min TTL enforcement
+│
+├── accounting.cpp            # Double-entry ledger: DEBIT/CREDIT journal write helpers;
+│                             # 4-leg purchase entries, 2-leg refund entries
+│
+├── currency_converter.cpp    # DCC engine: FX rate lookup, 2% bank markup calculation,
+│                             # converted amount computation
+│
+├── idempotency.cpp           # Idempotency key cache: lookup, lock (in-flight detection),
+│                             # store response, retrieve cached response
+│
+├── pin.cpp                   # PIN generation (HMAC-SHA256 from PAN);
+│                             # PIN verification (timing-safe comparison)
+│
+├── panencrypted.cpp          # AES-256-GCM PAN encryption and decryption service;
+│                             # Base64 encode/decode; 12-byte IV + 16-byte GCM tag
+│
+├── reversal.cpp              # Transaction reversal engine: balance restoration,
+│                             # state update, reversal record write
+│
+├── DatabaseQueries.cpp       # Shared parameterised SQL query helpers used
+│                             # across multiple channel files
+│
 ├── include/
-│   ├── TransactionLogger.h # Logger class, ScopedContext, ScopedFunctionTrace, LogField
-│   ├── Database.h          # Connection pool interface
-│   ├── global_contant.h    # Engine-wide constants
-│   ├── atm.h / mobile.h / pos.h / ecom.h / qrcode.h / ringpay.h
+│   ├── DbConfig.h            # DbCredentials struct; DbConfig::load() declaration;
+│   │                         # encryption constants (PEPPER, PBKDF2_ITER, KEY_LEN)
+│   ├── Database.h            # Connection pool interface: acquire/release/tryAcquire;
+│   │                         # ScopedConnection RAII; PoolHealth; creds_ static member
+│   ├── TransactionLogger.h   # Logger class, ScopedContext, ScopedFunctionTrace,
+│   │                         # LogField, generateUuid()
+│   ├── global_contant.h      # TransactionType enum; ChannelType enum (20 channels);
+│   │                         # string↔enum converters
+│   ├── falcon.h              # Falcon class; FalconChannel enum; EvictionPolicy enum;
+│   │                         # FALCON_VELOCITY_LIMIT, FALCON_AI_DECLINE_SCORE constants
+│   ├── AccountLockManager.h  # Per-account mutex registry; credit-priority locking
+│   ├── DatabaseQueries.h     # Shared DB query function declarations
+│   ├── atm.h / mobile.h / pos.h / ecom.h / qrcode.h / ringpay.h / iccw.h
 │   ├── auth.h / card_mgmt.h / tds.h / account.h / issue.h / reversal.h
-│   ├── falcon.h / accounting.h / currency_converter.h / idempotency.h
-│   ├── json.hpp            # nlohmann/json (bundled)
-│   └── httplib.h           # cpp-httplib (bundled, 10M thread pool)
-├── Create DB.sql           # Full database schema + seed data
-├── API Document.txt        # Complete API reference with all request/response samples
-├── API Hit Tool            # Browser-based API testing UI (v3.2)
-└── CMakeLists.txt          # Build configuration
+│   ├── accounting.h / currency_converter.h / idempotency.h / pin.h / panencrypted.h
+│   ├── json.hpp              # nlohmann/json v3 (bundled, header-only)
+│   └── httplib.h             # cpp-httplib (bundled, 10M thread pool)
+│
+├── db.ini                    # Encrypted DB credentials (AES-256-GCM after first run)
+│                             # Listed in .gitignore — never committed to repository
+│
+├── Create DB.sql             # Full bankingdb schema + seed data (API keys, FX rates)
+├── API Document.txt          # Complete API reference with all request/response samples
+├── API Hit Tool              # Browser-based API testing UI (v3.2)
+├── CMakeLists.txt            # Build configuration (C++20, OpenSSL, MySQL Connector)
+└── .gitignore                # Excludes db.ini, db.ini.tmp, cmake-build-*, .DS_Store
 ```
 
 ---
 
-## Production Notes
+## Production Hardening Notes
 
-- Move AES key, PIN secret, and JWT secret to a vault or HSM (HashiCorp Vault, AWS KMS).
-- Replace plaintext `cards.pan` column with tokenized or HSM-backed lookup.
-- Restrict `CARD_DETAILS` channel to internal networks only (firewall rule or separate listener).
-- Enable TLS (HTTPS) at the load balancer or natively via OpenSSL in `httplib`.
-- Replace seeded API keys with a proper key management service.
-- Ensure all `transaction_id` columns are `VARCHAR(36)` — UUID strings are exactly 36 characters.
-- Add database migrations (Flyway / Liquibase) for schema changes instead of manual SQL edits.
-- Add unit and integration tests for all channels and Falcon rules.
-- Rotate JWT secret without downtime using a dual-key verification strategy.
-- Ship structured log lines to a SIEM / observability platform (Elastic Stack, Grafana Loki, Datadog).
-- Replace RingPay simulated network failure with real provider response handling.
+### Critical Before Go-Live
+
+- **Change the PEPPER** in `DbConfig.h` before compiling your production binary. This makes your encryption key unique to your deployment and invalidates any dev `db.ini` files.
+- **Move AES key, PIN secret, and JWT secret** to a vault or HSM (HashiCorp Vault, AWS KMS, Azure Key Vault).
+- **Replace plaintext `cards.pan`** column with a tokenized or HSM-backed lookup. The PAN is currently stored in plaintext in the DB alongside the encrypted version.
+- **Restrict `CARD_DETAILS` channel** to internal networks only — it returns the full PAN. Add a firewall rule or a separate internal-only listener.
+- **Enable TLS (HTTPS)** at the load balancer or natively via OpenSSL in `httplib::SSLServer`.
+- **Replace seeded API keys** with a proper key management service (rotate on breach, expiry, per-client keys).
+
+### Operations
+
+- **Ensure `VARCHAR(36)`** on all `transaction_id` columns — UUID strings are exactly 36 characters (32 hex + 4 hyphens).
+- **Add database migrations** (Flyway / Liquibase) for schema changes instead of manual SQL edits.
+- **Add unit and integration tests** for all channels and Falcon rules before production deployment.
+- **Rotate JWT secret** without downtime using a dual-key verification strategy (accept both old and new key during rotation window).
+- **Ship structured logs** to a SIEM / observability platform (Elastic Stack, Grafana Loki, Datadog, Splunk) — the structured JSON-line format is directly ingestible.
+- **Monitor pool health** via `GET /metrics` — watch `staleReconnects` for DB connectivity degradation.
 - Consider `O_DIRECT` or a dedicated async I/O log thread if `::fsync` latency becomes a bottleneck under extreme write load.
+- Replace RingPay simulated network failures with real payment provider response handling.
+- Set `DB_POOL_SIZE` via environment variable to match your MySQL `mysqlx_max_connections` setting.
 
 ---
 
 ## License
 
-This repository currently does not include an open-source license file.  
+This repository currently does not include an open-source license file.
 Add a license before publishing or accepting external contributions.
 
 ---
 
+*Copyright © Rohan Sakhare — All rights reserved.*  
 *Contact: rohanavinashsakhare@gmail.com | +91 9112765649*

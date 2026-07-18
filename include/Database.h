@@ -26,6 +26,7 @@
 #pragma once
 
 #include <mysqlx/xdevapi.h>
+#include "DbConfig.h"
 #include <vector>
 #include <queue>
 #include <mutex>
@@ -108,6 +109,11 @@ private:
 
     // Resolved once at pool init from DB_POOL_SIZE env-var
     static int                     poolSizeRuntime_;
+
+    // ── Encrypted config credentials (loaded once at initPool()) ────────────
+    // Path to the config file — relative to the working directory of the binary.
+    static constexpr const char*   DB_CONFIG_PATH = "db.ini";
+    static DbCredentials           creds_;   // populated by DbConfig::load()
 
     static std::vector<Session*>   allConnections_;
     static std::queue<Session*>    freeConnections_;
