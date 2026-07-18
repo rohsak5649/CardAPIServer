@@ -131,7 +131,7 @@ std::optional<ChallengeInfo> get3DSChallenge(Session& sess, const std::string& c
     info.otp = row[0].get<std::string>();
     info.transactionData = row[1].get<std::string>();
     info.status = row[2].get<std::string>();
-    info.expiresAt = row[3].get<long long>();
+    info.expiresAt = static_cast<long long>(row[3].get<int64_t>());
     return info;
 }
 
