@@ -21,6 +21,15 @@
 #  include <mach-o/dyld.h>   // _NSGetExecutablePath
 #endif
 
+// Platform-specific hostname and executable path headers
+#ifdef _WIN32
+#  include <winsock2.h>      // GetComputerNameA (gethostname is in ws2_32)
+#  include <windows.h>       // GetModuleFileNameA
+#  pragma comment(lib, "ws2_32.lib")
+#else
+#  include <unistd.h>        // gethostname (POSIX)
+#endif
+
 #include <algorithm>
 #include <fstream>
 #include <iomanip>
@@ -67,8 +76,18 @@ std::vector<unsigned char> DbConfig::fromHex(const std::string& hex) {
 std::string DbConfig::deriveKey() {
     // Get machine hostname as the salt component
     char hostBuf[256] = {};
+
+#ifdef _WIN32
+    // Windows: use GetComputerNameA (no WSAStartup needed for this)
+    DWORD hostLen = sizeof(hostBuf);
+    if (!GetComputerNameA(hostBuf, &hostLen))
+        throw std::runtime_error("[DbConfig] GetComputerNameA() failed");
+#else
+    // POSIX (macOS / Linux)
     if (gethostname(hostBuf, sizeof(hostBuf)) != 0)
         throw std::runtime_error("[DbConfig] gethostname() failed");
+#endif
+
     std::string hostname(hostBuf);
 
     // Combine hostname + pepper as the actual PBKDF2 salt

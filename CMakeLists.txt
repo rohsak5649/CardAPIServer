@@ -7,13 +7,17 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 
 # ── Platform-specific dependency paths ────────────────────────────────────────
 if(WIN32)
-    # Windows — MySQL Connector C++ installed to default path by MSI installer
-    set(MYSQL_CONNECTOR_DIR "C:/Program Files/MySQL/MySQL Connector C++ 9.5")
+    # Allow CI to inject the exact install path via -DMYSQL_CONNECTOR_DIR=...
+    # Falls back to the default MSI install location when not explicitly set.
+    if(NOT MYSQL_CONNECTOR_DIR)
+        set(MYSQL_CONNECTOR_DIR "C:/Program Files/MySQL/MySQL Connector C++ 9.5")
+    endif()
+
+    message(STATUS "MySQL Connector dir: ${MYSQL_CONNECTOR_DIR}")
 
     include_directories(
             ${PROJECT_SOURCE_DIR}/include
             "${MYSQL_CONNECTOR_DIR}/include"
-            "${MYSQL_CONNECTOR_DIR}/include/mysqlx"
     )
 
     link_directories(
@@ -21,8 +25,10 @@ if(WIN32)
             "${MYSQL_CONNECTOR_DIR}/lib64"
     )
 
-    # OpenSSL — installed by Chocolatey to this path on windows-latest runners
-    set(OPENSSL_ROOT_DIR "C:/Program Files/OpenSSL-Win64")
+    # OpenSSL set via -DOPENSSL_ROOT_DIR from CI; CMakeLists sets it for local builds
+    if(NOT OPENSSL_ROOT_DIR)
+        set(OPENSSL_ROOT_DIR "C:/Program Files/OpenSSL-Win64")
+    endif()
 
 else()
     # macOS (Homebrew) / Linux
