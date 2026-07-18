@@ -22,54 +22,61 @@ jobs:
           sudo apt-get update -q
           sudo apt-get install -y build-essential cmake libssl-dev
 
-      # ── MySQL Connector C++ (X DevAPI) ────────────────────────────────────────
-      # Strategy:
-      #   1. Try Ubuntu's built-in package (libmysqlcppconn-dev) — includes
-      #      mysqlx/xdevapi.h and libmysqlcppconnx.so, works on Ubuntu 22+
-      #   2. If xdevapi.h is still missing, add the MySQL Innovation APT repo
-      #      and install libmysqlcppconnx-dev (MySQL 9.x packages)
-      - name: Install MySQL Connector C++
+      # ── MySQL Connector C++ X DevAPI — tarball from MySQL CDN ─────────────────
+      # apt's libmysqlcppconn-dev is v1.1 (JDBC only — no xdevapi.h).
+      # MySQL Innovation APT repo GPG key has expired.
+      # Direct tarball download bypasses both problems entirely.
+      - name: Install MySQL Connector C++ (X DevAPI)
         run: |
           set -e
+          CONNECTOR_DIR="/opt/mysql-connector-cpp"
+          sudo mkdir -p "$CONNECTOR_DIR"
+          DOWNLOADED=false
 
-          # ── Method 1: Ubuntu default repository ───────────────────────────────
-          echo "==> Trying ubuntu repo: libmysqlcppconn-dev"
-          sudo apt-get install -y libmysqlcppconn-dev || true
-
-          # Check if X DevAPI header is now available
-          if find /usr /usr/local -name "xdevapi.h" 2>/dev/null | grep -q .; then
-            echo "✅ xdevapi.h found via apt — done."
-            find /usr /usr/local -name "xdevapi.h" 2>/dev/null
-            exit 0
-          fi
-
-          # ── Method 2: MySQL Innovation APT repository (MySQL 9.x) ─────────────
-          echo "==> xdevapi.h not found. Adding MySQL Innovation APT repo..."
-          wget -q https://dev.mysql.com/get/mysql-apt-config_0.8.33-1_all.deb -O mysql-apt.deb
-          echo "mysql-apt-config mysql-apt-config/select-server select mysql-innovation" \
-            | sudo debconf-set-selections
-          DEBIAN_FRONTEND=noninteractive sudo dpkg -i mysql-apt.deb
-          sudo apt-get update -q
-
-          for pkg in libmysqlcppconnx-dev libmysqlcppconn9-dev libmysqlcppconn-dev; do
-            if sudo apt-get install -y "$pkg" 2>/dev/null; then
-              echo "✅ Installed $pkg"
-              break
-            fi
+          # Probe CDN for available version/glibc combos (newest first)
+          for VERSION in "9.5.0" "9.3.0" "9.2.0" "9.1.0" "9.0.0" "8.4.0" "8.3.0"; do
+            for GLIBC in "2.28" "2.17"; do
+              URL="https://cdn.mysql.com/Downloads/Connector-C++/mysql-connector-c++-${VERSION}-linux-glibc${GLIBC}-x86-64bit.tar.gz"
+              echo "  → Trying MySQL Connector C++ ${VERSION} (glibc${GLIBC})..."
+              if wget -q "$URL" -O /tmp/connector.tar.gz 2>/dev/null; then
+                sudo tar -xzf /tmp/connector.tar.gz -C "$CONNECTOR_DIR" --strip-components=1
+                echo "✅ Installed MySQL Connector C++ ${VERSION} (glibc${GLIBC}) → $CONNECTOR_DIR"
+                DOWNLOADED=true
+                break 2
+              fi
+              rm -f /tmp/connector.tar.gz
+            done
           done
 
-          # ── Final check ────────────────────────────────────────────────────────
-          HEADER=$(find /usr /usr/local -name "xdevapi.h" 2>/dev/null | head -1)
-          if [ -z "$HEADER" ]; then
-            echo "❌ mysqlx/xdevapi.h not found after both install attempts."
-            dpkg -l | grep -i mysql || true
+          if [ "$DOWNLOADED" = "false" ]; then
+            echo "❌ All CDN download attempts failed. Checked versions: 9.5.0 9.3.0 9.2.0 9.1.0 9.0.0 8.4.0 8.3.0"
             exit 1
           fi
-          echo "✅ Header found: $HEADER"
 
-      # ── CMake configure ───────────────────────────────────────────────────────
+          # Register library path so the linker can find libmysqlcppconnx.so
+          printf '%s\n' "$CONNECTOR_DIR/lib64" "$CONNECTOR_DIR/lib" \
+            | sudo tee /etc/ld.so.conf.d/mysql-connector.conf
+          sudo ldconfig
+
+          # Verify xdevapi.h is present
+          HEADER=$(find "$CONNECTOR_DIR" -name "xdevapi.h" 2>/dev/null | head -1)
+          if [ -z "$HEADER" ]; then
+            echo "❌ xdevapi.h not found inside tarball at $CONNECTOR_DIR"
+            find "$CONNECTOR_DIR" -type f | head -20
+            exit 1
+          fi
+          echo "✅ xdevapi.h: $HEADER"
+
+          # Export path for CMake
+          echo "MYSQL_CONNECTOR_DIR=$CONNECTOR_DIR" >> "$GITHUB_ENV"
+
+      # ── Configure CMake ───────────────────────────────────────────────────────
       - name: Configure CMake
-        run: cmake -B build -S . -DCMAKE_BUILD_TYPE=Release
+        run: |
+          echo "MYSQL_CONNECTOR_DIR = $MYSQL_CONNECTOR_DIR"
+          cmake -B build -S . \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DMYSQL_CONNECTOR_DIR="$MYSQL_CONNECTOR_DIR"
 
       # ── Build ─────────────────────────────────────────────────────────────────
       - name: Build
