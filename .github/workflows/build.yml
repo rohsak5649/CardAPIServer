@@ -10,8 +10,6 @@ on:
 
 jobs:
   build:
-    # Ubuntu has all POSIX headers (unistd.h, fcntl.h, fsync, gethostname, etc.)
-    # and supports MySQL Connector C++ X DevAPI natively via deb packages.
     runs-on: ubuntu-latest
 
     steps:
@@ -22,35 +20,52 @@ jobs:
       - name: Install build dependencies
         run: |
           sudo apt-get update -q
-          sudo apt-get install -y \
-            build-essential \
-            cmake \
-            libssl-dev
+          sudo apt-get install -y build-essential cmake libssl-dev
 
-      # ── MySQL Connector C++ 9.5 (X DevAPI) ───────────────────────────────────
-      # No apt package exists — download deb directly from MySQL CDN.
-      - name: Install MySQL Connector C++ 9.5
+      # ── MySQL Connector C++ (X DevAPI) ────────────────────────────────────────
+      # Strategy:
+      #   1. Try Ubuntu's built-in package (libmysqlcppconn-dev) — includes
+      #      mysqlx/xdevapi.h and libmysqlcppconnx.so, works on Ubuntu 22+
+      #   2. If xdevapi.h is still missing, add the MySQL Innovation APT repo
+      #      and install libmysqlcppconnx-dev (MySQL 9.x packages)
+      - name: Install MySQL Connector C++
         run: |
-          cd /tmp
+          set -e
 
-          # Runtime library
-          wget -q "https://cdn.mysql.com/Downloads/Connector-C++/libmysqlcppconnx2_9.5.0-1ubuntu24.04_amd64.deb" \
-               -O mysql-runtime.deb
+          # ── Method 1: Ubuntu default repository ───────────────────────────────
+          echo "==> Trying ubuntu repo: libmysqlcppconn-dev"
+          sudo apt-get install -y libmysqlcppconn-dev || true
 
-          # Development headers + .so symlink
-          wget -q "https://cdn.mysql.com/Downloads/Connector-C++/libmysqlcppconnx-dev_9.5.0-1ubuntu24.04_amd64.deb" \
-               -O mysql-dev.deb
-
-          sudo dpkg -i mysql-runtime.deb mysql-dev.deb
-
-          # Verify headers landed in a standard path
-          if find /usr /usr/local -name "xdevapi.h" 2>/dev/null | grep -q xdevapi; then
-            echo "✅ mysqlx/xdevapi.h found:"
+          # Check if X DevAPI header is now available
+          if find /usr /usr/local -name "xdevapi.h" 2>/dev/null | grep -q .; then
+            echo "✅ xdevapi.h found via apt — done."
             find /usr /usr/local -name "xdevapi.h" 2>/dev/null
-          else
-            echo "⚠ xdevapi.h not in /usr — checking dpkg content list..."
-            dpkg -L libmysqlcppconnx-dev 2>/dev/null || true
+            exit 0
           fi
+
+          # ── Method 2: MySQL Innovation APT repository (MySQL 9.x) ─────────────
+          echo "==> xdevapi.h not found. Adding MySQL Innovation APT repo..."
+          wget -q https://dev.mysql.com/get/mysql-apt-config_0.8.33-1_all.deb -O mysql-apt.deb
+          echo "mysql-apt-config mysql-apt-config/select-server select mysql-innovation" \
+            | sudo debconf-set-selections
+          DEBIAN_FRONTEND=noninteractive sudo dpkg -i mysql-apt.deb
+          sudo apt-get update -q
+
+          for pkg in libmysqlcppconnx-dev libmysqlcppconn9-dev libmysqlcppconn-dev; do
+            if sudo apt-get install -y "$pkg" 2>/dev/null; then
+              echo "✅ Installed $pkg"
+              break
+            fi
+          done
+
+          # ── Final check ────────────────────────────────────────────────────────
+          HEADER=$(find /usr /usr/local -name "xdevapi.h" 2>/dev/null | head -1)
+          if [ -z "$HEADER" ]; then
+            echo "❌ mysqlx/xdevapi.h not found after both install attempts."
+            dpkg -l | grep -i mysql || true
+            exit 1
+          fi
+          echo "✅ Header found: $HEADER"
 
       # ── CMake configure ───────────────────────────────────────────────────────
       - name: Configure CMake
